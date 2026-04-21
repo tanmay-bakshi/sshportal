@@ -1,0 +1,38 @@
+[package]
+name = "sshportal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Consent-gated remote shell access over an HTTP or WebSocket rendezvous."
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["ssh", "remote-support", "terminal", "websocket"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+anyhow = "1.0.98"
+bytes = "1.10.1"
+clap = { version = "4.5.39", features = ["derive"] }
+crossterm = "0.29.0"
+futures-util = "0.3.31"
+hostname = "0.4.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.7.0", features = ["http1", "server"] }
+hyper-tungstenite = "0.19.0"
+hyper-util = { version = "0.1.16", features = ["tokio", "client-proxy"] }
+pin-project-lite = "0.2.16"
+portable-pty = "0.9.0"
+russh = { version = "0.58.0", default-features = false, features = ["flate2", "rsa", "ring"] }
+rustls = { version = "0.23.37", default-features = false, features = ["std", "ring"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7.16", features = ["io"] }
+url = "2.5.4"
+webpki-roots = "0.26.11"
+whoami = "1.6.1"
+
+[dev-dependencies]
+tempfile = "3.20.0"
