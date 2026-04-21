@@ -52,14 +52,20 @@ class SpawnedProcess:
     transcript: str
 
 
-def run_checked(command: list[str], *, cwd: Path | None = None) -> None:
+def run_checked(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
     """Run a subprocess and fail fast on errors.
 
     :param command: Command and arguments to execute.
     :param cwd: Optional working directory.
+    :param env: Optional environment override.
     """
 
-    subprocess.run(command, cwd=cwd, check=True)
+    subprocess.run(command, cwd=cwd, check=True, env=env)
 
 
 def resolve_target_triple(requested_platform: str | None) -> str:
@@ -91,11 +97,41 @@ def build_host_binaries(target_triple: str) -> None:
     :param target_triple: Rust target triple to build.
     """
 
+    build_environment = resolve_build_environment(target_triple)
     run_checked(["rustup", "target", "add", target_triple], cwd=PROJECT_ROOT)
     run_checked(
         ["cargo", "build", "--release", "--target", target_triple, "--bins"],
         cwd=PROJECT_ROOT,
+        env=build_environment,
     )
+
+
+def resolve_build_environment(target_triple: str) -> dict[str, str]:
+    """Resolve environment overrides needed for host-side target builds.
+
+    :param target_triple: Rust target triple to build.
+    :returns: Process environment for the build commands.
+    :raises RuntimeError: If a required Linux musl toolchain is unavailable.
+    """
+
+    environment = os.environ.copy()
+    if target_triple != "x86_64-unknown-linux-musl":
+        return environment
+    if platform_module.system() != "Linux":
+        return environment
+    if shutil.which("x86_64-linux-musl-gcc") is not None:
+        return environment
+
+    musl_gcc = shutil.which("musl-gcc")
+    if musl_gcc is None:
+        raise RuntimeError(
+            "building x86_64-unknown-linux-musl requires a musl C toolchain; "
+            "install musl-tools or provide x86_64-linux-musl-gcc"
+        )
+
+    environment["CC_x86_64_unknown_linux_musl"] = musl_gcc
+    environment["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"] = musl_gcc
+    return environment
 
 
 def build_image(image_tag: str, platform: str | None) -> None:

@@ -577,18 +577,14 @@ async fn relay_ssh_session_to_local_client(
             break;
         };
         match message {
-            ChannelMsg::Data { data } => {
-                if local_handle.data(local_channel, data).await.is_err() {
-                    break;
-                }
-            }
+            ChannelMsg::Data { data } => match local_handle.data(local_channel, data).await {
+                Ok(()) => {}
+                Err(_) => break,
+            },
             ChannelMsg::ExtendedData { data, ext } => {
-                if local_handle
-                    .extended_data(local_channel, ext, data)
-                    .await
-                    .is_err()
-                {
-                    break;
+                match local_handle.extended_data(local_channel, ext, data).await {
+                    Ok(()) => {}
+                    Err(_) => break,
                 }
             }
             ChannelMsg::Eof => {
@@ -1662,10 +1658,11 @@ mod tests {
             };
             match message {
                 ChannelMsg::Data { data } => stdout.extend_from_slice(data.as_ref()),
-                ChannelMsg::ExtendedData { data, ext } => {
-                    if ext == SSH_EXTENDED_DATA_STDERR {
-                        stderr.extend_from_slice(data.as_ref());
-                    }
+                ChannelMsg::ExtendedData {
+                    data,
+                    ext: SSH_EXTENDED_DATA_STDERR,
+                } => {
+                    stderr.extend_from_slice(data.as_ref());
                 }
                 ChannelMsg::Eof => {
                     saw_eof = true;
