@@ -16,7 +16,8 @@ use super::local_proxy::start_ssh_proxy_listener;
 use super::remote::run_remote_shell_server;
 use super::socks::{
     SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
-    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_VERSION, SocksConnectTarget, negotiate_socks5,
+    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksConnectTarget,
+    negotiate_socks5, start_dynamic_forward_listener,
 };
 
 async fn none_authentication_succeeds<S>(io: S, username: &str) -> bool
@@ -375,6 +376,117 @@ async fn forwards_direct_tcpip_channels_to_client_network() {
         .disconnect(Disconnect::ByApplication, "test complete", "en-US")
         .await
         .unwrap();
+    echo_task.await.unwrap();
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dynamic_forward_listener_routes_socks_connections_through_client_network() {
+    let temp_dir = tempdir().unwrap();
+    let allowed_private_key = Arc::new(
+        PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap(),
+    );
+    let allowed_public_key = allowed_private_key.public_key().clone();
+    let (client_io, server_io) = duplex(64 * 1024);
+    let shell = ShellLaunch::detect_for_current_platform().unwrap();
+
+    let server_task = tokio::spawn(run_remote_shell_server(
+        server_io,
+        "support-user".to_string(),
+        allowed_public_key,
+        temp_dir.path().to_path_buf(),
+        shell,
+    ));
+
+    let upstream_session = Arc::new(AsyncMutex::new(
+        connect_authenticated_client_transport(
+            client_io,
+            "support-user",
+            Arc::clone(&allowed_private_key),
+        )
+        .await
+        .unwrap(),
+    ));
+    let dynamic_forward_listener = start_dynamic_forward_listener(
+        Arc::clone(&upstream_session),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let (mut socket, _) = echo_listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        socket.read_to_end(&mut request).await.unwrap();
+        socket.write_all(&request).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let mut socks_stream = TcpStream::connect(dynamic_forward_listener.local_addr())
+        .await
+        .unwrap();
+    socks_stream
+        .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_NONE])
+        .await
+        .unwrap();
+    let mut method_response = [0_u8; 2];
+    socks_stream.read_exact(&mut method_response).await.unwrap();
+    assert_eq!(method_response, [SOCKS_VERSION, SOCKS_AUTH_NONE]);
+
+    let port_bytes = echo_addr.port().to_be_bytes();
+    socks_stream
+        .write_all(&[
+            SOCKS_VERSION,
+            SOCKS_CMD_CONNECT,
+            0,
+            SOCKS_ATYP_DOMAIN_NAME,
+            9,
+            b'l',
+            b'o',
+            b'c',
+            b'a',
+            b'l',
+            b'h',
+            b'o',
+            b's',
+            b't',
+            port_bytes[0],
+            port_bytes[1],
+        ])
+        .await
+        .unwrap();
+
+    let mut connect_response = [0_u8; 10];
+    socks_stream
+        .read_exact(&mut connect_response)
+        .await
+        .unwrap();
+    assert_eq!(connect_response[0], SOCKS_VERSION);
+    assert_eq!(connect_response[1], SOCKS_REPLY_SUCCESS);
+
+    socks_stream
+        .write_all(b"hello through socks")
+        .await
+        .unwrap();
+    socks_stream.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    socks_stream.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"hello through socks");
+
+    drop(dynamic_forward_listener);
+    {
+        let session_guard = upstream_session.lock().await;
+        session_guard
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+    }
     echo_task.await.unwrap();
     server_task.await.unwrap().unwrap();
 }

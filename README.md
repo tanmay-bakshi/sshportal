@@ -94,6 +94,7 @@ cargo run --bin sshportal-server -- \
 ```
 
 The SOCKS5 listener accepts unauthenticated `CONNECT` requests, matching the forwarding model of `ssh -D`.
+Destinations are opened from the approved client environment, so the proxy uses the client network on Linux, macOS, and Windows.
 
 ## Build
 

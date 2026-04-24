@@ -59,6 +59,9 @@ jobs:
         run: cargo test --locked shell::tests::forwards_direct_tcpip_channels_to_client_network -- --nocapture
       - if: matrix.os == 'windows-latest'
         timeout-minutes: 3
+        run: cargo test --locked shell::tests::dynamic_forward_listener_routes_socks_connections_through_client_network -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        timeout-minutes: 3
         run: cargo test --locked shell::tests::executes_noninteractive_commands_over_authenticated_transport -- --nocapture
       - if: matrix.os == 'windows-latest'
         timeout-minutes: 3
