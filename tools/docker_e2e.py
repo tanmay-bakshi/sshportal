@@ -551,11 +551,11 @@ def start_server(
             ]
         )
     command.extend(
-            [
-                "-e",
-                "SSHPORTAL_DEBUG=1",
-                image_tag,
-                "/usr/local/bin/sshportal-server",
+        [
+            "-e",
+            "SSHPORTAL_DEBUG=1",
+            image_tag,
+            "/usr/local/bin/sshportal-server",
             "--listen",
             "0.0.0.0:8080",
             "--operator-name",
@@ -569,6 +569,7 @@ def start_server(
     if persist_key:
         command.append("--persist-operator-key")
     return spawn_pty_process("server", command)
+
 
 def support_client_url(server: SpawnedProcess) -> str:
     """Build the client connection URL from the server transcript.
