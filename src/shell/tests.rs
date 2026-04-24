@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, ssh_key};
 use russh::{Channel, ChannelMsg};
@@ -7,8 +8,10 @@ use tempfile::tempdir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_tungstenite::accept_async;
 
 use crate::platform::{ShellFamily, ShellLaunch};
+use crate::websocket_to_io;
 
 use super::client::connect_authenticated_client_transport;
 use super::common::{NoopClientHandler, SSH_EXTENDED_DATA_STDERR};
@@ -377,6 +380,64 @@ async fn forwards_direct_tcpip_channels_to_client_network() {
         .await
         .unwrap();
     echo_task.await.unwrap();
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn runs_authenticated_transport_over_websocket_io() {
+    let temp_dir = tempdir().unwrap();
+    let allowed_private_key = Arc::new(
+        PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap(),
+    );
+    let allowed_public_key = allowed_private_key.public_key().clone();
+    let shell = ShellLaunch::detect_for_current_platform().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let websocket = accept_async(socket).await.unwrap();
+        run_remote_shell_server(
+            websocket_to_io(websocket),
+            "support-user".to_string(),
+            allowed_public_key,
+            temp_dir.path().to_path_buf(),
+            shell,
+        )
+        .await
+    });
+
+    let (websocket, _) = tokio_tungstenite::connect_async(format!("ws://{listener_addr}"))
+        .await
+        .unwrap();
+    let session = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect_authenticated_client_transport(
+            websocket_to_io(websocket),
+            "support-user",
+            Arc::clone(&allowed_private_key),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let shell = ShellLaunch::detect_for_current_platform().unwrap();
+    let mut channel = session.channel_open_session().await.unwrap();
+    let command = marker_exec_command(&shell, "websocket-exec");
+    let (stdout, stderr, exit_status) = collect_exec_output(&mut channel, &command).await;
+
+    assert_eq!(stderr, "");
+    assert_eq!(exit_status, 0);
+    assert!(stdout.contains("websocket-exec"));
+
+    session
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en-US")
+        .await
+        .unwrap();
     server_task.await.unwrap().unwrap();
 }
 

@@ -50,6 +50,7 @@ pin_project! {
     struct WebSocketWriter<W> {
         #[pin]
         sink: W,
+        pending_write_len: Option<usize>,
     }
 }
 
@@ -97,6 +98,20 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
+        if let Some(bytes_written) = *this.pending_write_len {
+            return match this.sink.as_mut().poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    *this.pending_write_len = None;
+                    Poll::Ready(Ok(bytes_written))
+                }
+                Poll::Ready(Err(error)) => {
+                    *this.pending_write_len = None;
+                    Poll::Ready(Err(map_websocket_error(error)))
+                }
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -111,7 +126,18 @@ where
             .as_mut()
             .start_send(Message::Binary(Bytes::copy_from_slice(buf)))
             .map_err(map_websocket_error)?;
-        Poll::Ready(Ok(buf.len()))
+        *this.pending_write_len = Some(buf.len());
+        match this.sink.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                *this.pending_write_len = None;
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(error)) => {
+                *this.pending_write_len = None;
+                Poll::Ready(Err(map_websocket_error(error)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -143,7 +169,10 @@ where
     let (sink, stream) = websocket.split();
     Box::pin(DuplexIo {
         reader: StreamReader::new(websocket_reader(stream)),
-        writer: WebSocketWriter { sink },
+        writer: WebSocketWriter {
+            sink,
+            pending_write_len: None,
+        },
     })
 }
 
@@ -457,6 +486,7 @@ mod tests {
 
     struct RecordingPendingFlushSink {
         frames: Arc<Mutex<Vec<Vec<u8>>>>,
+        pending_flushes: Arc<Mutex<usize>>,
     }
 
     impl Sink<Message> for RecordingPendingFlushSink {
@@ -480,6 +510,11 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
+            let mut pending_flushes = self.pending_flushes.lock().unwrap();
+            if *pending_flushes == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            *pending_flushes -= 1;
             Poll::Pending
         }
 
@@ -525,22 +560,28 @@ mod tests {
     }
 
     #[test]
-    fn websocket_writer_reports_writes_before_flush_completes() {
+    fn websocket_writer_waits_for_flush_before_reporting_writes() {
         let frames = Arc::new(Mutex::new(Vec::new()));
+        let pending_flushes = Arc::new(Mutex::new(1));
         let sink = RecordingPendingFlushSink {
             frames: Arc::clone(&frames),
+            pending_flushes,
         };
-        let mut writer = WebSocketWriter { sink };
+        let mut writer = WebSocketWriter {
+            sink,
+            pending_write_len: None,
+        };
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
 
         assert!(matches!(
             Pin::new(&mut writer).poll_write(&mut context, b"first"),
-            Poll::Ready(Ok(5))
-        ));
-        assert!(matches!(
-            Pin::new(&mut writer).poll_flush(&mut context),
             Poll::Pending
+        ));
+        assert_eq!(*frames.lock().unwrap(), vec![b"first".to_vec()]);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut context, b"first"),
+            Poll::Ready(Ok(5))
         ));
         assert!(matches!(
             Pin::new(&mut writer).poll_write(&mut context, b"second"),
