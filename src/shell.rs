@@ -471,7 +471,6 @@ async fn start_ssh_proxy_listener(
             let config = Arc::clone(&config);
             let handler = LocalSshProxyHandler {
                 allowed_username: allowed_username.clone(),
-                allow_unauthenticated: remote_addr.ip().is_loopback(),
                 allowed_public_key: allowed_public_key.clone(),
                 upstream_session: Arc::clone(&upstream_session),
                 channels: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -547,7 +546,6 @@ struct ProxiedSessionChannel {
 
 struct LocalSshProxyHandler {
     allowed_username: String,
-    allow_unauthenticated: bool,
     allowed_public_key: PublicKey,
     upstream_session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
     channels: Arc<AsyncMutex<HashMap<ChannelId, ProxiedSessionChannel>>>,
@@ -626,10 +624,7 @@ impl server::Handler for LocalSshProxyHandler {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, username: &str) -> Result<Auth, Self::Error> {
-        if self.allow_unauthenticated && username == self.allowed_username {
-            debug_log(format!("accepted local SSH proxy none auth for {username}"));
-            return Ok(Auth::Accept);
-        }
+        debug_log(format!("rejected local SSH proxy none auth for {username}"));
         Ok(Auth::reject())
     }
 
@@ -1564,10 +1559,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::duplex;
 
-    async fn connect_none_authenticated_client<S>(
-        io: S,
-        username: &str,
-    ) -> client::Handle<NoopClientHandler>
+    async fn none_authentication_succeeds<S>(io: S, username: &str) -> bool
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1582,8 +1574,15 @@ mod tests {
             .authenticate_none(username.to_string())
             .await
             .unwrap();
-        assert!(auth_result.success());
-        session
+        let success = auth_result.success();
+        let _ = session
+            .disconnect(
+                russh::Disconnect::ByApplication,
+                "none authentication check complete",
+                "en-US",
+            )
+            .await;
+        success
     }
 
     async fn collect_interactive_shell_output(
@@ -2090,11 +2089,24 @@ mod tests {
         .await
         .unwrap();
 
+        let none_auth_stream = TcpStream::connect(proxy_listener.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            !none_authentication_succeeds(none_auth_stream, "support-user").await,
+            "local SSH proxy accepted none authentication"
+        );
+
         let first_proxy_stream = TcpStream::connect(proxy_listener.local_addr())
             .await
             .unwrap();
-        let first_local_client =
-            connect_none_authenticated_client(first_proxy_stream, "support-user").await;
+        let first_local_client = connect_authenticated_client_transport(
+            first_proxy_stream,
+            "support-user",
+            Arc::clone(&allowed_private_key),
+        )
+        .await
+        .unwrap();
         let mut first_channel = first_local_client.channel_open_session().await.unwrap();
         let first_output =
             collect_interactive_shell_output(&mut first_channel, &shell, "proxy-first").await;
@@ -2111,8 +2123,13 @@ mod tests {
         let second_proxy_stream = TcpStream::connect(proxy_listener.local_addr())
             .await
             .unwrap();
-        let second_local_client =
-            connect_none_authenticated_client(second_proxy_stream, "support-user").await;
+        let second_local_client = connect_authenticated_client_transport(
+            second_proxy_stream,
+            "support-user",
+            Arc::clone(&allowed_private_key),
+        )
+        .await
+        .unwrap();
         let mut second_channel = second_local_client.channel_open_session().await.unwrap();
         let second_output =
             collect_interactive_shell_output(&mut second_channel, &shell, "proxy-second").await;
@@ -2180,7 +2197,13 @@ mod tests {
         let proxy_stream = TcpStream::connect(proxy_listener.local_addr())
             .await
             .unwrap();
-        let local_client = connect_none_authenticated_client(proxy_stream, "support-user").await;
+        let local_client = connect_authenticated_client_transport(
+            proxy_stream,
+            "support-user",
+            Arc::clone(&allowed_private_key),
+        )
+        .await
+        .unwrap();
         let mut channel = local_client.channel_open_session().await.unwrap();
         let command = marker_exec_command(&shell, "proxy-exec");
         let (stdout, stderr, exit_status) = collect_exec_output(&mut channel, &command).await;
