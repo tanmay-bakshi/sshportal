@@ -50,7 +50,6 @@ pin_project! {
     struct WebSocketWriter<W> {
         #[pin]
         sink: W,
-        pending_len: Option<usize>,
     }
 }
 
@@ -98,17 +97,6 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
-        if let Some(pending_len) = this.pending_len.as_ref() {
-            ready!(
-                this.sink
-                    .as_mut()
-                    .poll_flush(cx)
-                    .map_err(map_websocket_error)
-            )?;
-            let written_len = *pending_len;
-            *this.pending_len = None;
-            return Poll::Ready(Ok(written_len));
-        }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -123,41 +111,19 @@ where
             .as_mut()
             .start_send(Message::Binary(Bytes::copy_from_slice(buf)))
             .map_err(map_websocket_error)?;
-        *this.pending_len = Some(buf.len());
-        ready!(
-            this.sink
-                .as_mut()
-                .poll_flush(cx)
-                .map_err(map_websocket_error)
-        )?;
-        *this.pending_len = None;
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-        ready!(
-            this.sink
-                .as_mut()
-                .poll_flush(cx)
-                .map_err(map_websocket_error)
-        )?;
-        *this.pending_len = None;
-        Poll::Ready(Ok(()))
+        self.project()
+            .sink
+            .poll_flush(cx)
+            .map_err(map_websocket_error)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-        if this.pending_len.is_some() {
-            ready!(
-                this.sink
-                    .as_mut()
-                    .poll_flush(cx)
-                    .map_err(map_websocket_error)
-            )?;
-            *this.pending_len = None;
-        }
-        this.sink
+        self.project()
+            .sink
             .as_mut()
             .poll_close(cx)
             .map_err(map_websocket_error)
@@ -177,10 +143,7 @@ where
     let (sink, stream) = websocket.split();
     Box::pin(DuplexIo {
         reader: StreamReader::new(websocket_reader(stream)),
-        writer: WebSocketWriter {
-            sink,
-            pending_len: None,
-        },
+        writer: WebSocketWriter { sink },
     })
 }
 
@@ -476,15 +439,57 @@ pub fn normalize_websocket_url(raw_server: &str) -> anyhow::Result<Url> {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{Sink, task::noop_waker};
     use hyper_util::client::proxy::matcher::Matcher;
     use std::io;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
     use super::{
-        connect_async_with_proxy_matcher, normalize_websocket_url, selected_proxy_for_websocket_url,
+        WebSocketWriter, connect_async_with_proxy_matcher, normalize_websocket_url,
+        selected_proxy_for_websocket_url,
     };
+
+    struct RecordingPendingFlushSink {
+        frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Sink<Message> for RecordingPendingFlushSink {
+        type Error = WebSocketError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            if let Message::Binary(bytes) = item {
+                self.frames.lock().unwrap().push(bytes.to_vec());
+            }
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn converts_http_to_websocket() {
@@ -517,6 +522,35 @@ mod tests {
         let proxy = selected_proxy_for_websocket_url(&matcher, &url).unwrap();
 
         assert!(proxy.is_none());
+    }
+
+    #[test]
+    fn websocket_writer_reports_writes_before_flush_completes() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let sink = RecordingPendingFlushSink {
+            frames: Arc::clone(&frames),
+        };
+        let mut writer = WebSocketWriter { sink };
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut context, b"first"),
+            Poll::Ready(Ok(5))
+        ));
+        assert!(matches!(
+            Pin::new(&mut writer).poll_flush(&mut context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut context, b"second"),
+            Poll::Ready(Ok(6))
+        ));
+
+        assert_eq!(
+            *frames.lock().unwrap(),
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
     }
 
     #[tokio::test]
