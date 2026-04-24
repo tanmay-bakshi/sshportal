@@ -1043,6 +1043,18 @@ impl RemoteShellHandler {
             }
         });
 
+        {
+            let mut guard = self.shell_states.lock().await;
+            guard.insert(
+                channel,
+                SessionChannelState::RunningPty {
+                    master,
+                    input_sender: Some(input_sender),
+                    killer,
+                },
+            );
+        }
+
         let exit_handle = handle.clone();
         let shell_states = Arc::clone(&self.shell_states);
         tokio::spawn(async move {
@@ -1058,16 +1070,6 @@ impl RemoteShellHandler {
             let mut guard = shell_states.lock().await;
             guard.remove(&channel);
         });
-
-        let mut guard = self.shell_states.lock().await;
-        guard.insert(
-            channel,
-            SessionChannelState::RunningPty {
-                master,
-                input_sender: Some(input_sender),
-                killer,
-            },
-        );
         Ok(())
     }
 
@@ -1146,6 +1148,17 @@ impl RemoteShellHandler {
         });
 
         let wait_child = Arc::clone(&child);
+        {
+            let mut guard = self.shell_states.lock().await;
+            guard.insert(
+                channel,
+                SessionChannelState::RunningExec {
+                    child,
+                    input_sender: Some(input_sender),
+                },
+            );
+        }
+
         let exit_handle = handle.clone();
         let shell_states = Arc::clone(&self.shell_states);
         tokio::spawn(async move {
@@ -1179,15 +1192,6 @@ impl RemoteShellHandler {
             let mut guard = shell_states.lock().await;
             guard.remove(&channel);
         });
-
-        let mut guard = self.shell_states.lock().await;
-        guard.insert(
-            channel,
-            SessionChannelState::RunningExec {
-                child,
-                input_sender: Some(input_sender),
-            },
-        );
         Ok(())
     }
 }
