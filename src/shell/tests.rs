@@ -49,6 +49,28 @@ where
     success
 }
 
+async fn connect_none_authenticated_client<S>(
+    io: S,
+    username: &str,
+) -> client::Handle<NoopClientHandler>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let client_config = Arc::new(client::Config {
+        inactivity_timeout: None,
+        ..client::Config::default()
+    });
+    let mut session = client::connect_stream(client_config, io, NoopClientHandler)
+        .await
+        .unwrap();
+    let auth_result = session
+        .authenticate_none(username.to_string())
+        .await
+        .unwrap();
+    assert!(auth_result.success());
+    session
+}
+
 async fn collect_interactive_shell_output(
     channel: &mut Channel<client::Msg>,
     shell: &ShellLaunch,
@@ -725,20 +747,15 @@ async fn local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport() {
         .await
         .unwrap();
     assert!(
-        !none_authentication_succeeds(none_auth_stream, "support-user").await,
-        "local SSH proxy accepted none authentication"
+        none_authentication_succeeds(none_auth_stream, "support-user").await,
+        "local SSH proxy rejected loopback none authentication"
     );
 
     let first_proxy_stream = TcpStream::connect(proxy_listener.local_addr())
         .await
         .unwrap();
-    let first_local_client = connect_authenticated_client_transport(
-        first_proxy_stream,
-        "support-user",
-        Arc::clone(&allowed_private_key),
-    )
-    .await
-    .unwrap();
+    let first_local_client =
+        connect_none_authenticated_client(first_proxy_stream, "support-user").await;
     let mut first_channel = first_local_client.channel_open_session().await.unwrap();
     let first_output =
         collect_interactive_shell_output(&mut first_channel, &shell, "proxy-first").await;
@@ -755,13 +772,8 @@ async fn local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport() {
     let second_proxy_stream = TcpStream::connect(proxy_listener.local_addr())
         .await
         .unwrap();
-    let second_local_client = connect_authenticated_client_transport(
-        second_proxy_stream,
-        "support-user",
-        Arc::clone(&allowed_private_key),
-    )
-    .await
-    .unwrap();
+    let second_local_client =
+        connect_none_authenticated_client(second_proxy_stream, "support-user").await;
     let mut second_channel = second_local_client.channel_open_session().await.unwrap();
     let second_output =
         collect_interactive_shell_output(&mut second_channel, &shell, "proxy-second").await;

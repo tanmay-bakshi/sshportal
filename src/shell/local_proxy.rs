@@ -94,6 +94,7 @@ pub(super) async fn start_ssh_proxy_listener(
             let config = Arc::clone(&config);
             let handler = LocalSshProxyHandler {
                 allowed_username: allowed_username.clone(),
+                allow_unauthenticated: remote_addr.ip().is_loopback(),
                 allowed_public_key: allowed_public_key.clone(),
                 upstream_session: Arc::clone(&upstream_session),
                 channels: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -117,6 +118,7 @@ struct ProxiedSessionChannel {
 
 struct LocalSshProxyHandler {
     allowed_username: String,
+    allow_unauthenticated: bool,
     allowed_public_key: PublicKey,
     upstream_session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
     channels: Arc<AsyncMutex<HashMap<ChannelId, ProxiedSessionChannel>>>,
@@ -195,7 +197,10 @@ impl server::Handler for LocalSshProxyHandler {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, username: &str) -> Result<Auth, Self::Error> {
-        debug_log(format!("rejected local SSH proxy none auth for {username}"));
+        if self.allow_unauthenticated && username == self.allowed_username {
+            debug_log(format!("accepted local SSH proxy none auth for {username}"));
+            return Ok(Auth::Accept);
+        }
         Ok(Auth::reject())
     }
 
