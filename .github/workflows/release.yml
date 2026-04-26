@@ -102,7 +102,7 @@ jobs:
           tar -C dist -czf "dist/${archive_stem}.tar.gz" "${archive_stem}"
           sha256sum "dist/${archive_stem}.tar.gz" > "dist/${archive_stem}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -116,9 +116,10 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       TAG_NAME: ${{ github.ref_name }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
