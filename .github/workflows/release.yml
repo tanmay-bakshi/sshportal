@@ -100,7 +100,7 @@ jobs:
           install -m 0644 README.md LICENSE "${package_dir}/"
 
           tar -C dist -czf "dist/${archive_stem}.tar.gz" "${archive_stem}"
-          sha256sum "dist/${archive_stem}.tar.gz" > "dist/${archive_stem}.tar.gz.sha256"
+          (cd dist && sha256sum "${archive_stem}.tar.gz" > "${archive_stem}.tar.gz.sha256")
 
       - uses: actions/upload-artifact@v7
         with:
