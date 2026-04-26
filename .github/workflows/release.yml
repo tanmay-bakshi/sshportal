@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate_tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+    steps:
+      - id: validate
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release_tag=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "release_tag=false" >> "${GITHUB_OUTPUT}"
+          echo "Tag ${TAG_NAME} does not match vX.X.X; skipping release."
+
+  build:
+    needs: validate_tag
+    if: needs.validate_tag.outputs.release_tag == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG_NAME: ${{ github.ref_name }}
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes binutils file musl-tools
+
+      - name: Install Rust target
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target "${TARGET}"
+
+      - name: Build static musl binaries
+        run: cargo +stable build --locked --release --target "${TARGET}" --bins
+
+      - name: Verify static linkage
+        run: |
+          set -euo pipefail
+
+          for binary in \
+            "target/${TARGET}/release/sshportal-client" \
+            "target/${TARGET}/release/sshportal-server"
+          do
+            file "${binary}"
+            if readelf -l "${binary}" | grep -q "Requesting program interpreter"; then
+              echo "${binary} has a dynamic program interpreter" >&2
+              exit 1
+            fi
+            if readelf -d "${binary}" 2>/dev/null | grep -q "(NEEDED)"; then
+              echo "${binary} has dynamic shared library dependencies" >&2
+              exit 1
+            fi
+          done
+
+      - name: Package release archive
+        run: |
+          set -euo pipefail
+
+          archive_stem="sshportal-${TAG_NAME}-${TARGET}"
+          package_dir="dist/${archive_stem}"
+          mkdir -p "${package_dir}"
+
+          install -m 0755 "target/${TARGET}/release/sshportal-client" "${package_dir}/sshportal-client"
+          install -m 0755 "target/${TARGET}/release/sshportal-server" "${package_dir}/sshportal-server"
+          install -m 0644 README.md LICENSE "${package_dir}/"
+
+          tar -C dist -czf "dist/${archive_stem}.tar.gz" "${archive_stem}"
+          sha256sum "dist/${archive_stem}.tar.gz" > "dist/${archive_stem}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          assets=(dist/*.tar.gz dist/*.sha256)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No release assets were downloaded." >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${assets[@]}" --clobber
+            exit 0
+          fi
+
+          gh release create "${TAG_NAME}" "${assets[@]}" --verify-tag --title "${TAG_NAME}" --notes ""

@@ -132,6 +132,11 @@ cargo build --release --target aarch64-unknown-linux-musl --bins
 
 This repository pins `rust-lld` for both musl targets in [`.cargo/config.toml`](.cargo/config.toml), which allows the same commands to work cleanly from macOS hosts.
 
+## Release Tags
+
+Pushing a tag that matches `vX.X.X` publishes a GitHub Release with fully static Linux musl archives for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`.
+Each archive contains `sshportal-client`, `sshportal-server`, `README.md`, and `LICENSE`, and each archive is published with a `.sha256` checksum file.
+
 ## Container Image
 
 The [`Dockerfile`](Dockerfile) packages prebuilt static binaries from `target/<triple>/release` into a small Alpine runtime image:
