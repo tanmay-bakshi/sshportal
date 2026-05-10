@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::io::Result as IoResult;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child as StdChild, ExitStatus, Stdio};
+use std::process::{Child as StdChild, ExitStatus as StdExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use portable_pty::{ChildKiller, MasterPty, PtyPair, PtySize, native_pty_system};
+use portable_pty::{
+    Child as PtyChild, ExitStatus as PtyExitStatus, MasterPty, PtyPair, PtySize, native_pty_system,
+};
 use russh::keys::{PrivateKey, PublicKey, ssh_key};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId};
@@ -80,12 +83,76 @@ enum SessionChannelState {
     RunningPty {
         master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
         input_sender: Option<tokio_mpsc::Sender<Vec<u8>>>,
-        killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+        child: Arc<Mutex<PtyChildState>>,
     },
     RunningExec {
-        child: Arc<Mutex<StdChild>>,
+        child: Arc<Mutex<ExecChildState>>,
         input_sender: Option<tokio_mpsc::Sender<Vec<u8>>>,
     },
+}
+
+struct PtyChildState {
+    child: Box<dyn PtyChild + Send + Sync>,
+    exited: bool,
+}
+
+impl PtyChildState {
+    fn new(child: Box<dyn PtyChild + Send + Sync>) -> Self {
+        Self {
+            child,
+            exited: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> IoResult<Option<PtyExitStatus>> {
+        if self.exited {
+            return Ok(None);
+        }
+        let maybe_status = self.child.try_wait()?;
+        if maybe_status.is_some() {
+            self.exited = true;
+        }
+        Ok(maybe_status)
+    }
+
+    fn kill_if_running(&mut self) -> IoResult<()> {
+        if self.exited {
+            return Ok(());
+        }
+        self.child.kill()
+    }
+}
+
+struct ExecChildState {
+    child: StdChild,
+    exited: bool,
+}
+
+impl ExecChildState {
+    fn new(child: StdChild) -> Self {
+        Self {
+            child,
+            exited: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> IoResult<Option<StdExitStatus>> {
+        if self.exited {
+            return Ok(None);
+        }
+        let maybe_status = self.child.try_wait()?;
+        if maybe_status.is_some() {
+            self.exited = true;
+        }
+        Ok(maybe_status)
+    }
+
+    fn kill_if_running(&mut self) -> IoResult<()> {
+        if self.exited {
+            return Ok(());
+        }
+        self.child.kill()
+    }
 }
 
 struct RemoteShellHandler {
@@ -106,7 +173,7 @@ impl RemoteShellHandler {
         }
     }
 
-    fn exit_status_code(status: ExitStatus) -> u32 {
+    fn exit_status_code(status: StdExitStatus) -> u32 {
         match status.code() {
             Some(code) => u32::try_from(code).unwrap_or(1),
             None => 1,
@@ -151,12 +218,12 @@ impl RemoteShellHandler {
         for (name, value) in &env_vars {
             command.env(name, value);
         }
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(command)
             .context("failed to spawn PTY process")?;
 
-        let killer = Arc::new(Mutex::new(child.clone_killer()));
+        let child = Arc::new(Mutex::new(PtyChildState::new(child)));
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -216,19 +283,38 @@ impl RemoteShellHandler {
                 SessionChannelState::RunningPty {
                     master,
                     input_sender: Some(input_sender),
-                    killer,
+                    child: Arc::clone(&child),
                 },
             );
         }
 
+        let wait_child = Arc::clone(&child);
         let exit_handle = handle.clone();
         let shell_states = Arc::clone(&self.shell_states);
         tokio::spawn(async move {
-            let wait_result = tokio::task::spawn_blocking(move || child.wait()).await;
-            let exit_code: u32 = match wait_result {
-                Ok(Ok(status)) => status.exit_code(),
-                _ => 1,
-            };
+            let exit_code = tokio::task::spawn_blocking(move || -> u32 {
+                loop {
+                    let maybe_status = {
+                        let mut child_guard = match wait_child.lock() {
+                            Ok(child_guard) => child_guard,
+                            Err(_) => return 1,
+                        };
+                        match child_guard.try_wait() {
+                            Ok(status) => status,
+                            Err(error) => {
+                                debug_log(format!("failed to poll PTY process status: {error:#}"));
+                                return 1;
+                            }
+                        }
+                    };
+                    if let Some(status) = maybe_status {
+                        return status.exit_code();
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            })
+            .await
+            .unwrap_or(1);
             debug_log(format!("PTY process exited with status {exit_code}"));
             let _ = exit_handle.exit_status_request(channel, exit_code).await;
             let _ = exit_handle.eof(channel).await;
@@ -269,7 +355,7 @@ impl RemoteShellHandler {
             .take()
             .ok_or_else(|| anyhow!("failed to take exec stdin"))?;
 
-        let child = Arc::new(Mutex::new(child));
+        let child = Arc::new(Mutex::new(ExecChildState::new(child)));
 
         let (input_sender, mut input_receiver) =
             tokio_mpsc::channel::<Vec<u8>>(SESSION_INPUT_CHANNEL_CAPACITY);
@@ -671,16 +757,16 @@ impl server::Handler for RemoteShellHandler {
             guard.remove(&channel)
         };
         match removed_state {
-            Some(SessionChannelState::RunningPty { killer, .. }) => {
+            Some(SessionChannelState::RunningPty { child, .. }) => {
                 debug_log("received SSH channel close");
-                if let Ok(mut killer_guard) = killer.lock() {
-                    let _ = killer_guard.kill();
+                if let Ok(mut child_guard) = child.lock() {
+                    let _ = child_guard.kill_if_running();
                 }
             }
             Some(SessionChannelState::RunningExec { child, .. }) => {
                 debug_log("received SSH channel close");
                 if let Ok(mut child_guard) = child.lock() {
-                    let _ = child_guard.kill();
+                    let _ = child_guard.kill_if_running();
                 }
             }
             _ => {}
@@ -716,5 +802,99 @@ impl server::Handler for RemoteShellHandler {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use portable_pty::{ChildKiller, ExitStatus as PtyExitStatus};
+
+    use super::{PtyChild, PtyChildState};
+
+    #[derive(Debug)]
+    struct FakePtyChild {
+        exit_status: Option<PtyExitStatus>,
+        kill_count: Arc<AtomicUsize>,
+    }
+
+    impl ChildKiller for FakePtyChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kill_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(FakePtyKiller {
+                kill_count: Arc::clone(&self.kill_count),
+            })
+        }
+    }
+
+    impl PtyChild for FakePtyChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<PtyExitStatus>> {
+            Ok(self.exit_status.take())
+        }
+
+        fn wait(&mut self) -> std::io::Result<PtyExitStatus> {
+            Ok(self
+                .exit_status
+                .take()
+                .unwrap_or_else(|| PtyExitStatus::with_exit_code(0)))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakePtyKiller {
+        kill_count: Arc<AtomicUsize>,
+    }
+
+    impl ChildKiller for FakePtyKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kill_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self {
+                kill_count: Arc::clone(&self.kill_count),
+            })
+        }
+    }
+
+    #[test]
+    fn pty_child_state_does_not_signal_after_exit_is_observed() {
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        let child = FakePtyChild {
+            exit_status: Some(PtyExitStatus::with_exit_code(0)),
+            kill_count: Arc::clone(&kill_count),
+        };
+        let mut child_state = PtyChildState::new(Box::new(child));
+
+        let exit_status = child_state.try_wait().unwrap().unwrap();
+        child_state.kill_if_running().unwrap();
+
+        assert_eq!(exit_status.exit_code(), 0);
+        assert_eq!(kill_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pty_child_state_signals_child_before_exit_is_observed() {
+        let kill_count = Arc::new(AtomicUsize::new(0));
+        let child = FakePtyChild {
+            exit_status: None,
+            kill_count: Arc::clone(&kill_count),
+        };
+        let mut child_state = PtyChildState::new(Box::new(child));
+
+        child_state.kill_if_running().unwrap();
+
+        assert_eq!(kill_count.load(Ordering::SeqCst), 1);
     }
 }
