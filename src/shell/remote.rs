@@ -17,11 +17,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as AsyncMutex, mpsc as tokio_mpsc};
 
+use crate::debug::debug_log;
 use crate::platform::ShellLaunch;
 
 use super::common::{
     SESSION_INPUT_CHANNEL_CAPACITY, SESSION_OUTPUT_CHANNEL_CAPACITY, SSH_EXTENDED_DATA_STDERR,
-    debug_log, debug_public_key, same_public_key,
+    debug_public_key, same_public_key,
 };
 use super::forwarding::bridge_ssh_channel_with_tcp_stream;
 

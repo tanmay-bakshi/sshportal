@@ -13,7 +13,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
-use super::common::{NoopClientHandler, debug_log, same_public_key};
+use crate::debug::debug_log;
+
+use super::common::{NoopClientHandler, same_public_key};
 
 pub(super) struct SshProxyListener {
     listen_addr: SocketAddr,
