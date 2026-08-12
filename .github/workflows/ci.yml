@@ -50,6 +50,9 @@ jobs:
         run: cargo test --locked websocket::tests -- --nocapture
       - if: matrix.os == 'windows-latest'
         timeout-minutes: 3
+        run: cargo test --locked proxy::tests::socks_only_proxy_routes_tcp_without_ssh -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        timeout-minutes: 3
         run: cargo test --locked shell::tests::negotiates_socks5_domain_connect_request -- --nocapture
       - if: matrix.os == 'windows-latest'
         timeout-minutes: 3

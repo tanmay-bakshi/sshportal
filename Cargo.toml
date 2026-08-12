@@ -3,10 +3,10 @@ name = "sshportal"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Consent-gated remote shell access over an HTTP or WebSocket rendezvous."
+description = "Consent-gated SSH and SOCKS proxy access over an HTTP or WebSocket rendezvous."
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["ssh", "remote-support", "terminal", "websocket"]
+keywords = ["ssh", "socks", "remote-support", "proxy", "websocket"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]

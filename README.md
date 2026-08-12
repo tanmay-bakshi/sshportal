@@ -1,17 +1,18 @@
 # sshportal
 
-`sshportal` is a Rust remote-support tool that turns a single, user-approved WebSocket attachment into an SSH-accessible shell session. It is built for cases where an operator needs shell access into a user environment without pre-provisioning an always-on agent, VPN, or inbound SSH listener.
+`sshportal` is a Rust remote-support tool that turns a single, user-approved WebSocket attachment into either an SSH-accessible shell session or a SOCKS5 proxy. It is built for cases where an operator needs temporary access into a user environment without pre-provisioning an always-on agent, VPN, or inbound listener.
 
 The project ships two binaries:
 
-- `sshportal-server`: hosts the rendezvous endpoint, prints a one-time join token, and exposes a local SSH proxy once a client connects.
-- `sshportal-client`: connects back to the server, presents environment metadata, prompts the local user for consent, and serves the approved shell session.
+- `sshportal-server`: hosts the rendezvous endpoint, prints a one-time join token, and exposes the selected local proxy once a client connects.
+- `sshportal-client`: connects back to the server, presents environment metadata, prompts the local user for consent, and serves the approved support session.
 
 ## What It Does
 
 - Opens a temporary support session through an HTTP or WebSocket front door.
-- Requires the client-side user to approve shell access before the session becomes active.
+- Requires the client-side user to approve the requested SSH or SOCKS capability before the session becomes active.
 - Reuses the established transport for repeated SSH sessions during the same support window.
+- Can expose a SOCKS5 proxy using a purpose-built TCP multiplexer over the WebSocket, without starting or carrying SSH.
 - Optionally exposes a local SOCKS5 proxy on the server side by forwarding `direct-tcpip` channels through the client.
 - Optionally installs a persistent operator SSH key on POSIX clients when both sides request and approve that action.
 
@@ -21,10 +22,10 @@ The project ships two binaries:
 
 1. The server listens for exactly one client attachment at a time.
 2. The server prints a one-time join token.
-3. The client connects with that token and receives the operator identity and SSH public key.
+3. The client connects with that token and receives the operator identity and requested session mode.
 4. The local user approves or declines the support session.
 5. If approved, the server shuts down the HTTP listener and keeps only the upgraded transport alive for the active session.
-6. The operator reaches the client by SSHing to the local proxy listener that the server binds.
+6. The operator uses the SSH or SOCKS listener that the server binds locally.
 
 This keeps the trust model easy to inspect. There is no long-lived daemon on the client side, no background control plane, and no multi-session broker.
 
@@ -81,9 +82,39 @@ cargo run --bin sshportal-client -- \
   --approve-key-install
 ```
 
-## Dynamic Forwarding
+## SOCKS-Only Mode
 
-To expose a local SOCKS5 proxy on the server side for the lifetime of the session:
+To expose only a local SOCKS5 proxy on the operator's side, start the server with `--socks-only`:
+
+```bash
+cargo run --bin sshportal-server -- \
+  --listen 0.0.0.0:8080 \
+  --operator-name support-team \
+  --socks-only 127.0.0.1:1080
+```
+
+The client connects normally and receives a consent prompt that specifically describes TCP proxy access:
+
+```bash
+cargo run --bin sshportal-client -- \
+  --server "https://support.example.com?token=<printed-token>"
+```
+
+Once approved, use the listener from the operator's machine, for example:
+
+```bash
+curl --proxy socks5h://127.0.0.1:1080 https://example.com
+```
+
+This mode does not generate or exchange SSH keys, detect or launch a shell, start an SSH server, or carry traffic in SSH channels. Each SOCKS `CONNECT` destination is opened by the client and its TCP stream is multiplexed directly over the existing WebSocket. The implementation uses Tokio's cross-platform TCP APIs and is covered by the same raw-proxy end-to-end test on Linux, macOS, and Windows CI.
+
+The SOCKS listener is unauthenticated. Keep it bound to a loopback address unless other hosts should deliberately be allowed to use the client network.
+
+SOCKS-only mode has no inner SSH encryption, so its confidentiality depends on the WebSocket transport. Use an HTTPS/WSS endpoint outside a trusted network. The client emits a warning when this mode is negotiated over plain WS.
+
+## SSH-Backed Dynamic Forwarding
+
+An SSH support session can also expose a SOCKS5 listener backed by SSH `direct-tcpip` channels:
 
 ```bash
 cargo run --bin sshportal-server -- \
@@ -93,8 +124,7 @@ cargo run --bin sshportal-server -- \
   --dynamic-forward 127.0.0.1:1080
 ```
 
-The SOCKS5 listener accepts unauthenticated `CONNECT` requests, matching the forwarding model of `ssh -D`.
-Destinations are opened from the approved client environment, so the proxy uses the client network on Linux, macOS, and Windows.
+This is intentionally different from `--socks-only`: SSH authentication and transport are active, and both the local SSH listener and the SOCKS listener are available. The SOCKS5 listener accepts unauthenticated `CONNECT` requests, matching the forwarding model of `ssh -D`. Destinations are opened from the approved client environment, so the proxy uses the client network on Linux, macOS, and Windows.
 
 ## Build
 

@@ -8,7 +8,9 @@ use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::common::{NoopClientHandler, debug_log, debug_public_key};
+use crate::debug::debug_log;
+
+use super::common::{NoopClientHandler, debug_public_key};
 use super::local_proxy::start_ssh_proxy_listener;
 use super::socks::start_dynamic_forward_listener;
 

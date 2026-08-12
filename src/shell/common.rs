@@ -1,8 +1,8 @@
-use std::env;
-
 use anyhow::Result;
 use russh::client;
 use russh::keys::{PublicKey, ssh_key};
+
+use crate::debug::debug_enabled;
 
 #[derive(Default)]
 pub(super) struct NoopClientHandler;
@@ -15,16 +15,6 @@ impl client::Handler for NoopClientHandler {
         _server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
-    }
-}
-
-fn debug_enabled() -> bool {
-    env::var_os("SSHPORTAL_DEBUG").is_some()
-}
-
-pub(super) fn debug_log(message: impl AsRef<str>) {
-    if debug_enabled() {
-        eprintln!("[sshportal-debug] {}", message.as_ref());
     }
 }
 

@@ -11,17 +11,18 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::accept_async;
 
 use crate::platform::{ShellFamily, ShellLaunch};
+use crate::socks::{
+    SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
+    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksConnectTarget,
+    negotiate_socks5,
+};
 use crate::websocket_to_io;
 
 use super::client::connect_authenticated_client_transport;
 use super::common::{NoopClientHandler, SSH_EXTENDED_DATA_STDERR};
 use super::local_proxy::start_ssh_proxy_listener;
 use super::remote::run_remote_shell_server;
-use super::socks::{
-    SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
-    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksConnectTarget,
-    negotiate_socks5, start_dynamic_forward_listener,
-};
+use super::socks::start_dynamic_forward_listener;
 
 async fn none_authentication_succeeds<S>(io: S, username: &str) -> bool
 where

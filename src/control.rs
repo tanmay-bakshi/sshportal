@@ -12,7 +12,6 @@ pub struct ClientMetadata {
     pub hostname: String,
     pub username: String,
     pub working_directory: String,
-    pub preferred_shell: String,
     pub platform: Platform,
 }
 
@@ -26,8 +25,17 @@ pub struct ClientHello {
 pub struct ServerOffer {
     pub protocol_version: u32,
     pub operator_name: String,
-    pub ssh_public_key: String,
-    pub persist_key_requested: bool,
+    pub session: OfferedSession,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum OfferedSession {
+    Ssh {
+        ssh_public_key: String,
+        persist_key_requested: bool,
+    },
+    Socks,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

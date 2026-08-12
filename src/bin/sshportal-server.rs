@@ -26,8 +26,9 @@ use url::form_urlencoded;
 
 use sshportal::{
     ClientDecision, ClientHello, ControlPacket, DEFAULT_CONNECT_PATH, DEFAULT_HEALTH_PATH,
-    OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, load_operator_key, recv_packet,
-    run_client_session_proxy, send_packet, validate_protocol_version, websocket_to_io,
+    OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, load_operator_key,
+    recv_packet, run_client_session_proxy, run_operator_socks_proxy, send_packet,
+    validate_protocol_version, websocket_to_io,
 };
 
 use russh::keys::ssh_key::rand_core::{OsRng, RngCore};
@@ -35,9 +36,9 @@ use russh::keys::ssh_key::rand_core::{OsRng, RngCore};
 #[derive(Parser, Debug)]
 #[command(
     name = "sshportal-server",
-    about = "Accept one consent-gated support client and expose it as a local SSH proxy.",
-    long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and exposes the approved session through a local SSH listener.",
-    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key"
+    about = "Accept one consent-gated support client and expose an SSH or SOCKS proxy.",
+    long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and exposes either an SSH session or a SOCKS-only proxy after client approval.",
+    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080"
 )]
 struct ServerCli {
     /// HTTP address for the one-time rendezvous endpoint.
@@ -61,11 +62,23 @@ struct ServerCli {
     #[arg(long)]
     persist_operator_key: bool,
     /// Local SSH proxy listener that the operator connects to after approval.
-    #[arg(long, default_value = "127.0.0.1:0", value_name = "LISTEN_ADDR")]
+    #[arg(
+        long,
+        default_value = "127.0.0.1:0",
+        value_name = "LISTEN_ADDR",
+        conflicts_with = "socks_only"
+    )]
     ssh_listen: SocketAddr,
     /// Optional local SOCKS5 listener to expose for the lifetime of the session.
-    #[arg(long, value_name = "LISTEN_ADDR")]
+    #[arg(long, value_name = "LISTEN_ADDR", conflicts_with = "socks_only")]
     dynamic_forward: Option<SocketAddr>,
+    /// Run without SSH and expose only this local SOCKS5 listener.
+    #[arg(
+        long,
+        value_name = "LISTEN_ADDR",
+        conflicts_with_all = ["operator_key", "persist_operator_key"]
+    )]
+    socks_only: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,9 +138,35 @@ struct AppState {
     operator_name: String,
     join_token: String,
     handshake_timeout: Duration,
-    operator_key: OperatorKeyMaterial,
-    ssh_listen: SocketAddr,
-    dynamic_forward: Option<SocketAddr>,
+    session_mode: ServerSessionMode,
+}
+
+enum ServerSessionMode {
+    Ssh {
+        operator_key: OperatorKeyMaterial,
+        ssh_listen: SocketAddr,
+        dynamic_forward: Option<SocketAddr>,
+    },
+    Socks {
+        listen_addr: SocketAddr,
+    },
+}
+
+impl ServerSessionMode {
+    fn offer(&self, operator_name: String) -> ServerOffer {
+        let session = match self {
+            Self::Ssh { operator_key, .. } => OfferedSession::Ssh {
+                ssh_public_key: operator_key.public_key_openssh().to_string(),
+                persist_key_requested: operator_key.persistent(),
+            },
+            Self::Socks { .. } => OfferedSession::Socks,
+        };
+        ServerOffer {
+            protocol_version: PROTOCOL_VERSION,
+            operator_name,
+            session,
+        }
+    }
 }
 
 struct EstablishedSession {
@@ -138,8 +177,8 @@ struct EstablishedSession {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = ServerCli::parse();
+    let session_mode = resolve_session_mode(&cli)?;
     let join_token = resolve_join_token(cli.join_token)?;
-    let operator_key = load_operator_key(cli.operator_key.as_deref(), cli.persist_operator_key)?;
 
     let listener = TcpListener::bind(cli.listen)
         .await
@@ -153,9 +192,7 @@ async fn main() -> Result<()> {
         operator_name: cli.operator_name.clone(),
         join_token: join_token.clone(),
         handshake_timeout: Duration::from_secs(cli.handshake_timeout_seconds),
-        operator_key,
-        ssh_listen: cli.ssh_listen,
-        dynamic_forward: cli.dynamic_forward,
+        session_mode,
     });
 
     println!("sshportal server listening on http://{}", cli.listen);
@@ -168,9 +205,21 @@ async fn main() -> Result<()> {
         "handshake timeout: {}",
         format_duration(Duration::from_secs(cli.handshake_timeout_seconds))
     );
-    println!("local SSH proxy requested on {}", cli.ssh_listen);
-    if let Some(listen_addr) = cli.dynamic_forward {
-        println!("dynamic SOCKS5 proxy requested on {listen_addr}");
+    match &state.session_mode {
+        ServerSessionMode::Ssh {
+            ssh_listen,
+            dynamic_forward,
+            ..
+        } => {
+            println!("local SSH proxy requested on {ssh_listen}");
+            if let Some(listen_addr) = dynamic_forward {
+                println!("SSH-backed dynamic SOCKS5 proxy requested on {listen_addr}");
+            }
+        }
+        ServerSessionMode::Socks { listen_addr } => {
+            println!("SOCKS-only proxy requested on {listen_addr} (SSH disabled)");
+            println!("SOCKS-only traffic relies on WSS for transport encryption");
+        }
     }
 
     let http_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));
@@ -184,15 +233,26 @@ async fn main() -> Result<()> {
         let mut status = state.status.write().await;
         *status = SessionSummary::connected();
     }
-    let transport = websocket_to_io(established_session.websocket);
-    let session_result = run_client_session_proxy(
-        transport,
-        &established_session.client_hello.metadata.username,
-        Arc::clone(state.operator_key.private_key()),
-        state.ssh_listen,
-        state.dynamic_forward,
-    )
-    .await;
+    let session_result = match &state.session_mode {
+        ServerSessionMode::Ssh {
+            operator_key,
+            ssh_listen,
+            dynamic_forward,
+        } => {
+            let transport = websocket_to_io(established_session.websocket);
+            run_client_session_proxy(
+                transport,
+                &established_session.client_hello.metadata.username,
+                Arc::clone(operator_key.private_key()),
+                *ssh_listen,
+                *dynamic_forward,
+            )
+            .await
+        }
+        ServerSessionMode::Socks { listen_addr } => {
+            run_operator_socks_proxy(established_session.websocket, *listen_addr).await
+        }
+    };
     {
         let mut status = state.status.write().await;
         match &session_result {
@@ -346,12 +406,7 @@ async fn handle_support_session(
     };
     validate_protocol_version(client_hello.protocol_version)?;
 
-    let offer = ServerOffer {
-        protocol_version: PROTOCOL_VERSION,
-        operator_name: state.operator_name.clone(),
-        ssh_public_key: state.operator_key.public_key_openssh().to_string(),
-        persist_key_requested: state.operator_key.persistent(),
-    };
+    let offer = state.session_mode.offer(state.operator_name.clone());
     send_packet(&mut websocket, &ControlPacket::ServerOffer(offer)).await?;
 
     let decision = match recv_packet(&mut websocket).await? {
@@ -388,6 +443,18 @@ fn plain_response(status: StatusCode, body: impl Into<String>) -> Response<Full<
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+fn resolve_session_mode(cli: &ServerCli) -> Result<ServerSessionMode> {
+    if let Some(listen_addr) = cli.socks_only {
+        return Ok(ServerSessionMode::Socks { listen_addr });
+    }
+    let operator_key = load_operator_key(cli.operator_key.as_deref(), cli.persist_operator_key)?;
+    Ok(ServerSessionMode::Ssh {
+        operator_key,
+        ssh_listen: cli.ssh_listen,
+        dynamic_forward: cli.dynamic_forward,
+    })
 }
 
 fn resolve_join_token(join_token: Option<String>) -> Result<String> {
@@ -457,6 +524,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
+    use clap::Parser;
     use hyper::{Request, StatusCode};
     use russh::keys::ssh_key::rand_core::OsRng as KeyOsRng;
     use russh::keys::{PrivateKey, ssh_key};
@@ -465,8 +533,8 @@ mod tests {
     use tokio_tungstenite::{connect_async, tungstenite::Error as WebSocketError};
 
     use super::{
-        AppState, SessionSummary, render_status_body, request_matches_join_token,
-        resolve_join_token, run_http_server,
+        AppState, ServerCli, ServerSessionMode, SessionSummary, render_status_body,
+        request_matches_join_token, resolve_join_token, resolve_session_mode, run_http_server,
     };
     use sshportal::{DEFAULT_CONNECT_PATH, OperatorKeyMaterial};
 
@@ -483,6 +551,32 @@ mod tests {
 
         assert_eq!(token.len(), 32);
         assert!(token.chars().all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn socks_only_mode_does_not_require_ssh_configuration() {
+        let cli = ServerCli::try_parse_from(["sshportal-server", "--socks-only", "127.0.0.1:1080"])
+            .unwrap();
+
+        let mode = resolve_session_mode(&cli).unwrap();
+        assert!(matches!(
+            mode,
+            ServerSessionMode::Socks { listen_addr }
+                if listen_addr == "127.0.0.1:1080".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn socks_only_mode_rejects_ssh_listener_configuration() {
+        let result = ServerCli::try_parse_from([
+            "sshportal-server",
+            "--socks-only",
+            "127.0.0.1:1080",
+            "--ssh-listen",
+            "127.0.0.1:2222",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -521,9 +615,11 @@ mod tests {
             operator_name: "support".to_string(),
             join_token: "join-token".to_string(),
             handshake_timeout: Duration::from_millis(150),
-            operator_key: test_operator_key_material(),
-            ssh_listen: "127.0.0.1:0".parse().unwrap(),
-            dynamic_forward: None,
+            session_mode: ServerSessionMode::Ssh {
+                operator_key: test_operator_key_material(),
+                ssh_listen: "127.0.0.1:0".parse().unwrap(),
+                dynamic_forward: None,
+            },
         });
 
         let server_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));
@@ -555,9 +651,11 @@ mod tests {
             operator_name: "support".to_string(),
             join_token: "join-token".to_string(),
             handshake_timeout: Duration::from_secs(1),
-            operator_key: test_operator_key_material(),
-            ssh_listen: "127.0.0.1:0".parse().unwrap(),
-            dynamic_forward: None,
+            session_mode: ServerSessionMode::Ssh {
+                operator_key: test_operator_key_material(),
+                ssh_listen: "127.0.0.1:0".parse().unwrap(),
+                dynamic_forward: None,
+            },
         });
 
         let server_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));

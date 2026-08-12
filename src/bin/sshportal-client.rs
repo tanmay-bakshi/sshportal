@@ -10,17 +10,17 @@ use hostname::get;
 
 use sshportal::{
     AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ControlPacket,
-    PROTOCOL_VERSION, Platform, ServerOffer, ShellLaunch, authorized_key_support,
+    OfferedSession, PROTOCOL_VERSION, Platform, ShellLaunch, authorized_key_support,
     connect_async_with_env_proxy, install_default_rustls_crypto_provider, normalize_websocket_url,
-    parse_public_key, recv_packet, run_remote_shell_server, send_packet, validate_protocol_version,
-    websocket_to_io,
+    parse_public_key, recv_packet, run_client_socks_proxy, run_remote_shell_server, send_packet,
+    validate_protocol_version, websocket_to_io,
 };
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sshportal-client",
     about = "Connect back to an sshportal server and request local user approval.",
-    long_about = "Connect to an sshportal rendezvous endpoint, complete the handshake, and serve the approved shell session back to the operator over the upgraded transport.",
+    long_about = "Connect to an sshportal rendezvous endpoint, complete the handshake, and serve the approved SSH or SOCKS-only support session back to the operator over the upgraded transport.",
     after_help = "Examples:\n  sshportal-client --server http://server-host:8080?token=<join-token>\n  sshportal-client --server https://support.example.com?token=<join-token> --approve-session"
 )]
 struct ClientCli {
@@ -40,7 +40,6 @@ struct ClientCli {
 
 struct LocalClientEnvironment {
     metadata: ClientMetadata,
-    shell: ShellLaunch,
 }
 
 struct KeyInstallOutcome {
@@ -71,14 +70,19 @@ async fn main() -> Result<()> {
     };
     validate_protocol_version(offer.protocol_version)?;
 
-    let public_key = parse_public_key(&offer.ssh_public_key)?;
+    let session_description = match &offer.session {
+        OfferedSession::Ssh { .. } => "open SSH support sessions into this environment",
+        OfferedSession::Socks => {
+            "route TCP connections through this environment using a SOCKS5 proxy"
+        }
+    };
     let session_allowed = if cli.approve_session {
         true
     } else {
         prompt_yes_no(
             &format!(
-                "Allow {} to open SSH support sessions into this environment while this connection remains open?",
-                offer.operator_name
+                "Allow {} to {session_description} while this connection remains open?",
+                offer.operator_name,
             ),
             false,
         )?
@@ -93,23 +97,52 @@ async fn main() -> Result<()> {
         bail!("support session was declined locally");
     }
 
-    let key_install = maybe_install_operator_key(&cli, &offer)?;
-    let decision = ClientDecision {
-        session_allowed: true,
-        key_installed: key_install.installed,
-        note: key_install.note,
-    };
-    send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
+    match offer.session {
+        OfferedSession::Ssh {
+            ssh_public_key,
+            persist_key_requested,
+        } => {
+            let public_key = parse_public_key(&ssh_public_key)?;
+            let shell = ShellLaunch::detect_for_current_platform()?;
+            let key_install = maybe_install_operator_key(
+                &cli,
+                &offer.operator_name,
+                &ssh_public_key,
+                persist_key_requested,
+            )?;
+            let decision = ClientDecision {
+                session_allowed: true,
+                key_installed: key_install.installed,
+                note: key_install.note,
+            };
+            send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
 
-    let transport = websocket_to_io(websocket);
-    run_remote_shell_server(
-        transport,
-        client_environment.metadata.username,
-        public_key,
-        PathBuf::from(client_environment.metadata.working_directory),
-        client_environment.shell,
-    )
-    .await
+            let transport = websocket_to_io(websocket);
+            run_remote_shell_server(
+                transport,
+                client_environment.metadata.username,
+                public_key,
+                PathBuf::from(client_environment.metadata.working_directory),
+                shell,
+            )
+            .await
+        }
+        OfferedSession::Socks => {
+            if server_url.scheme() == "ws" {
+                eprintln!(
+                    "warning: SOCKS-only traffic is using an unencrypted WebSocket; use HTTPS/WSS outside a trusted network"
+                );
+            }
+            let decision = ClientDecision {
+                session_allowed: true,
+                key_installed: false,
+                note: None,
+            };
+            send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
+            println!("SOCKS-only support session approved (SSH disabled)");
+            run_client_socks_proxy(websocket).await
+        }
+    }
 }
 
 fn gather_client_environment() -> Result<LocalClientEnvironment> {
@@ -126,21 +159,23 @@ fn gather_client_environment() -> Result<LocalClientEnvironment> {
         .display()
         .to_string();
     let platform = Platform::current()?;
-    let shell = ShellLaunch::detect_for_current_platform()?;
     Ok(LocalClientEnvironment {
         metadata: ClientMetadata {
             hostname,
             username,
             working_directory,
-            preferred_shell: shell.label().to_string(),
             platform,
         },
-        shell,
     })
 }
 
-fn maybe_install_operator_key(cli: &ClientCli, offer: &ServerOffer) -> Result<KeyInstallOutcome> {
-    if !offer.persist_key_requested {
+fn maybe_install_operator_key(
+    cli: &ClientCli,
+    operator_name: &str,
+    ssh_public_key: &str,
+    persist_key_requested: bool,
+) -> Result<KeyInstallOutcome> {
+    if !persist_key_requested {
         return Ok(KeyInstallOutcome {
             installed: false,
             note: None,
@@ -163,7 +198,7 @@ fn maybe_install_operator_key(cli: &ClientCli, offer: &ServerOffer) -> Result<Ke
         prompt_yes_no(
             &format!(
                 "Persist {}'s SSH key into {} for future access?",
-                offer.operator_name,
+                operator_name,
                 target.prompt_path()
             ),
             false,
@@ -177,7 +212,7 @@ fn maybe_install_operator_key(cli: &ClientCli, offer: &ServerOffer) -> Result<Ke
     }
 
     let installed = target
-        .install(&offer.ssh_public_key)
+        .install(ssh_public_key)
         .with_context(|| format!("failed to add the operator key to {}", target.prompt_path()))?;
     Ok(KeyInstallOutcome {
         installed,
