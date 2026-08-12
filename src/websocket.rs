@@ -12,18 +12,18 @@ use hyper::header::HeaderValue;
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use pin_project_lite::pin_project;
 use rustls::RootCertStore;
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{Error as WebSocketError, Message, handshake::client::Response},
 };
 use tokio_util::io::StreamReader;
 use url::Url;
 
-use crate::DEFAULT_CONNECT_PATH;
+use crate::{DEFAULT_CONNECT_PATH, debug::debug_log};
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send {}
 
@@ -213,7 +213,13 @@ async fn connect_async_with_proxy_matcher(
         None => connect_direct(url).await?,
     };
 
-    client_async_tls_with_config(url.as_str(), stream, None, None)
+    let connector = match url.scheme() {
+        "wss" => Some(Connector::Rustls(tls_client_config())),
+        "ws" => None,
+        unsupported => bail!("unsupported websocket URL scheme `{unsupported}`"),
+    };
+
+    client_async_tls_with_config(url.as_str(), stream, None, connector)
         .await
         .context("failed to complete websocket handshake")
 }
@@ -333,26 +339,57 @@ async fn connect_to_https_proxy(
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let server_name = ServerName::try_from(proxy_host.to_string())
         .map_err(|_| anyhow!("proxy host `{proxy_host}` is not a valid TLS server name"))?;
-    let connector = TlsConnector::from(proxy_tls_config());
+    let connector = TlsConnector::from(tls_client_config());
     connector
         .connect(server_name, socket)
         .await
         .with_context(|| format!("failed to negotiate TLS with HTTPS proxy `{proxy_host}`"))
 }
 
-fn proxy_tls_config() -> Arc<rustls::ClientConfig> {
-    static PROXY_TLS_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+fn tls_client_config() -> Arc<rustls::ClientConfig> {
+    static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
-    Arc::clone(PROXY_TLS_CONFIG.get_or_init(|| {
+    Arc::clone(TLS_CLIENT_CONFIG.get_or_init(|| {
         crate::install_default_rustls_crypto_provider();
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let rustls_native_certs::CertificateResult {
+            certs,
+            errors,
+            ..
+        } = rustls_native_certs::load_native_certs();
+        if !errors.is_empty() {
+            debug_log(format!(
+                "native root CA certificate loading errors: {errors:?}"
+            ));
+        }
+
+        let native_certificate_count = certs.len();
+        let (root_store, native_certificates_added, native_certificates_ignored) =
+            build_tls_root_store(certs);
+        debug_log(format!(
+            "loaded {native_certificates_added}/{native_certificate_count} native root CA certificates (ignored {native_certificates_ignored}); using {} bundled roots",
+            webpki_roots::TLS_SERVER_ROOTS.len()
+        ));
+
         Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         )
     }))
+}
+
+fn build_tls_root_store(
+    native_certificates: Vec<CertificateDer<'static>>,
+) -> (RootCertStore, usize, usize) {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let (native_certificates_added, native_certificates_ignored) =
+        root_store.add_parsable_certificates(native_certificates);
+    (
+        root_store,
+        native_certificates_added,
+        native_certificates_ignored,
+    )
 }
 
 async fn establish_connect_tunnel(
@@ -470,6 +507,7 @@ pub fn normalize_websocket_url(raw_server: &str) -> anyhow::Result<Url> {
 mod tests {
     use futures_util::{Sink, task::noop_waker};
     use hyper_util::client::proxy::matcher::Matcher;
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
     use std::io;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -480,9 +518,20 @@ mod tests {
     use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
     use super::{
-        WebSocketWriter, connect_async_with_proxy_matcher, normalize_websocket_url,
-        selected_proxy_for_websocket_url,
+        WebSocketWriter, build_tls_root_store, connect_async_with_proxy_matcher,
+        normalize_websocket_url, selected_proxy_for_websocket_url,
     };
+
+    const TEST_NATIVE_ROOT_CERTIFICATE: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIBazCCAR2gAwIBAgIUIl6xecIvHza8CC6c3b5ZUbfFE7swBQYDK2VwMCsxKTAn
+BgNVBAMMIHNzaHBvcnRhbCBuYXRpdmUgcm9vdCBtZXJnZSB0ZXN0MB4XDTI2MDgx
+MjE2MzcxNloXDTM2MDgwOTE2MzcxNlowKzEpMCcGA1UEAwwgc3NocG9ydGFsIG5h
+dGl2ZSByb290IG1lcmdlIHRlc3QwKjAFBgMrZXADIQA8KF+Gcy+GqUpfeWjDB9D1
+hTm7PJtaT34dc/i+5F1kN6NTMFEwHQYDVR0OBBYEFHdP8oekGiEMC7BfrsMRaWk7
+ZKhZMB8GA1UdIwQYMBaAFHdP8oekGiEMC7BfrsMRaWk7ZKhZMA8GA1UdEwEB/wQF
+MAMBAf8wBQYDK2VwA0EAciJzM+9N5X1Jp3zVnaD3eBnAp7d2Yv4KrjE0eSICEQ2d
+Yj+p86hqrfFe/aJy8QnX+6Uy5sEBgCQI9BDEOJ8yDw==
+-----END CERTIFICATE-----"#;
 
     struct RecordingPendingFlushSink {
         frames: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -557,6 +606,30 @@ mod tests {
         let proxy = selected_proxy_for_websocket_url(&matcher, &url).unwrap();
 
         assert!(proxy.is_none());
+    }
+
+    #[test]
+    fn retains_bundled_roots_when_no_native_roots_are_available() {
+        let (root_store, native_certificates_added, native_certificates_ignored) =
+            build_tls_root_store(Vec::new());
+
+        assert_eq!(root_store.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        assert_eq!(native_certificates_added, 0);
+        assert_eq!(native_certificates_ignored, 0);
+    }
+
+    #[test]
+    fn merges_parsable_native_roots_and_ignores_malformed_ones() {
+        let native_root = CertificateDer::from_pem_slice(TEST_NATIVE_ROOT_CERTIFICATE).unwrap();
+        let malformed_root = CertificateDer::from(vec![0_u8]);
+        let bundled_root_count = webpki_roots::TLS_SERVER_ROOTS.len();
+
+        let (root_store, native_certificates_added, native_certificates_ignored) =
+            build_tls_root_store(vec![native_root, malformed_root]);
+
+        assert_eq!(root_store.len(), bundled_root_count + 1);
+        assert_eq!(native_certificates_added, 1);
+        assert_eq!(native_certificates_ignored, 1);
     }
 
     #[test]
