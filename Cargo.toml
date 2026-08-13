@@ -1,6 +1,6 @@
 [package]
 name = "sshportal"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.90"
 description = "Consent-gated SSH, SOCKS proxy, and VPN access over a WebSocket rendezvous."

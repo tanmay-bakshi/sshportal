@@ -82,7 +82,7 @@
 		5EC8213AED881B1AC542BDFD /* SOCKSProtocol.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSProtocol.swift; sourceTree = "<group>"; };
 		6621A87FF59B14290B14A3C5 /* AppProxyProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AppProxyProvider.swift; sourceTree = "<group>"; };
 		6E77E4E7F6466A498263347E /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/AppKit.framework; sourceTree = DEVELOPER_DIR; };
-		711B1D01E946614118E181A5 /* SSHPortalAppProxyTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SSHPortalAppProxyTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		711B1D01E946614118E181A5 /* SSHPortalAppProxyTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; name = SSHPortalAppProxyTests.xctest; path = "SSHPortal App Proxy Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		86F8883BEF20380E2B3AEB1A /* SystemExtensionInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstaller.swift; sourceTree = "<group>"; };
 		89AEDCA07F8F5F7CF6E2D737 /* main.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		8B54E4B1FA970B2FA12B2997 /* FlowBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowBridge.swift; sourceTree = "<group>"; };
@@ -96,7 +96,7 @@
 		B6B810E02E03936505153D23 /* PerAppVPNController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNController.swift; sourceTree = "<group>"; };
 		B7891E34ACA1A7CE027BBA63 /* SSHPortalAppProxy.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = SSHPortalAppProxy.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		BE1459BD0C540A31615DE856 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
-		CBB1BDDAB742E62A4E965421 /* generate_project.rb */ = {isa = PBXFileReference; includeInIndex = 1; path = generate_project.rb; sourceTree = "<group>"; };
+		CBB1BDDAB742E62A4E965421 /* generate_project.rb */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.script.ruby; path = generate_project.rb; sourceTree = "<group>"; };
 		DC887C5CD04DA6F89FF20D0A /* ApplicationCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ApplicationCoordinator.swift; sourceTree = "<group>"; };
 		E0CD6AA3047A80E1C3E87F8B /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/NetworkExtension.framework; sourceTree = DEVELOPER_DIR; };
 		E69786820EBFA1E6766D9DAF /* SignedApplicationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SignedApplicationTests.swift; sourceTree = "<group>"; };
@@ -156,7 +156,6 @@
 				0904CADC2CCCE46671AFCCF8 /* SignedApplication.swift */,
 				86F8883BEF20380E2B3AEB1A /* SystemExtensionInstaller.swift */,
 			);
-			name = App;
 			path = App;
 			sourceTree = "<group>";
 		};
@@ -169,7 +168,6 @@
 				9715CB4600504002FCC4FF75 /* SSHPortalAppProxyDeveloperID.entitlements */,
 				151AC27727F9223A839779C3 /* SSHPortalDeveloperID.entitlements */,
 			);
-			name = Support;
 			path = Support;
 			sourceTree = "<group>";
 		};
@@ -178,7 +176,6 @@
 			children = (
 				9896ABBCAFAAB4FF1490905E /* SSHPortalConfiguration.swift */,
 			);
-			name = Shared;
 			path = Shared;
 			sourceTree = "<group>";
 		};
@@ -193,7 +190,6 @@
 				F22D3B36BFAB7C78243DFB7B /* SOCKSConnection.swift */,
 				5EC8213AED881B1AC542BDFD /* SOCKSProtocol.swift */,
 			);
-			name = AppProxyExtension;
 			path = AppProxyExtension;
 			sourceTree = "<group>";
 		};
@@ -204,7 +200,6 @@
 				E69786820EBFA1E6766D9DAF /* SignedApplicationTests.swift */,
 				EC8FB660ED26DFB05D0E024E /* SOCKSProtocolTests.swift */,
 			);
-			name = Tests;
 			path = Tests;
 			sourceTree = "<group>";
 		};
@@ -319,6 +314,19 @@
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 2700;
 				ORGANIZATIONNAME = "Tanmay Bakshi";
+				TargetAttributes = {
+					53F1010CBEC0DE856D5F5EBD = {
+						ProvisioningStyle = Automatic;
+					};
+					9036BB44520513A797A94B0C = {
+						DevelopmentTeam = 998XWVFVMR;
+						ProvisioningStyle = Automatic;
+					};
+					BC5B8DE57101619A5270AFD4 = {
+						DevelopmentTeam = 998XWVFVMR;
+						ProvisioningStyle = Automatic;
+					};
+				};
 			};
 			buildConfigurationList = 3864EDED87D4A811F1511788 /* Build configuration list for PBXProject "SSHPortal" */;
 			compatibilityVersion = "Xcode 3.2";
@@ -329,8 +337,6 @@
 				Base,
 			);
 			mainGroup = 4D3141699625BF38D577E441;
-			minimizedProjectReferenceProxies = 0;
-			preferredProjectObjectVersion = 77;
 			productRefGroup = 62801A6C57A08B12F01A09FC /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -493,7 +499,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyTests;
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;
@@ -514,7 +520,7 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AppProxyExtension/Info.plist;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyExtension;
 				PRODUCT_NAME = SSHPortalAppProxy;
 				PROVISIONING_PROFILE_SPECIFIER = "$(SSHPORTAL_EXTENSION_PROFILE)";
@@ -541,7 +547,7 @@
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos;
 				PRODUCT_NAME = SSHPortal;
 				PROVISIONING_PROFILE_SPECIFIER = "$(SSHPORTAL_APP_PROFILE)";
@@ -599,8 +605,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_COMPILATION_MODE = wholemodule;
-				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_OPTIMIZATION_LEVEL = "-Owholemodule";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
@@ -613,11 +618,12 @@
 				CODE_SIGN_ENTITLEMENTS = Support/SSHPortalAppProxy.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 998XWVFVMR;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AppProxyExtension/Info.plist;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyExtension;
 				PRODUCT_NAME = SSHPortalAppProxy;
 				SDKROOT = macosx;
@@ -637,12 +643,13 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 998XWVFVMR;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos;
 				PRODUCT_NAME = SSHPortal;
 				SDKROOT = macosx;
@@ -660,7 +667,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyTests;
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;

@@ -93,20 +93,35 @@ impl Shutdown {
     fn pending(&mut self, w: Waker) {
         *self = Shutdown::Pending(w);
     }
-    fn ready(&mut self) {
-        if let Shutdown::Pending(w) = self {
-            w.wake_by_ref();
-        }
+
+    fn ready(&mut self) -> Option<Waker> {
+        let waker = match self {
+            Shutdown::Pending(waker) => Some(waker.clone()),
+            Shutdown::None | Shutdown::Ready => None,
+        };
         *self = Shutdown::Ready;
+        waker
     }
 
-    // Just for comparison purpose
-    fn fake_clone(&self) -> Shutdown {
+    fn waker(&self) -> Option<Waker> {
         match self {
-            Shutdown::None => Shutdown::None,
-            Shutdown::Pending(_) => Shutdown::Pending(Waker::noop().clone()),
-            Shutdown::Ready => Shutdown::Ready,
+            Shutdown::Pending(waker) => Some(waker.clone()),
+            Shutdown::None | Shutdown::Ready => None,
         }
+    }
+}
+
+fn wake_shutdown(shutdown: &Arc<std::sync::Mutex<Shutdown>>) {
+    let waker = { shutdown.lock().unwrap().waker() };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+fn complete_shutdown(shutdown: &Arc<std::sync::Mutex<Shutdown>>) {
+    let waker = { shutdown.lock().unwrap().ready() };
+    if let Some(waker) = waker {
+        waker.wake();
     }
 }
 
@@ -295,7 +310,7 @@ impl AsyncRead for IpStackTcpStream {
 
         let state = self.tcb.lock().unwrap().get_state();
         if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
+            complete_shutdown(&self.shutdown);
             self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             return Poll::Ready(Ok(()));
         }
@@ -313,7 +328,7 @@ impl AsyncRead for IpStackTcpStream {
                 let state = tcb.get_state();
                 log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
             }
-            self.shutdown.lock().unwrap().ready();
+            complete_shutdown(&self.shutdown);
 
             return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
@@ -352,7 +367,8 @@ impl AsyncWrite for IpStackTcpStream {
         let is_full = tcb.is_send_buffer_full();
 
         if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
+            drop(tcb);
+            complete_shutdown(&self.shutdown);
             self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
@@ -380,7 +396,14 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
+        let shutdown = {
+            let mut shutdown = self.shutdown.lock().unwrap();
+            if matches!(*shutdown, Shutdown::Ready) {
+                return Poll::Ready(Ok(()));
+            }
+            shutdown.pending(cx.waker().clone());
+            shutdown.to_string()
+        };
         let (nt, state, seq, is_ready) = {
             let tcb = self.tcb.lock().unwrap();
             let is_ready = tcb.get_inflight_packets_total_len() == 0;
@@ -388,26 +411,14 @@ impl AsyncWrite for IpStackTcpStream {
         };
         log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
         if state == TcpState::Closed {
+            complete_shutdown(&self.shutdown);
             return Poll::Ready(Ok(()));
         }
-        match shutdown {
-            Shutdown::None => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
-                self.shutdown.lock().unwrap().pending(cx.waker().clone());
-                Poll::Pending
-            }
-            Shutdown::Pending(_) => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
-                Poll::Pending
-            }
-            Shutdown::Ready => Poll::Ready(Ok(())),
+        if is_ready && state == TcpState::Established {
+            let mut tcb = self.tcb.lock().unwrap();
+            send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
         }
+        Poll::Pending
     }
 }
 
@@ -468,6 +479,7 @@ impl IpStackTcpStream {
         self.exit_notifier = Some(exit_task_notifier);
 
         let task_handle = tokio::spawn(async move {
+            let task_shutdown = shutdown.clone();
             let v = tcp_main_logic_loop(
                 tcb,
                 config,
@@ -475,6 +487,7 @@ impl IpStackTcpStream {
                 up_packet_sender,
                 exit_notifier,
                 network_tuple,
+                task_shutdown,
                 write_notify,
                 read_notify,
                 data_tx,
@@ -486,8 +499,8 @@ impl IpStackTcpStream {
             }
             _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
             log::trace!("{network_tuple} task completed, destroy messenger sent successfully");
-            shutdown.lock().unwrap().ready();
-            log::trace!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
+            complete_shutdown(&shutdown);
+            log::trace!("{network_tuple} shutdown completed");
             v
         });
         self.task_handle = Some(task_handle);
@@ -503,6 +516,7 @@ async fn tcp_main_logic_loop(
     up_packet_sender: PacketSender,
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
+    shutdown: Arc<std::sync::Mutex<Shutdown>>,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -668,6 +682,7 @@ async fn tcp_main_logic_loop(
 
         tcb.update_duplicate_ack_count(incoming_ack);
 
+        let had_inflight_packets = tcb.get_inflight_packets_total_len() > 0;
         tcb.update_inflight_packet_queue(incoming_ack);
 
         for packet in tcb.collect_timed_out_inflight_packets() {
@@ -895,6 +910,13 @@ async fn tcp_main_logic_loop(
 
         tcb.update_last_received_ack(incoming_ack);
         tcb.update_send_window(incoming_win);
+        let shutdown_can_progress = had_inflight_packets
+            && tcb.get_inflight_packets_total_len() == 0
+            && tcb.get_state() == TcpState::Established;
+        drop(tcb);
+        if shutdown_can_progress {
+            wake_shutdown(&shutdown);
+        }
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
@@ -1036,4 +1058,174 @@ pub(crate) fn create_raw_packet(
         transport: TransportHeader::Tcp(tcp_header),
         payload: Some(payload),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::AsyncWriteExt;
+
+    const PEER_INITIAL_SEQUENCE: u32 = 1_000;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn peer_packet(
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        flags: u8,
+        sequence_number: u32,
+        acknowledgment_number: u32,
+    ) -> NetworkPacket {
+        create_raw_packet(
+            src_addr,
+            dst_addr,
+            |_, _| usize::MAX,
+            flags,
+            TTL,
+            sequence_number,
+            acknowledgment_number,
+            u16::MAX,
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn tcp_header(packet: &NetworkPacket) -> &TcpHeader {
+        match packet.transport_header() {
+            TransportHeader::Tcp(header) => header,
+            TransportHeader::Udp(_) | TransportHeader::Unknown => panic!("expected a TCP packet"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_sends_fin_after_outstanding_data_is_acknowledged() {
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 50_000);
+        let destination_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let mut syn = TcpHeader::new(
+            peer_addr.port(),
+            destination_addr.port(),
+            PEER_INITIAL_SEQUENCE,
+            u16::MAX,
+        );
+        syn.syn = true;
+
+        let (up_packet_sender, mut up_packet_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = TcpConfig::default();
+        config.two_msl = Duration::from_millis(1);
+        let mut stream = IpStackTcpStream::new(
+            peer_addr,
+            destination_addr,
+            syn,
+            up_packet_sender,
+            1_500,
+            None,
+            Arc::new(config),
+        )
+        .unwrap();
+
+        let syn_ack = tokio::time::timeout(TEST_TIMEOUT, up_packet_receiver.recv())
+            .await
+            .expect("timed out waiting for SYN-ACK")
+            .expect("TCP output channel closed before SYN-ACK");
+        let syn_ack_header = tcp_header(&syn_ack);
+        assert!(syn_ack_header.syn);
+        assert!(syn_ack_header.ack);
+        let peer_sequence = PEER_INITIAL_SEQUENCE + 1;
+        let stack_sequence = syn_ack_header.sequence_number + 1;
+
+        let stream_sender = stream.stream_sender();
+        stream_sender
+            .send(peer_packet(
+                peer_addr,
+                destination_addr,
+                ACK,
+                peer_sequence,
+                stack_sequence,
+            ))
+            .unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let established = stream.tcb.lock().unwrap().get_state() == TcpState::Established;
+                if established {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out completing the TCP handshake");
+
+        let payload = b"response bytes awaiting acknowledgment";
+        stream.write_all(payload).await.unwrap();
+        let data_packet = tokio::time::timeout(TEST_TIMEOUT, up_packet_receiver.recv())
+            .await
+            .expect("timed out waiting for data packet")
+            .expect("TCP output channel closed before data packet");
+        assert_eq!(data_packet.payload.as_deref(), Some(payload.as_slice()));
+        let data_sequence = tcp_header(&data_packet).sequence_number;
+
+        let shutdown_state = stream.shutdown.clone();
+        let shutdown_task = tokio::spawn(async move { stream.shutdown().await });
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let pending = matches!(*shutdown_state.lock().unwrap(), Shutdown::Pending(_));
+                if pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown was not polled while data remained unacknowledged");
+        assert!(!shutdown_task.is_finished());
+
+        let data_acknowledgment = data_sequence + payload.len() as u32;
+        stream_sender
+            .send(peer_packet(
+                peer_addr,
+                destination_addr,
+                ACK,
+                peer_sequence,
+                data_acknowledgment,
+            ))
+            .unwrap();
+
+        let fin_packet = tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let packet = up_packet_receiver
+                    .recv()
+                    .await
+                    .expect("TCP output channel closed before FIN");
+                if tcp_header(&packet).fin {
+                    break packet;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for FIN after acknowledging response data");
+        let fin_sequence = tcp_header(&fin_packet).sequence_number;
+
+        stream_sender
+            .send(peer_packet(
+                peer_addr,
+                destination_addr,
+                ACK | FIN,
+                peer_sequence,
+                fin_sequence + 1,
+            ))
+            .unwrap();
+        let closing_ack = tokio::time::timeout(TEST_TIMEOUT, up_packet_receiver.recv())
+            .await
+            .expect("timed out waiting for the closing ACK")
+            .expect("TCP output channel closed before the closing ACK");
+        assert!(tcp_header(&closing_ack).ack);
+        assert!(!tcp_header(&closing_ack).fin);
+
+        tokio::time::timeout(TEST_TIMEOUT, shutdown_task)
+            .await
+            .expect("shutdown did not complete")
+            .expect("shutdown task panicked")
+            .expect("shutdown returned an error");
+    }
 }

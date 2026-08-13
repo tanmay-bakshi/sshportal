@@ -4,4 +4,6 @@ dist/
 .idea/
 .vscode/
 __pycache__/
+xcuserdata/
+*.xcuserstate
 /misc

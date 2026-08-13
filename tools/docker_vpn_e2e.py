@@ -32,6 +32,7 @@ PROXY_NAME: str = "sshportal-vpn-e2e-proxy"
 ECHO_NAME: str = "sshportal-vpn-e2e-echo"
 JOIN_TOKEN: str = "vpn-e2e-token"
 TEST_DNS_SERVER: str = "203.0.113.53"
+CLOSE_DELIMITED_BODY_SIZE: int = 256 * 1024
 
 
 def run_checked(command: list[str]) -> None:
@@ -215,6 +216,11 @@ def start_echo_service(image_tag: str) -> str:
             "> /tmp/http-response && "
             "chmod 0755 /tmp/http-response && "
             "nc -l -k -p 8081 -e /tmp/http-response & "
+            "printf \"HTTP/1.1 200 OK\\r\\nConnection: close\\r\\n\\r\\n\" "
+            "> /tmp/close-delimited-response && "
+            f"head -c {CLOSE_DELIMITED_BODY_SIZE} /dev/zero | tr \"\\000\" x "
+            ">> /tmp/close-delimited-response; "
+            "nc -l -p 8082 < /tmp/close-delimited-response > /dev/null & "
             "exec nc -u -l -k -p 19090 -e cat",
         ]
     )
@@ -454,6 +460,16 @@ def run_vpn_session(
             ["wget", "-qO-", "-T", "10", f"http://{echo_ip}:8081/"],
             "vpn-tcp-ok",
             "TCP tunnel",
+        )
+        run_probe(
+            [
+                "/bin/sh",
+                "-lc",
+                f"wget -qO /tmp/close-delimited-body -T 10 http://{echo_ip}:8082/ && "
+                "wc -c < /tmp/close-delimited-body",
+            ],
+            str(CLOSE_DELIMITED_BODY_SIZE),
+            "close-delimited TCP response",
         )
         if not selective:
             run_probe(

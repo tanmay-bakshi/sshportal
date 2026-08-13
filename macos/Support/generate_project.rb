@@ -9,6 +9,7 @@ module SSHPortalMacProject
   CARGO_MANIFEST = File.expand_path('../Cargo.toml', ROOT)
   MARKETING_VERSION = File.read(CARGO_MANIFEST).match(/^version = "([^"]+)"$/)[1]
   PROJECT_VERSION = '1'
+  DEVELOPMENT_TEAM = '998XWVFVMR'
 
   APP_TARGET_NAME = 'SSHPortal'
   EXTENSION_TARGET_NAME = 'SSHPortal App Proxy'
@@ -22,6 +23,7 @@ module SSHPortalMacProject
 
     groups = create_groups(project)
     targets = create_targets(project)
+    configure_target_attributes(project, targets)
     configure_project(project)
     configure_app(targets[:app])
     configure_extension(targets[:extension])
@@ -37,12 +39,18 @@ module SSHPortalMacProject
   def self.create_groups(project)
     root = project.main_group
     {
-      app: root.new_group('App', 'App'),
-      extension: root.new_group('AppProxyExtension', 'AppProxyExtension'),
-      shared: root.new_group('Shared', 'Shared'),
-      support: root.new_group('Support', 'Support'),
-      tests: root.new_group('Tests', 'Tests'),
+      app: create_directory_group(root, 'App'),
+      extension: create_directory_group(root, 'AppProxyExtension'),
+      shared: create_directory_group(root, 'Shared'),
+      support: create_directory_group(root, 'Support'),
+      tests: create_directory_group(root, 'Tests'),
     }
+  end
+
+  def self.create_directory_group(parent, path)
+    group = parent.new_group(path, path)
+    group.name = nil
+    group
   end
 
   def self.create_targets(project)
@@ -68,13 +76,29 @@ module SSHPortalMacProject
       :swift,
       'SSHPortalAppProxyTests'
     )
+    tests.product_reference.name = 'SSHPortalAppProxyTests.xctest'
+    tests.product_reference.path = "#{TEST_TARGET_NAME}.xctest"
     { app: app, extension: extension, tests: tests }
+  end
+
+  def self.configure_target_attributes(project, targets)
+    attributes = targets.values.to_h do |target|
+      [target.uuid, { 'ProvisioningStyle' => 'Automatic' }]
+    end
+    attributes[targets[:app].uuid]['DevelopmentTeam'] = DEVELOPMENT_TEAM
+    attributes[targets[:extension].uuid]['DevelopmentTeam'] = DEVELOPMENT_TEAM
+    project.root_object.attributes['TargetAttributes'] = attributes
   end
 
   def self.configure_project(project)
     project.build_configurations.each do |configuration|
-      configuration.build_settings['SWIFT_VERSION'] = '5.0'
-      configuration.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '13.0'
+      settings = configuration.build_settings
+      settings['SWIFT_VERSION'] = '5.0'
+      settings['MACOSX_DEPLOYMENT_TARGET'] = '13.0'
+      next unless configuration.name == 'Release'
+
+      settings.delete('SWIFT_COMPILATION_MODE')
+      settings['SWIFT_OPTIMIZATION_LEVEL'] = '-Owholemodule'
     end
   end
 
@@ -106,6 +130,7 @@ module SSHPortalMacProject
         )
       else
         settings['CODE_SIGN_ENTITLEMENTS'] = 'Support/SSHPortal.entitlements'
+        settings['DEVELOPMENT_TEAM'] = DEVELOPMENT_TEAM
       end
     end
   end
@@ -130,6 +155,7 @@ module SSHPortalMacProject
         )
       else
         settings['CODE_SIGN_ENTITLEMENTS'] = 'Support/SSHPortalAppProxy.entitlements'
+        settings['DEVELOPMENT_TEAM'] = DEVELOPMENT_TEAM
       end
     end
   end
@@ -189,8 +215,9 @@ module SSHPortalMacProject
       SSHPortalAppProxy.entitlements
       SSHPortalDeveloperID.entitlements
       SSHPortalAppProxyDeveloperID.entitlements
-      generate_project.rb
     ).each { |name| groups[:support].new_file(name) }
+    generator = groups[:support].new_file('generate_project.rb')
+    generator.last_known_file_type = 'text.script.ruby'
   end
 
   def self.add_dependencies(project, targets)
