@@ -25,7 +25,7 @@ pub use macos::MacosPerAppVpn;
 pub use platform::{OperatingSystem, Platform, ShellLaunch};
 pub use proxy::{run_client_network_proxy, run_operator_socks_proxy};
 pub use shell::{run_client_session_proxy, run_remote_shell_server};
-pub use vpn::run_operator_vpn;
+pub use vpn::{SystemVpnPolicy, run_operator_vpn};
 pub use websocket::{
     AsyncStream, ClientWebSocketStream, WebSocketClientTransport, connect_async_with_env_proxy,
     normalize_websocket_url, websocket_to_io,
@@ -41,4 +41,4 @@ pub fn install_default_rustls_crypto_provider() {
 
 pub const DEFAULT_CONNECT_PATH: &str = "/connect";
 pub const DEFAULT_HEALTH_PATH: &str = "/healthz";
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;

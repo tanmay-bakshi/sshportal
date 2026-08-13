@@ -241,14 +241,27 @@ def start_echo_service(image_tag: str) -> str:
     raise RuntimeError("echo service did not receive an egress-network address")
 
 
-def start_server(image_tag: str) -> SpawnedProcess:
+def start_server(image_tag: str, include_cidr: str | None) -> SpawnedProcess:
     """Start the privileged operator-side VPN server container.
 
     :param image_tag: Existing sshportal runtime image.
+    :param include_cidr: Optional CIDR for a selective VPN session.
     :returns: Attached server process.
     """
 
     remove_container(SERVER_NAME)
+    server_command: list[str] = [
+        "/usr/local/bin/sshportal-server",
+        "--listen",
+        "0.0.0.0:8080",
+        "--operator-name",
+        "support-team",
+        "--join-token",
+        JOIN_TOKEN,
+        "--vpn",
+    ]
+    if include_cidr is not None:
+        server_command.extend(["--vpn-include-cidr", include_cidr])
     return spawn_pty_process(
         "VPN server",
         [
@@ -271,14 +284,7 @@ def start_server(image_tag: str) -> SpawnedProcess:
             "SSHPORTAL_DEBUG=1",
             "-it",
             image_tag,
-            "/usr/local/bin/sshportal-server",
-            "--listen",
-            "0.0.0.0:8080",
-            "--operator-name",
-            "support-team",
-            "--join-token",
-            JOIN_TOKEN,
-            "--vpn",
+            *server_command,
         ],
     )
 
@@ -390,15 +396,36 @@ def run_probe(command: list[str], expected: str, label: str) -> None:
         raise RuntimeError(f"{label} failed, expected {expected!r} in:\n{output}")
 
 
-def run_vpn_session(image_tag: str, certificate_directory: Path) -> None:
+def run_probe_excluding(command: list[str], unexpected: str, label: str) -> None:
+    """Run an operator-side probe and reject an unexpected output fragment.
+
+    :param command: Command to run inside the server container.
+    :param unexpected: Output fragment that must not appear.
+    :param label: Human-readable probe name.
+    """
+
+    output = command_output(["docker", "exec", SERVER_NAME, *command])
+    if unexpected in output:
+        raise RuntimeError(
+            f"{label} failed, did not expect {unexpected!r} in:\n{output}"
+        )
+
+
+def run_vpn_session(
+    image_tag: str,
+    certificate_directory: Path,
+    selective: bool,
+) -> None:
     """Run the complete WSS, TUN, TCP, UDP, DNS, and cleanup test.
 
     :param image_tag: Existing sshportal runtime image.
     :param certificate_directory: Directory containing TLS test material.
+    :param selective: Whether to exercise CIDR allowlist split tunnelling.
     """
 
     echo_ip = start_echo_service(image_tag)
-    server = start_server(image_tag)
+    include_cidr = f"{echo_ip}/32" if selective else None
+    server = start_server(image_tag, include_cidr)
     client: SpawnedProcess | None = None
     try:
         wait_for_text(server, "sshportal server listening on http://0.0.0.0:8080", 30.0)
@@ -417,16 +444,23 @@ def run_vpn_session(image_tag: str, certificate_directory: Path) -> None:
             f"dev {interface_name}",
             "TUN route",
         )
+        if selective:
+            run_probe_excluding(
+                ["ip", "route", "get", "1.1.1.1"],
+                f"dev {interface_name}",
+                "unmatched direct route",
+            )
         run_probe(
             ["wget", "-qO-", "-T", "10", f"http://{echo_ip}:8081/"],
             "vpn-tcp-ok",
             "TCP tunnel",
         )
-        run_probe(
-            ["wget", "-qO-", "-T", "10", "http://echo.test:8081/"],
-            "vpn-tcp-ok",
-            "virtual DNS and client-side resolution",
-        )
+        if not selective:
+            run_probe(
+                ["wget", "-qO-", "-T", "10", "http://echo.test:8081/"],
+                "vpn-tcp-ok",
+                "virtual DNS and client-side resolution",
+            )
         run_probe(
             [
                 "/bin/sh",
@@ -508,7 +542,8 @@ def main() -> int:
     try:
         prepare_networks()
         generate_tls_material(certificate_directory)
-        run_vpn_session(arguments.image_tag, certificate_directory)
+        run_vpn_session(arguments.image_tag, certificate_directory, selective=False)
+        run_vpn_session(arguments.image_tag, certificate_directory, selective=True)
     finally:
         for name in [CLIENT_NAME, SERVER_NAME, PROXY_NAME, ECHO_NAME]:
             remove_container(name)

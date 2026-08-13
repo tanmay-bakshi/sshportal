@@ -80,25 +80,7 @@ async fn main() -> Result<()> {
         bail!("{note}");
     }
 
-    let session_description = match &offer.session {
-        OfferedSession::Ssh { .. } => "open SSH support sessions into this environment".to_string(),
-        OfferedSession::Socks => {
-            "route TCP connections through this environment using a SOCKS5 proxy".to_string()
-        }
-        OfferedSession::Vpn {
-            scope: VpnScope::System,
-        } => {
-            "route the operator's system-wide internet-bound TCP, UDP, and DNS traffic through this environment"
-                .to_string()
-        }
-        OfferedSession::Vpn {
-            scope: VpnScope::Application { application },
-        } => {
-            format!(
-                "route traffic from the operator's {application} application through this environment"
-            )
-        }
-    };
+    let session_description = session_description(&offer.session);
     let session_allowed = if cli.approve_session {
         true
     } else {
@@ -176,6 +158,55 @@ async fn main() -> Result<()> {
             run_client_network_proxy(websocket).await
         }
     }
+}
+
+fn session_description(session: &OfferedSession) -> String {
+    match session {
+        OfferedSession::Ssh { .. } => "open SSH support sessions into this environment".to_string(),
+        OfferedSession::Socks => {
+            "route TCP connections through this environment using a SOCKS5 proxy".to_string()
+        }
+        OfferedSession::Vpn {
+            scope: VpnScope::System { policy },
+        } => describe_system_vpn(policy),
+        OfferedSession::Vpn {
+            scope: VpnScope::Application { application },
+        } => {
+            format!(
+                "route traffic from the operator's {application} application through this environment"
+            )
+        }
+    }
+}
+
+fn describe_system_vpn(policy: &sshportal::SystemVpnPolicy) -> String {
+    if policy.is_full_tunnel() {
+        return "route the operator's system-wide internet-bound TCP, UDP, and DNS traffic through this environment"
+            .to_string();
+    }
+
+    let mut selectors = Vec::new();
+    if !policy.include_cidrs().is_empty() {
+        selectors.push(format!(
+            "IP ranges [{}]",
+            policy
+                .include_cidrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !policy.include_domains().is_empty() {
+        selectors.push(format!(
+            "domain suffixes [{}], including their apexes and all subdomains",
+            policy.include_domains().join(", ")
+        ));
+    }
+    format!(
+        "route only the operator's TCP and UDP traffic for {} through this environment",
+        selectors.join(" and ")
+    )
 }
 
 fn session_transport_refusal(session: &OfferedSession, server_url: &url::Url) -> Option<String> {
@@ -292,10 +323,10 @@ fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use sshportal::OfferedSession;
+    use sshportal::{OfferedSession, SystemVpnPolicy, VpnScope};
     use url::Url;
 
-    use super::session_transport_refusal;
+    use super::{session_description, session_transport_refusal};
 
     #[test]
     fn vpn_mode_rejects_plain_websocket_transport() {
@@ -303,7 +334,9 @@ mod tests {
 
         let refusal = session_transport_refusal(
             &OfferedSession::Vpn {
-                scope: sshportal::VpnScope::System,
+                scope: VpnScope::System {
+                    policy: SystemVpnPolicy::default(),
+                },
             },
             &url,
         )
@@ -319,7 +352,9 @@ mod tests {
         assert!(
             session_transport_refusal(
                 &OfferedSession::Vpn {
-                    scope: sshportal::VpnScope::System,
+                    scope: VpnScope::System {
+                        policy: SystemVpnPolicy::default(),
+                    },
                 },
                 &url,
             )
@@ -332,5 +367,44 @@ mod tests {
         let url = Url::parse("ws://support.example/connect").unwrap();
 
         assert!(session_transport_refusal(&OfferedSession::Socks, &url).is_none());
+    }
+
+    #[test]
+    fn full_vpn_consent_describes_system_wide_access() {
+        let description = session_description(&OfferedSession::Vpn {
+            scope: VpnScope::System {
+                policy: SystemVpnPolicy::default(),
+            },
+        });
+
+        assert!(description.contains("system-wide"));
+        assert!(description.contains("TCP, UDP, and DNS"));
+    }
+
+    #[test]
+    fn selective_vpn_consent_names_every_normalized_selector() {
+        let policy = SystemVpnPolicy::new(
+            vec![
+                "10.20.4.7/16".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap(),
+            ],
+            vec!["ANTHEM.COM".to_string(), "elevancehealth.com".to_string()],
+        )
+        .unwrap();
+
+        let description = session_description(&OfferedSession::Vpn {
+            scope: VpnScope::System { policy },
+        });
+
+        for selector in [
+            "10.20.0.0/16",
+            "2001:db8::/32",
+            "anthem.com",
+            "elevancehealth.com",
+        ] {
+            assert!(description.contains(selector));
+        }
+        assert!(description.contains("only the operator's"));
+        assert!(description.contains("all subdomains"));
     }
 }

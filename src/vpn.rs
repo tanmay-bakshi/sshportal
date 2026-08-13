@@ -1,4 +1,7 @@
+mod policy;
 mod routes;
+
+pub use policy::SystemVpnPolicy;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -8,7 +11,7 @@ use std::net::Ipv6Addr;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -23,6 +26,8 @@ const VPN_MTU: u16 = 1500;
 const VPN_INTERFACE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 254, 0, 2);
 const VPN_GATEWAY_IPV4: Ipv4Addr = Ipv4Addr::new(10, 254, 0, 1);
 const VPN_NETMASK_IPV4: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+pub(super) const VIRTUAL_DNS_POOL: &str = "198.18.0.0/15";
+pub(super) const VIRTUAL_DNS_SERVER: &str = "198.18.0.1";
 #[cfg(target_os = "windows")]
 const VPN_INTERFACE_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd73, 0x6870, 0x6f72, 0x7461, 0x6c00, 0, 0, 2);
 const TUN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,10 +108,12 @@ impl ShutdownSignals {
 pub async fn run_operator_vpn<S>(
     websocket: WebSocketStream<S>,
     transport_peers: Vec<IpAddr>,
+    policy: SystemVpnPolicy,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    validate_transport_peers(&policy, &transport_peers)?;
     let mut shutdown_signals = ShutdownSignals::new()?;
     let socks_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -117,19 +124,24 @@ where
     let tun = create_tun_device().context(
         "failed to create the VPN interface; run sshportal-server with administrator/root privileges",
     )?;
-    let mut route_guard = routes::configure(&tun.name, tun.index, &transport_peers).with_context(|| {
-        format!(
-            "failed to configure VPN routes on interface {}; administrator/root privileges are required",
-            tun.name
-        )
-    })?;
+    let mut route_guard = routes::configure(&tun.name, tun.index, &transport_peers, &policy)
+        .with_context(|| {
+            format!(
+                "failed to configure VPN routes on interface {}; administrator/root privileges are required",
+                tun.name
+            )
+        })?;
 
-    println!("VPN active on interface {}", tun.name);
+    if policy.is_full_tunnel() {
+        println!("full-tunnel VPN active on interface {}", tun.name);
+    } else {
+        println!("selective VPN active on interface {}", tun.name);
+    }
     println!("press Ctrl-C to disconnect and restore the original routes");
 
     let cancellation = CancellationToken::new();
     let tun_cancellation = cancellation.clone();
-    let tun_args = tun2proxy_args(socks_addr);
+    let tun_args = tun2proxy_args(socks_addr, &policy);
     let mut proxy_task = tokio::spawn(run_operator_network_proxy_with_listener(
         websocket,
         socks_listener,
@@ -230,20 +242,45 @@ fn wintun_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn tun2proxy_args(socks_addr: SocketAddr) -> Args {
+fn tun2proxy_args(socks_addr: SocketAddr, policy: &SystemVpnPolicy) -> Args {
     Args {
         proxy: ArgProxy {
             proxy_type: ProxyType::Socks5,
             addr: socks_addr,
             credentials: None,
         },
-        dns: ArgDns::Virtual,
+        dns: if policy.uses_virtual_dns() {
+            ArgDns::Virtual
+        } else {
+            ArgDns::Direct
+        },
+        virtual_dns_pool: VIRTUAL_DNS_POOL
+            .parse()
+            .expect("the built-in virtual DNS pool must be valid"),
         ipv6_enabled: true,
         setup: false,
         mtu: VPN_MTU,
         tcp_mss: Some(VPN_MTU - 40),
         ..Args::default()
     }
+}
+
+fn validate_transport_peers(policy: &SystemVpnPolicy, transport_peers: &[IpAddr]) -> Result<()> {
+    for peer in transport_peers {
+        let peer = match peer {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(*address)),
+            address => *address,
+        };
+        if policy.contains_exact_ip(peer) {
+            bail!(
+                "VPN include CIDR selects the WebSocket transport peer {peer} exactly; use a broader CIDR or remove that host selector so SSHPortal can keep its control connection on the physical network"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn finish_tun_task(mut task: JoinHandle<Result<usize>>) {
@@ -257,5 +294,55 @@ async fn finish_tun_task(mut task: JoinHandle<Result<usize>>) {
     {
         task.abort();
         let _ = task.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use tun2proxy::ArgDns;
+
+    use super::{SystemVpnPolicy, tun2proxy_args, validate_transport_peers};
+
+    #[test]
+    fn cidr_only_policy_leaves_dns_in_direct_mode() {
+        let policy =
+            SystemVpnPolicy::new(vec!["10.20.0.0/16".parse().unwrap()], Vec::new()).unwrap();
+
+        let args = tun2proxy_args(SocketAddr::from((Ipv4Addr::LOCALHOST, 1080)), &policy);
+
+        assert_eq!(args.dns, ArgDns::Direct);
+    }
+
+    #[test]
+    fn full_and_domain_policies_use_virtual_dns() {
+        let domain_policy =
+            SystemVpnPolicy::new(Vec::new(), vec!["anthem.com".to_string()]).unwrap();
+
+        for policy in [SystemVpnPolicy::default(), domain_policy] {
+            let args = tun2proxy_args(SocketAddr::from((Ipv4Addr::LOCALHOST, 1080)), &policy);
+            assert_eq!(args.dns, ArgDns::Virtual);
+            assert_eq!(args.virtual_dns_pool.to_string(), "198.18.0.0/15");
+        }
+    }
+
+    #[test]
+    fn exact_transport_peer_selector_is_rejected() {
+        let policy =
+            SystemVpnPolicy::new(vec!["203.0.113.8/32".parse().unwrap()], Vec::new()).unwrap();
+
+        let result = validate_transport_peers(&policy, &["203.0.113.8".parse().unwrap()]);
+
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("WebSocket transport peer"));
+    }
+
+    #[test]
+    fn broader_transport_peer_selector_is_safe() {
+        let policy =
+            SystemVpnPolicy::new(vec!["203.0.113.0/24".parse().unwrap()], Vec::new()).unwrap();
+
+        validate_transport_peers(&policy, &["203.0.113.8".parse().unwrap()]).unwrap();
     }
 }

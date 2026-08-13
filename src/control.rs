@@ -6,6 +6,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use crate::PROTOCOL_VERSION;
 use crate::platform::Platform;
+use crate::vpn::SystemVpnPolicy;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientMetadata {
@@ -44,7 +45,7 @@ pub enum OfferedSession {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VpnScope {
-    System,
+    System { policy: SystemVpnPolicy },
     Application { application: String },
 }
 
@@ -120,14 +121,17 @@ pub fn validate_protocol_version(version: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ControlPacket, OfferedSession, ServerOffer, VpnScope};
+    use crate::vpn::SystemVpnPolicy;
 
     #[test]
     fn system_vpn_offer_identifies_its_scope() {
         let packet = ControlPacket::ServerOffer(ServerOffer {
-            protocol_version: 5,
+            protocol_version: 6,
             operator_name: "support".to_string(),
             session: OfferedSession::Vpn {
-                scope: VpnScope::System,
+                scope: VpnScope::System {
+                    policy: SystemVpnPolicy::default(),
+                },
             },
         });
 
@@ -136,12 +140,20 @@ mod tests {
         assert_eq!(encoded["type"], "server_offer");
         assert_eq!(encoded["session"]["mode"], "vpn");
         assert_eq!(encoded["session"]["scope"]["kind"], "system");
+        assert_eq!(
+            encoded["session"]["scope"]["policy"]["include_cidrs"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            encoded["session"]["scope"]["policy"]["include_domains"],
+            serde_json::json!([])
+        );
     }
 
     #[test]
     fn application_vpn_offer_names_the_scoped_application() {
         let packet = ControlPacket::ServerOffer(ServerOffer {
-            protocol_version: 5,
+            protocol_version: 6,
             operator_name: "support".to_string(),
             session: OfferedSession::Vpn {
                 scope: VpnScope::Application {

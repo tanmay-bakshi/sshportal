@@ -113,6 +113,33 @@ sudo sshportal-server \
   --vpn
 ```
 
+With no selectors, `--vpn` is a full tunnel. Supplying any include selector changes it to an
+allowlist split tunnel. Repeat either option as needed; CIDR and domain selectors have union
+semantics:
+
+```bash
+sudo sshportal-server \
+  --listen 127.0.0.1:8080 \
+  --operator-name support-team \
+  --vpn \
+  --vpn-include-cidr 10.20.0.0/16 \
+  --vpn-include-cidr 2001:db8:1200::/48 \
+  --vpn-include-domain elevancehealth.com \
+  --vpn-include-domain anthem.com
+```
+
+A domain selector includes its apex and every subdomain, so `anthem.com` also selects
+`login.anthem.com`; wildcard syntax is not accepted. Domain names are normalized to lowercase
+ASCII/IDNA form, and CIDRs are normalized to their network address. Everything that matches none
+of the selectors continues over the operator machine's normal network path.
+
+Domain routing uses the operating system's split-DNS facility rather than resolving a hostname
+once and pinning its current addresses. Queries for selected suffixes go to SSHPortal's virtual
+resolver at `198.18.0.1`; its synthetic addresses from `198.18.0.0/15` enter the TUN, where
+`tun2proxy` restores the original hostname. The existing SOCKS/WebSocket path then resolves and
+connects from the client environment. Unselected DNS queries continue to use the operator's normal
+resolvers. A CIDR-only policy does not change DNS configuration.
+
 VPN mode requires an HTTPS/WSS URL. `sshportal-server` deliberately remains a small HTTP/WS server, so terminate TLS with a reverse proxy and forward the WebSocket to its local listener:
 
 ```text
@@ -159,17 +186,46 @@ The companion owns no remote transport. It forwards native Network Extension flo
 
 ### Routing behavior
 
-VPN mode installs IPv4 and IPv6 split-default routes through the TUN and pins the established WebSocket peer to its original physical path. Existing directly attached networks and loopback remain local. Existing system DNS servers receive explicit TUN routes, and virtual DNS keeps hostname resolution on the client side instead of leaking names through the operator's upstream resolver.
+Full-tunnel system VPN mode installs IPv4 and IPv6 split-default routes through the TUN and routes
+the existing system DNS servers into virtual DNS. Selective mode installs only the requested CIDR
+routes plus the virtual DNS pool when domain selectors are present. Both modes pin the established
+WebSocket peer to its original physical path; broader selected CIDRs are safe because that host
+route is more specific, but an exact `/32` or `/128` selector for the transport peer is rejected.
+Existing directly attached networks and loopback remain local unless a more-specific selected route
+deliberately covers them.
 
 This is intentionally a TCP/UDP application tunnel rather than a general IP router. ICMP, multicast, and other IP protocols are not carried. Applications that need ping or raw sockets will not behave like they do on WireGuard or IPsec.
 
-Routes are registered transactionally and restored in reverse order after Ctrl-C (or Ctrl-Break on Windows), transport loss, setup failure, or normal exit. Unix also handles SIGTERM and SIGHUP. Avoid forcibly terminating the process while it owns the TUN. The route entries are non-persistent, but a reboot may be required if the operating system or a third-party network manager retains stale state after an unclean termination.
+Routes and split-DNS state are registered transactionally and restored after Ctrl-C (or Ctrl-Break
+on Windows), transport loss, setup failure, or normal exit. DNS policy is removed before TUN routes.
+Unix also handles SIGTERM and SIGHUP. Avoid forcibly terminating the process while it owns the TUN.
+Route and DNS entries are non-persistent or session-scoped where the platform permits, but a reboot
+may be required if the operating system or a third-party network manager retains stale state after
+an unclean termination.
+
+Hostname selection necessarily has a few edges:
+
+- Application-controlled DNS-over-HTTPS or DNS-over-TLS bypasses operating-system suffix routing.
+  Disable the application's private DNS mode or use CIDR selectors for the resulting destinations;
+  routing only the encrypted resolver does not recover the queried hostname.
+- Literal IP connections and real addresses already cached by an application carry no hostname to
+  match. Restart the application or clear its DNS cache after changing a policy.
+- A selected site can depend on identity, API, or CDN names under unrelated domains. Those suffixes
+  need their own selectors.
+- `198.18.0.0/15` is reserved for SSHPortal's virtual names while domain selection is active, so it
+  cannot simultaneously represent real destinations from that benchmark-testing range.
 
 ### Platform requirements
 
-- Linux needs `/dev/net/tun`, root or `CAP_NET_ADMIN`, and the `ip` command from `iproute2`.
-- macOS needs root privileges to configure the `utun` routes.
-- Windows needs an elevated terminal and the signed `wintun.dll` beside `sshportal-server.exe`. Official Windows release archives include the DLL and its redistribution license. The binary verifies the DLL's Authenticode signature before loading it.
+- Linux needs `/dev/net/tun`, root or `CAP_NET_ADMIN`, and the `ip` command from `iproute2`. Domain
+  selectors additionally require systemd-resolved and `resolvectl`; SSHPortal fails closed instead
+  of silently sending selected DNS to the normal resolver when they are unavailable.
+- macOS needs root privileges to configure the `utun` routes. Domain selectors use a
+  process-session-scoped supplemental resolver in the SystemConfiguration dynamic store.
+- Windows needs an elevated terminal and the signed `wintun.dll` beside `sshportal-server.exe`.
+  Domain selectors use session-unique local NRPT rules. Official Windows release archives include
+  the DLL and its redistribution license. The binary verifies the DLL's Authenticode signature
+  before loading it.
 
 Only the operator-side server needs these privileges and platform components. A Windows machine running only `sshportal-client.exe` does not need elevation or `wintun.dll`.
 

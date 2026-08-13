@@ -19,6 +19,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_tungstenite::{is_upgrade_request, upgrade};
 use hyper_util::rt::TokioIo;
+use ipnet::IpNet;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tokio_tungstenite::WebSocketStream;
@@ -28,7 +29,7 @@ use url::form_urlencoded;
 use sshportal::MacosPerAppVpn;
 use sshportal::{
     ClientDecision, ClientHello, ControlPacket, DEFAULT_CONNECT_PATH, DEFAULT_HEALTH_PATH,
-    OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, VpnScope,
+    OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, SystemVpnPolicy, VpnScope,
     load_operator_key, recv_packet, run_client_session_proxy, run_operator_socks_proxy,
     run_operator_vpn, send_packet, validate_protocol_version, websocket_to_io,
 };
@@ -38,7 +39,7 @@ use sshportal::{
     name = "sshportal-server",
     about = "Accept one consent-gated support client and expose SSH, SOCKS, or VPN access.",
     long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and starts exactly one client-approved SSH, SOCKS, or VPN session.",
-    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080\n  sudo sshportal-server --vpn\n  sshportal-server --vpn-app /Applications/Firefox.app"
+    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080\n  sudo sshportal-server --vpn\n  sudo sshportal-server --vpn --vpn-include-cidr 10.20.0.0/16 --vpn-include-domain anthem.com\n  sshportal-server --vpn-app /Applications/Firefox.app"
 )]
 struct ServerCli {
     /// HTTP address for the one-time rendezvous endpoint.
@@ -83,9 +84,10 @@ struct ServerCli {
         conflicts_with_all = ["operator_key", "persist_operator_key", "vpn", "vpn_app"]
     )]
     socks_only: Option<SocketAddr>,
-    /// Route this machine's internet-bound IPv4, IPv6, TCP, UDP, and DNS traffic through the client.
+    /// Open a system VPN through the client.
     ///
-    /// This mode requires administrator/root privileges and an encrypted WSS endpoint.
+    /// With no include selectors, all internet-bound IPv4, IPv6, TCP, UDP, and DNS traffic is
+    /// routed through the client. This mode requires administrator/root privileges and WSS.
     #[arg(
         long,
         conflicts_with_all = [
@@ -98,6 +100,18 @@ struct ServerCli {
         ]
     )]
     vpn: bool,
+    /// Route only this IP network through a system VPN session.
+    ///
+    /// Repeat the option to include multiple IPv4 or IPv6 networks. Supplying any VPN include
+    /// option changes --vpn from full-tunnel to allowlist split-tunnel mode.
+    #[arg(long, value_name = "CIDR", requires = "vpn")]
+    vpn_include_cidr: Vec<IpNet>,
+    /// Route this domain suffix through a system VPN session.
+    ///
+    /// The value includes both its apex and every subdomain. Repeat the option for multiple
+    /// suffixes; wildcard syntax is neither needed nor accepted.
+    #[arg(long, value_name = "DOMAIN", requires = "vpn")]
+    vpn_include_domain: Vec<String>,
     /// On macOS, route only new connections from this signed application through the client.
     ///
     /// The server remains unprivileged. macOS may require administrator approval when the native
@@ -189,7 +203,9 @@ enum ServerSessionMode {
     Socks {
         listen_addr: SocketAddr,
     },
-    VpnSystem,
+    VpnSystem {
+        policy: SystemVpnPolicy,
+    },
     #[cfg(target_os = "macos")]
     VpnApplication {
         configuration: MacosPerAppVpn,
@@ -204,8 +220,10 @@ impl ServerSessionMode {
                 persist_key_requested: operator_key.persistent(),
             },
             Self::Socks { .. } => OfferedSession::Socks,
-            Self::VpnSystem => OfferedSession::Vpn {
-                scope: VpnScope::System,
+            Self::VpnSystem { policy } => OfferedSession::Vpn {
+                scope: VpnScope::System {
+                    policy: policy.clone(),
+                },
             },
             #[cfg(target_os = "macos")]
             Self::VpnApplication { configuration } => OfferedSession::Vpn {
@@ -274,8 +292,29 @@ async fn main() -> Result<()> {
             println!("SOCKS-only proxy requested on {listen_addr} (SSH disabled)");
             println!("SOCKS-only traffic relies on WSS for transport encryption");
         }
-        ServerSessionMode::VpnSystem => {
-            println!("VPN mode requested (SSH disabled)");
+        ServerSessionMode::VpnSystem { policy } => {
+            if policy.is_full_tunnel() {
+                println!("full-tunnel system VPN requested (SSH disabled)");
+            } else {
+                println!("selective system VPN requested (SSH disabled)");
+                if !policy.include_cidrs().is_empty() {
+                    println!(
+                        "included IP networks: {}",
+                        policy
+                            .include_cidrs()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if !policy.include_domains().is_empty() {
+                    println!(
+                        "included domain suffixes: {}",
+                        policy.include_domains().join(", ")
+                    );
+                }
+            }
             println!("VPN mode requires administrator/root privileges and WSS");
         }
         #[cfg(target_os = "macos")]
@@ -323,10 +362,11 @@ async fn main() -> Result<()> {
         ServerSessionMode::Socks { listen_addr } => {
             run_operator_socks_proxy(established_session.websocket, *listen_addr).await
         }
-        ServerSessionMode::VpnSystem => {
+        ServerSessionMode::VpnSystem { policy } => {
             run_operator_vpn(
                 established_session.websocket,
                 established_session.transport_peers,
+                policy.clone(),
             )
             .await
         }
@@ -564,7 +604,9 @@ fn plain_response(status: StatusCode, body: impl Into<String>) -> Response<Full<
 
 fn resolve_session_mode(cli: &ServerCli) -> Result<ServerSessionMode> {
     if cli.vpn {
-        return Ok(ServerSessionMode::VpnSystem);
+        let policy =
+            SystemVpnPolicy::new(cli.vpn_include_cidr.clone(), cli.vpn_include_domain.clone())?;
+        return Ok(ServerSessionMode::VpnSystem { policy });
     }
     if let Some(application_bundle) = &cli.vpn_app {
         #[cfg(target_os = "macos")]
@@ -718,7 +760,65 @@ mod tests {
 
         let mode = resolve_session_mode(&cli).unwrap();
 
-        assert!(matches!(mode, ServerSessionMode::VpnSystem));
+        assert!(matches!(
+            mode,
+            ServerSessionMode::VpnSystem { policy } if policy.is_full_tunnel()
+        ));
+    }
+
+    #[test]
+    fn vpn_selectors_require_system_vpn_mode() {
+        for arguments in [
+            vec!["sshportal-server", "--vpn-include-cidr", "10.20.0.0/16"],
+            vec!["sshportal-server", "--vpn-include-domain", "anthem.com"],
+        ] {
+            assert!(ServerCli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn repeated_vpn_selectors_form_one_normalized_policy() {
+        let cli = ServerCli::try_parse_from([
+            "sshportal-server",
+            "--vpn",
+            "--vpn-include-cidr",
+            "10.20.4.7/16",
+            "--vpn-include-cidr",
+            "2001:db8::/32",
+            "--vpn-include-domain",
+            "Login.ANTHEM.com",
+            "--vpn-include-domain",
+            "anthem.com",
+        ])
+        .unwrap();
+
+        let mode = resolve_session_mode(&cli).unwrap();
+        let ServerSessionMode::VpnSystem { policy } = mode else {
+            panic!("expected a system VPN session");
+        };
+
+        assert_eq!(
+            policy
+                .include_cidrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["10.20.0.0/16", "2001:db8::/32"]
+        );
+        assert_eq!(policy.include_domains(), ["anthem.com"]);
+    }
+
+    #[test]
+    fn malformed_vpn_domain_is_rejected_when_resolving_the_session() {
+        let cli = ServerCli::try_parse_from([
+            "sshportal-server",
+            "--vpn",
+            "--vpn-include-domain",
+            "*.anthem.com",
+        ])
+        .unwrap();
+
+        assert!(resolve_session_mode(&cli).is_err());
     }
 
     #[test]

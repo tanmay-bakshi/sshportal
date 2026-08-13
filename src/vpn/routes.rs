@@ -3,7 +3,21 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(target_os = "macos")]
+use core_foundation::{
+    array::CFArray,
+    base::{CFType, TCFType},
+    dictionary::CFDictionary,
+    number::CFNumber,
+    string::CFString,
+};
+#[cfg(target_os = "macos")]
+use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
+
 use crate::debug::debug_log;
+
+use super::policy::SystemVpnPolicy;
+use super::{VIRTUAL_DNS_POOL, VIRTUAL_DNS_SERVER};
 
 const SPLIT_DEFAULT_ROUTES: [&str; 4] = ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"];
 
@@ -12,6 +26,71 @@ use super::{VPN_GATEWAY_IPV4, VPN_INTERFACE_IPV6};
 
 #[cfg(target_os = "windows")]
 const ROUTE_METRIC: u32 = 4;
+
+#[derive(Debug, Eq, PartialEq)]
+struct RoutePlan {
+    tunnel_prefixes: Vec<String>,
+    route_system_dns: bool,
+    split_dns_domains: Vec<String>,
+}
+
+impl RoutePlan {
+    fn for_policy(policy: &SystemVpnPolicy) -> Self {
+        if policy.is_full_tunnel() {
+            return Self {
+                tunnel_prefixes: SPLIT_DEFAULT_ROUTES
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                route_system_dns: true,
+                split_dns_domains: Vec::new(),
+            };
+        }
+
+        let mut tunnel_prefixes = Vec::new();
+        for network in policy.include_cidrs() {
+            if network.prefix_len() == 0 {
+                let defaults = if network.addr().is_ipv4() {
+                    &SPLIT_DEFAULT_ROUTES[..2]
+                } else {
+                    &SPLIT_DEFAULT_ROUTES[2..]
+                };
+                append_unique_prefixes(&mut tunnel_prefixes, defaults.iter().copied());
+                continue;
+            }
+            append_unique_prefixes(&mut tunnel_prefixes, [network.to_string()]);
+        }
+        if !policy.include_domains().is_empty() {
+            append_unique_prefixes(&mut tunnel_prefixes, [VIRTUAL_DNS_POOL]);
+        }
+
+        Self {
+            tunnel_prefixes,
+            route_system_dns: false,
+            split_dns_domains: policy.include_domains().to_vec(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn requires_ipv6(&self) -> bool {
+        self.tunnel_prefixes
+            .iter()
+            .any(|prefix| prefix.contains(':'))
+    }
+}
+
+fn append_unique_prefixes<I, S>(prefixes: &mut Vec<String>, additions: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    for addition in additions {
+        let addition = addition.into();
+        if !prefixes.contains(&addition) {
+            prefixes.push(addition);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CommandSpec {
@@ -61,9 +140,83 @@ impl CommandExecutor for SystemCommandExecutor {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn unique_network_session_name() -> String {
+    let mut random = [0_u8; 8];
+    rand::fill(&mut random);
+    format!(
+        "SSHPortal-{}-{:016x}",
+        std::process::id(),
+        u64::from_be_bytes(random)
+    )
+}
+
+#[cfg(target_os = "macos")]
+struct MacosDnsPolicy {
+    store: SCDynamicStore,
+    key: String,
+    active: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosDnsPolicy {
+    fn install(domains: &[String]) -> Result<Self> {
+        let session_name = unique_network_session_name();
+        let store = SCDynamicStoreBuilder::new(session_name.as_str())
+            .session_keys(true)
+            .build()
+            .context("failed to open the macOS SystemConfiguration dynamic store")?;
+        let key = format!("State:/Network/Service/{session_name}/DNS");
+        let dictionary = macos_dns_dictionary(domains);
+        if !store.set(key.as_str(), dictionary.to_untyped()) {
+            bail!("macOS rejected the supplemental DNS configuration for selected VPN domains");
+        }
+        Ok(Self {
+            store,
+            key,
+            active: true,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        if !self.store.remove(self.key.as_str()) {
+            bail!("macOS failed to remove supplemental DNS configuration");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dns_dictionary(domains: &[String]) -> CFDictionary<CFString, CFType> {
+    let server_addresses =
+        CFArray::from_CFTypes(&[CFString::new(VIRTUAL_DNS_SERVER)]).into_CFType();
+    let match_domains = domains
+        .iter()
+        .map(|domain| CFString::new(domain))
+        .collect::<Vec<_>>();
+    let supplemental_match_domains = CFArray::from_CFTypes(&match_domains).into_CFType();
+    CFDictionary::from_CFType_pairs(&[
+        (CFString::new("ServerAddresses"), server_addresses),
+        (
+            CFString::new("SupplementalMatchDomains"),
+            supplemental_match_domains,
+        ),
+        (
+            CFString::new("SupplementalMatchDomainsNoSearch"),
+            CFNumber::from(1).into_CFType(),
+        ),
+    ])
+}
+
 pub(super) struct RouteGuard<E: CommandExecutor = SystemCommandExecutor> {
     executor: E,
     rollback: Vec<CommandSpec>,
+    #[cfg(target_os = "macos")]
+    dns_policy: Option<MacosDnsPolicy>,
     active: bool,
 }
 
@@ -72,6 +225,8 @@ impl<E: CommandExecutor> RouteGuard<E> {
         Self {
             executor,
             rollback: Vec::new(),
+            #[cfg(target_os = "macos")]
+            dns_policy: None,
             active: true,
         }
     }
@@ -86,12 +241,37 @@ impl<E: CommandExecutor> RouteGuard<E> {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    fn apply_group(
+        &mut self,
+        setups: impl IntoIterator<Item = CommandSpec>,
+        rollback: CommandSpec,
+    ) -> Result<()> {
+        let mut setups = setups.into_iter();
+        let Some(first) = setups.next() else {
+            return Ok(());
+        };
+        self.executor.run(&first)?;
+        self.rollback.push(rollback);
+        for setup in setups {
+            self.executor.run(&setup)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn restore(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
         self.active = false;
         let mut first_error = None;
+        #[cfg(target_os = "macos")]
+        if let Some(mut dns_policy) = self.dns_policy.take()
+            && let Err(error) = dns_policy.restore()
+        {
+            debug_log(format!("VPN split DNS cleanup failed: {error:#}"));
+            first_error = Some(error);
+        }
         while let Some(command) = self.rollback.pop() {
             if let Err(error) = self.executor.run(&command) {
                 debug_log(format!(
@@ -104,7 +284,7 @@ impl<E: CommandExecutor> RouteGuard<E> {
             }
         }
         match first_error {
-            Some(error) => Err(error).context("failed to restore one or more VPN routes"),
+            Some(error) => Err(error).context("failed to restore one or more VPN network settings"),
             None => Ok(()),
         }
     }
@@ -122,9 +302,11 @@ pub(super) fn configure(
     tun_name: &str,
     tun_index: i32,
     transport_peers: &[IpAddr],
+    policy: &SystemVpnPolicy,
 ) -> Result<RouteGuard> {
     let executor = SystemCommandExecutor;
-    configure_with_executor(tun_name, tun_index, transport_peers, executor)
+    let plan = RoutePlan::for_policy(policy);
+    configure_with_executor(tun_name, tun_index, transport_peers, &plan, executor)
 }
 
 fn normalize_ip(address: IpAddr) -> IpAddr {
@@ -150,6 +332,7 @@ fn configure_with_executor<E: CommandExecutor>(
     tun_name: &str,
     _tun_index: i32,
     transport_peers: &[IpAddr],
+    plan: &RoutePlan,
     executor: E,
 ) -> Result<RouteGuard<E>> {
     let transport_peers =
@@ -191,18 +374,43 @@ fn configure_with_executor<E: CommandExecutor>(
         )?;
     }
 
-    for dns_server in linux_dns_servers(&guard) {
-        if transport_peers.contains(&dns_server) || dns_server.is_loopback() {
-            continue;
+    if plan.route_system_dns {
+        for dns_server in linux_dns_servers(&guard) {
+            if transport_peers.contains(&dns_server) || dns_server.is_loopback() {
+                continue;
+            }
+            apply_linux_tun_route(&mut guard, tun_name, &host_prefix(dns_server))?;
         }
-        apply_linux_tun_route(&mut guard, tun_name, &host_prefix(dns_server))?;
     }
-    // Split defaults preserve the operating system's original defaults for rollback. Directly
-    // attached networks remain local, while explicit DNS host routes prevent resolver leaks.
-    for prefix in SPLIT_DEFAULT_ROUTES {
+    for prefix in &plan.tunnel_prefixes {
         apply_linux_tun_route(&mut guard, tun_name, prefix)?;
     }
+    if !plan.split_dns_domains.is_empty() {
+        configure_linux_split_dns(&mut guard, tun_name, &plan.split_dns_domains)?;
+    }
     Ok(guard)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_split_dns<E: CommandExecutor>(
+    guard: &mut RouteGuard<E>,
+    tun_name: &str,
+    domains: &[String],
+) -> Result<()> {
+    let mut domain_arguments = vec!["domain".to_string(), tun_name.to_string()];
+    domain_arguments.extend(domains.iter().map(|domain| format!("~{domain}")));
+    guard
+        .apply_group(
+            [
+                CommandSpec::new("resolvectl", ["dns", tun_name, VIRTUAL_DNS_SERVER]),
+                CommandSpec::new("resolvectl", domain_arguments),
+                CommandSpec::new("resolvectl", ["default-route", tun_name, "false"]),
+            ],
+            CommandSpec::new("resolvectl", ["revert", tun_name]),
+        )
+        .context(
+            "selected VPN domains require systemd-resolved and a working `resolvectl`; split DNS was not installed",
+        )
 }
 
 #[cfg(target_os = "linux")]
@@ -254,6 +462,7 @@ fn configure_with_executor<E: CommandExecutor>(
     tun_name: &str,
     _tun_index: i32,
     transport_peers: &[IpAddr],
+    plan: &RoutePlan,
     executor: E,
 ) -> Result<RouteGuard<E>> {
     let transport_peers =
@@ -281,17 +490,20 @@ fn configure_with_executor<E: CommandExecutor>(
         }
     }
 
-    let dns_output = guard.query(CommandSpec::new("scutil", ["--dns"]))?;
-    for dns_server in deduplicate_ips(parse_macos_dns_servers(&dns_output)) {
-        if transport_peers.contains(&dns_server) || dns_server.is_loopback() {
-            continue;
+    if plan.route_system_dns {
+        let dns_output = guard.query(CommandSpec::new("scutil", ["--dns"]))?;
+        for dns_server in deduplicate_ips(parse_macos_dns_servers(&dns_output)) {
+            if transport_peers.contains(&dns_server) || dns_server.is_loopback() {
+                continue;
+            }
+            apply_macos_tun_route(&mut guard, tun_name, &dns_server.to_string(), true)?;
         }
-        apply_macos_tun_route(&mut guard, tun_name, &dns_server.to_string(), true)?;
     }
-    // Split defaults preserve the operating system's original defaults for rollback. Directly
-    // attached networks remain local, while explicit DNS host routes prevent resolver leaks.
-    for prefix in SPLIT_DEFAULT_ROUTES {
+    for prefix in &plan.tunnel_prefixes {
         apply_macos_tun_route(&mut guard, tun_name, prefix, false)?;
+    }
+    if !plan.split_dns_domains.is_empty() {
+        guard.dns_policy = Some(MacosDnsPolicy::install(&plan.split_dns_domains)?);
     }
     Ok(guard)
 }
@@ -353,6 +565,7 @@ fn configure_with_executor<E: CommandExecutor>(
     _tun_name: &str,
     tun_index: i32,
     transport_peers: &[IpAddr],
+    plan: &RoutePlan,
     executor: E,
 ) -> Result<RouteGuard<E>> {
     let transport_peers =
@@ -370,44 +583,49 @@ fn configure_with_executor<E: CommandExecutor>(
         apply_windows_route(&mut guard, &prefix, route.interface_index, &route.next_hop)?;
     }
 
-    let ipv6_address = VPN_INTERFACE_IPV6.to_string();
-    let add_ipv6_address = format!(
-        "New-NetIPAddress -InterfaceIndex {tun_index} -IPAddress '{ipv6_address}' \
-         -PrefixLength 64 -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
-    );
-    let remove_ipv6_address = format!(
-        "Get-NetIPAddress -InterfaceIndex {tun_index} -IPAddress '{ipv6_address}' \
-         -AddressFamily IPv6 -ErrorAction SilentlyContinue \
-         | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
-    );
-    guard.apply(
-        powershell(add_ipv6_address),
-        powershell(remove_ipv6_address),
-    )?;
-
-    let dns_query = "Get-DnsClientServerAddress | ForEach-Object { $_.ServerAddresses } \
-                     | Where-Object { $_ } | ConvertTo-Json -Compress";
-    let dns_output = guard.query(powershell(dns_query))?;
-    for dns_server in parse_windows_dns_servers(&dns_output)? {
-        if transport_peers.contains(&dns_server) || dns_server.is_loopback() {
-            continue;
-        }
-        let next_hop = if dns_server.is_ipv4() {
-            VPN_GATEWAY_IPV4.to_string()
-        } else {
-            "::".to_string()
-        };
-        apply_windows_route(&mut guard, &host_prefix(dns_server), tun_index, &next_hop)?;
+    if plan.requires_ipv6() {
+        let ipv6_address = VPN_INTERFACE_IPV6.to_string();
+        let add_ipv6_address = format!(
+            "New-NetIPAddress -InterfaceIndex {tun_index} -IPAddress '{ipv6_address}' \
+             -PrefixLength 64 -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
+        );
+        let remove_ipv6_address = format!(
+            "Get-NetIPAddress -InterfaceIndex {tun_index} -IPAddress '{ipv6_address}' \
+             -AddressFamily IPv6 -ErrorAction SilentlyContinue \
+             | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue"
+        );
+        guard.apply(
+            powershell(add_ipv6_address),
+            powershell(remove_ipv6_address),
+        )?;
     }
-    // Split defaults preserve the operating system's original defaults for rollback. Directly
-    // attached networks remain local, while explicit DNS host routes prevent resolver leaks.
-    for prefix in SPLIT_DEFAULT_ROUTES {
+
+    if plan.route_system_dns {
+        let dns_query = "Get-DnsClientServerAddress | ForEach-Object { $_.ServerAddresses } \
+                         | Where-Object { $_ } | ConvertTo-Json -Compress";
+        let dns_output = guard.query(powershell(dns_query))?;
+        for dns_server in parse_windows_dns_servers(&dns_output)? {
+            if transport_peers.contains(&dns_server) || dns_server.is_loopback() {
+                continue;
+            }
+            let next_hop = if dns_server.is_ipv4() {
+                VPN_GATEWAY_IPV4.to_string()
+            } else {
+                "::".to_string()
+            };
+            apply_windows_route(&mut guard, &host_prefix(dns_server), tun_index, &next_hop)?;
+        }
+    }
+    for prefix in &plan.tunnel_prefixes {
         let next_hop = if prefix.contains(':') {
             "::".to_string()
         } else {
             VPN_GATEWAY_IPV4.to_string()
         };
         apply_windows_route(&mut guard, prefix, tun_index, &next_hop)?;
+    }
+    if !plan.split_dns_domains.is_empty() {
+        configure_windows_split_dns(&mut guard, &plan.split_dns_domains)?;
     }
     Ok(guard)
 }
@@ -467,6 +685,52 @@ fn apply_windows_route<E: CommandExecutor>(
 }
 
 #[cfg(target_os = "windows")]
+fn configure_windows_split_dns<E: CommandExecutor>(
+    guard: &mut RouteGuard<E>,
+    domains: &[String],
+) -> Result<()> {
+    let display_name = unique_network_session_name();
+    // NRPT represents the apex and its suffix namespace separately. Keep them in one rule so the
+    // policy covers both without creating overlapping rule objects.
+    let mut setup = domains
+        .iter()
+        .map(|domain| {
+            powershell(format!(
+                "Add-DnsClientNrptRule -Namespace '{domain}','.{domain}' \
+                 -NameServers '{}' -DisplayName '{display_name}' \
+                 -Comment 'SSHPortal selective VPN session' -ErrorAction Stop | Out-Null",
+                VIRTUAL_DNS_SERVER
+            ))
+        })
+        .collect::<Vec<_>>();
+    let namespaces = domains
+        .iter()
+        .flat_map(|domain| [format!("'{domain}'"), format!("'.{domain}'")])
+        .collect::<Vec<_>>()
+        .join(",");
+    setup.push(powershell(format!(
+        "$expectedNamespaces = @({namespaces}); \
+         foreach ($namespace in $expectedNamespaces) {{ \
+             $policy = Get-DnsClientNrptPolicy -Effective -Namespace $namespace -ErrorAction Stop; \
+             if ($null -eq $policy -or -not (@($policy.NameServers) -contains '{}')) {{ \
+                 throw \"The SSHPortal NRPT rule for $namespace is not effective\" \
+             }} \
+         }}",
+        VIRTUAL_DNS_SERVER
+    )));
+    setup.push(powershell("Clear-DnsClientCache -ErrorAction Stop"));
+    let rollback = powershell(format!(
+        "Get-DnsClientNrptRule -ErrorAction SilentlyContinue \
+         | Where-Object {{ $_.DisplayName -eq '{display_name}' }} \
+         | ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction SilentlyContinue }}; \
+         Clear-DnsClientCache -ErrorAction SilentlyContinue"
+    ));
+    guard
+        .apply_group(setup, rollback)
+        .context("failed to install Windows NRPT rules for selected VPN domains")
+}
+
+#[cfg(target_os = "windows")]
 fn parse_windows_dns_servers(output: &str) -> Result<Vec<IpAddr>> {
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "null" {
@@ -494,6 +758,7 @@ fn configure_with_executor<E: CommandExecutor>(
     _tun_name: &str,
     _tun_index: i32,
     _transport_peers: &[IpAddr],
+    _plan: &RoutePlan,
     executor: E,
 ) -> Result<RouteGuard<E>> {
     let _guard = RouteGuard::new(executor);
@@ -558,7 +823,8 @@ mod tests {
 
     use anyhow::{Result, anyhow};
 
-    use super::{CommandExecutor, CommandSpec, RouteGuard, normalize_ip};
+    use super::{CommandExecutor, CommandSpec, RouteGuard, RoutePlan, normalize_ip};
+    use crate::vpn::SystemVpnPolicy;
 
     #[derive(Default)]
     struct MockState {
@@ -646,6 +912,94 @@ mod tests {
     }
 
     #[test]
+    fn grouped_setup_registers_cleanup_after_its_first_success() {
+        let executor = MockExecutor::with_results([
+            Ok(String::new()),
+            Err(anyhow!("second setup failed")),
+            Ok(String::new()),
+        ]);
+        let observer = executor.clone();
+        let mut guard = RouteGuard::new(executor);
+        let first = CommandSpec::new("network", ["first"]);
+        let second = CommandSpec::new("network", ["second"]);
+        let rollback = CommandSpec::new("network", ["rollback"]);
+
+        assert!(
+            guard
+                .apply_group([first.clone(), second.clone()], rollback.clone())
+                .is_err()
+        );
+        guard.restore().unwrap();
+
+        assert_eq!(observer.calls(), vec![first, second, rollback]);
+    }
+
+    #[test]
+    fn full_tunnel_plan_preserves_split_defaults_and_system_dns_routes() {
+        let plan = RoutePlan::for_policy(&SystemVpnPolicy::default());
+
+        assert_eq!(
+            plan.tunnel_prefixes,
+            ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]
+        );
+        assert!(plan.route_system_dns);
+        assert!(plan.split_dns_domains.is_empty());
+    }
+
+    #[test]
+    fn cidr_only_plan_installs_only_selected_network_routes() {
+        let policy = SystemVpnPolicy::new(
+            vec![
+                "10.20.0.0/16".parse().unwrap(),
+                "2001:db8:7::/48".parse().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let plan = RoutePlan::for_policy(&policy);
+
+        assert_eq!(plan.tunnel_prefixes, ["10.20.0.0/16", "2001:db8:7::/48"]);
+        assert!(!plan.route_system_dns);
+        assert!(plan.split_dns_domains.is_empty());
+    }
+
+    #[test]
+    fn domain_plan_routes_the_fake_ip_pool_and_installs_split_dns() {
+        let policy = SystemVpnPolicy::new(
+            Vec::new(),
+            vec!["anthem.com".to_string(), "elevancehealth.com".to_string()],
+        )
+        .unwrap();
+
+        let plan = RoutePlan::for_policy(&policy);
+
+        assert_eq!(plan.tunnel_prefixes, ["198.18.0.0/15"]);
+        assert!(!plan.route_system_dns);
+        assert_eq!(plan.split_dns_domains, ["anthem.com", "elevancehealth.com"]);
+    }
+
+    #[test]
+    fn combined_plan_has_union_semantics_and_expands_default_cidrs() {
+        let policy = SystemVpnPolicy::new(
+            vec![
+                "0.0.0.0/0".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap(),
+            ],
+            vec!["anthem.com".to_string()],
+        )
+        .unwrap();
+
+        let plan = RoutePlan::for_policy(&policy);
+
+        assert_eq!(
+            plan.tunnel_prefixes,
+            ["0.0.0.0/1", "128.0.0.0/1", "2001:db8::/32", "198.18.0.0/15"]
+        );
+        assert_eq!(plan.split_dns_domains, ["anthem.com"]);
+    }
+
+    #[test]
     fn ipv4_mapped_peer_addresses_are_normalized() {
         let mapped = "::ffff:192.0.2.9".parse().unwrap();
 
@@ -683,6 +1037,58 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_split_dns_uses_route_only_systemd_resolved_domains() {
+        let executor = MockExecutor::default();
+        let observer = executor.clone();
+        let mut guard = RouteGuard::new(executor);
+
+        super::configure_linux_split_dns(
+            &mut guard,
+            "tun7",
+            &["anthem.com".to_string(), "elevancehealth.com".to_string()],
+        )
+        .unwrap();
+        guard.restore().unwrap();
+
+        let calls = observer.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].arguments, ["dns", "tun7", "198.18.0.1"]);
+        assert_eq!(
+            calls[1].arguments,
+            ["domain", "tun7", "~anthem.com", "~elevancehealth.com"]
+        );
+        assert_eq!(calls[2].arguments, ["default-route", "tun7", "false"]);
+        assert_eq!(calls[3].arguments, ["revert", "tun7"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_split_dns_dictionary_contains_server_and_match_domains() {
+        use core_foundation::{array::CFArray, number::CFNumber, string::CFString};
+
+        let dictionary = super::macos_dns_dictionary(&[
+            "anthem.com".to_string(),
+            "elevancehealth.com".to_string(),
+        ]);
+
+        let server_addresses = dictionary.find(CFString::new("ServerAddresses")).unwrap();
+        assert_eq!(server_addresses.downcast::<CFArray>().unwrap().len(), 1);
+        assert!(format!("{server_addresses:?}").contains("198.18.0.1"));
+        let match_domains = dictionary
+            .find(CFString::new("SupplementalMatchDomains"))
+            .unwrap();
+        assert_eq!(match_domains.downcast::<CFArray>().unwrap().len(), 2);
+        let match_domains_description = format!("{match_domains:?}");
+        assert!(match_domains_description.contains("anthem.com"));
+        assert!(match_domains_description.contains("elevancehealth.com"));
+        let no_search = dictionary
+            .find(CFString::new("SupplementalMatchDomainsNoSearch"))
+            .unwrap();
+        assert_eq!(no_search.downcast::<CFNumber>().unwrap().to_i32(), Some(1));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_route_lookup_uses_the_route_object_returned_second() {
@@ -718,5 +1124,45 @@ mod tests {
         let rollback = calls[1].arguments.last().unwrap();
         assert!(rollback.contains("Get-NetRoute -DestinationPrefix '0.0.0.0/1'"));
         assert!(rollback.contains("Remove-NetRoute -Confirm:$false"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_split_dns_uses_session_scoped_suffix_nrpt_rules() {
+        let executor = MockExecutor::default();
+        let observer = executor.clone();
+        let mut guard = RouteGuard::new(executor);
+
+        super::configure_windows_split_dns(
+            &mut guard,
+            &["anthem.com".to_string(), "elevancehealth.com".to_string()],
+        )
+        .unwrap();
+        guard.restore().unwrap();
+
+        let calls = observer.calls();
+        assert_eq!(calls.len(), 5);
+        let anthem_setup = calls[0].arguments.last().unwrap();
+        assert!(anthem_setup.contains("-Namespace 'anthem.com','.anthem.com'"));
+        assert!(anthem_setup.contains("-NameServers '198.18.0.1'"));
+        assert!(anthem_setup.contains("-DisplayName 'SSHPortal-"));
+        let elevance_setup = calls[1].arguments.last().unwrap();
+        assert!(elevance_setup.contains("-Namespace 'elevancehealth.com','.elevancehealth.com'"));
+        assert!(elevance_setup.contains("-DisplayName 'SSHPortal-"));
+        let validation = calls[2].arguments.last().unwrap();
+        assert!(validation.contains("Get-DnsClientNrptPolicy -Effective"));
+        assert!(validation.contains("'anthem.com','.anthem.com'"));
+        assert!(validation.contains("-contains '198.18.0.1'"));
+        assert!(
+            calls[3]
+                .arguments
+                .last()
+                .unwrap()
+                .contains("Clear-DnsClientCache")
+        );
+        let rollback = calls[4].arguments.last().unwrap();
+        assert!(rollback.contains("$_.DisplayName -eq 'SSHPortal-"));
+        assert!(rollback.contains("Remove-DnsClientNrptRule -Name $_.Name -Force"));
+        assert!(rollback.contains("Clear-DnsClientCache"));
     }
 }

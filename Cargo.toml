@@ -1,6 +1,6 @@
 [package]
 name = "sshportal"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Consent-gated SSH, SOCKS proxy, and VPN access over a WebSocket rendezvous."
@@ -20,6 +20,7 @@ http-body-util = "0.1.3"
 hyper = { version = "1.7.0", features = ["http1", "server"] }
 hyper-tungstenite = "0.19.0"
 hyper-util = { version = "0.1.16", features = ["tokio", "client-proxy"] }
+ipnet = { version = "2.12.0", features = ["serde"] }
 pin-project-lite = "0.2.16"
 portable-pty = "0.9.0"
 rand = "0.10.0"
@@ -37,6 +38,10 @@ tun2proxy = { version = "0.8.3", default-features = false }
 url = "2.5.4"
 webpki-roots = "0.26.11"
 whoami = "1.6.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9.4"
+system-configuration = "0.7.0"
 
 [dev-dependencies]
 tempfile = "3.20.0"
