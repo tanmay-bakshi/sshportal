@@ -3,7 +3,7 @@ FROM alpine:3.22 AS runtime
 ARG TARGETARCH
 ARG TARGET_TRIPLE
 
-RUN apk add --no-cache bash ca-certificates
+RUN apk add --no-cache bash ca-certificates iproute2
 
 WORKDIR /support-workspace
 COPY target /prebuilt-target

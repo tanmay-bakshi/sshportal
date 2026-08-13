@@ -13,8 +13,8 @@ use tokio_tungstenite::accept_async;
 use crate::platform::{ShellFamily, ShellLaunch};
 use crate::socks::{
     SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
-    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksConnectTarget,
-    negotiate_socks5,
+    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksAuthentication,
+    SocksTarget, negotiate_socks5_connect,
 };
 use crate::websocket_to_io;
 
@@ -234,7 +234,9 @@ fn longest_prefix_suffix_match(buffer: &[u8], needle: &[u8]) -> usize {
 #[tokio::test]
 async fn negotiates_socks5_domain_connect_request() {
     let (mut client_side, mut server_side) = duplex(1024);
-    let server_task = tokio::spawn(async move { negotiate_socks5(&mut server_side).await });
+    let server_task = tokio::spawn(async move {
+        negotiate_socks5_connect(&mut server_side, &SocksAuthentication::None).await
+    });
 
     client_side
         .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_NONE])
@@ -271,7 +273,7 @@ async fn negotiates_socks5_domain_connect_request() {
     let target = server_task.await.unwrap().unwrap();
     assert_eq!(
         target,
-        SocksConnectTarget {
+        SocksTarget {
             host: "example.com".to_string(),
             port: 1080,
         }
@@ -281,7 +283,9 @@ async fn negotiates_socks5_domain_connect_request() {
 #[tokio::test]
 async fn rejects_unsupported_socks5_command() {
     let (mut client_side, mut server_side) = duplex(1024);
-    let server_task = tokio::spawn(async move { negotiate_socks5(&mut server_side).await });
+    let server_task = tokio::spawn(async move {
+        negotiate_socks5_connect(&mut server_side, &SocksAuthentication::None).await
+    });
 
     client_side
         .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_NONE])
@@ -332,11 +336,8 @@ async fn rejects_unsupported_socks5_command() {
 #[tokio::test]
 async fn forwards_direct_tcpip_channels_to_client_network() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = PrivateKey::random(
-        &mut russh::keys::ssh_key::rand_core::OsRng,
-        ssh_key::Algorithm::Ed25519,
-    )
-    .unwrap();
+    let allowed_private_key =
+        PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
@@ -409,13 +410,8 @@ async fn forwards_direct_tcpip_channels_to_client_network() {
 #[tokio::test]
 async fn runs_authenticated_transport_over_websocket_io() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
 
@@ -467,13 +463,8 @@ async fn runs_authenticated_transport_over_websocket_io() {
 #[tokio::test]
 async fn dynamic_forward_listener_routes_socks_connections_through_client_network() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
@@ -578,13 +569,8 @@ async fn dynamic_forward_listener_routes_socks_connections_through_client_networ
 #[tokio::test]
 async fn executes_noninteractive_commands_over_authenticated_transport() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
@@ -619,13 +605,8 @@ async fn executes_noninteractive_commands_over_authenticated_transport() {
 #[tokio::test]
 async fn transfers_large_exec_output_through_bounded_channels() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
@@ -661,13 +642,8 @@ async fn transfers_large_exec_output_through_bounded_channels() {
 #[tokio::test]
 async fn reuses_authenticated_transport_for_multiple_shell_sessions() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
@@ -707,13 +683,8 @@ async fn reuses_authenticated_transport_for_multiple_shell_sessions() {
 #[tokio::test]
 async fn local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();
@@ -802,13 +773,8 @@ async fn local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport() {
 #[tokio::test]
 async fn local_ssh_proxy_executes_noninteractive_commands() {
     let temp_dir = tempdir().unwrap();
-    let allowed_private_key = Arc::new(
-        PrivateKey::random(
-            &mut russh::keys::ssh_key::rand_core::OsRng,
-            ssh_key::Algorithm::Ed25519,
-        )
-        .unwrap(),
-    );
+    let allowed_private_key =
+        Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let allowed_public_key = allowed_private_key.public_key().clone();
     let (client_io, server_io) = duplex(64 * 1024);
     let shell = ShellLaunch::detect_for_current_platform().unwrap();

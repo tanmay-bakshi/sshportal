@@ -26,6 +26,35 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  windows-cross:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install cross-compilation tools
+        run: |
+          brew install llvm lld jq
+          rustup toolchain install 1.90.0 \
+            --profile minimal \
+            --target x86_64-pc-windows-msvc
+          cargo install --locked --version 0.21.4 cargo-xwin
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/cargo-xwin
+          key: cargo-xwin-${{ runner.os }}-${{ runner.arch }}-0.21.4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-cross-x86_64-msvc
+      - run: tools/build_windows_release.sh
+
   test:
     strategy:
       fail-fast: false
@@ -41,7 +70,7 @@ jobs:
       - if: matrix.os != 'windows-latest'
         uses: Swatinem/rust-cache@v2
       - if: matrix.os != 'windows-latest'
-        run: cargo test --locked
+        run: cargo test --locked --all-targets
       - if: matrix.os == 'windows-latest'
         run: cargo test --locked platform::tests -- --nocapture
       - if: matrix.os == 'windows-latest'
@@ -50,7 +79,16 @@ jobs:
         run: cargo test --locked websocket::tests -- --nocapture
       - if: matrix.os == 'windows-latest'
         timeout-minutes: 3
-        run: cargo test --locked proxy::tests::socks_only_proxy_routes_tcp_without_ssh -- --nocapture
+        run: cargo test --locked proxy::tests::network_proxy_routes_tcp_and_resolves_domains_on_the_client -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        timeout-minutes: 3
+        run: cargo test --locked proxy::tests::network_proxy_routes_socks5_udp_associations -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        run: cargo test --locked vpn::routes::tests -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        run: cargo test --locked --bin sshportal-client -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        run: cargo test --locked --bin sshportal-server -- --nocapture
       - if: matrix.os == 'windows-latest'
         timeout-minutes: 3
         run: cargo test --locked shell::tests::negotiates_socks5_domain_connect_request -- --nocapture
@@ -79,15 +117,55 @@ jobs:
         timeout-minutes: 3
         run: cargo test --locked shell::tests::local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport -- --nocapture
 
+  native-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test native per-app VPN targets
+        run: |
+          xcodebuild \
+            -project macos/SSHPortal.xcodeproj \
+            -scheme SSHPortal \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath target/macos-ci-derived \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+      - name: Build universal companion and system extension
+        run: |
+          xcodebuild \
+            -project macos/SSHPortal.xcodeproj \
+            -scheme SSHPortal \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath target/macos-ci-universal-derived \
+            CODE_SIGNING_ALLOWED=NO \
+            ARCHS='arm64 x86_64' \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+          lipo \
+            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/MacOS/SSHPortal \
+            -verify_arch arm64
+          lipo \
+            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/MacOS/SSHPortal \
+            -verify_arch x86_64
+          lipo \
+            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/Library/SystemExtensions/SSHPortalAppProxy.systemextension/Contents/MacOS/SSHPortalAppProxy \
+            -verify_arch arm64
+          lipo \
+            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/Library/SystemExtensions/SSHPortalAppProxy.systemextension/Contents/MacOS/SSHPortalAppProxy \
+            -verify_arch x86_64
+
   e2e-linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - run: sudo apt-get update && sudo apt-get install --yes musl-tools openssl
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: python3 tools/docker_e2e.py
+      - run: python3 tools/docker_vpn_e2e.py --skip-build

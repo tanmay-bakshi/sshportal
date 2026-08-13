@@ -100,7 +100,15 @@ def build_host_binaries(target_triple: str) -> None:
     build_environment = resolve_build_environment(target_triple)
     run_checked(["rustup", "target", "add", target_triple], cwd=PROJECT_ROOT)
     run_checked(
-        ["cargo", "build", "--release", "--target", target_triple, "--bins"],
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            target_triple,
+            "--bins",
+        ],
         cwd=PROJECT_ROOT,
         env=build_environment,
     )
@@ -114,23 +122,51 @@ def resolve_build_environment(target_triple: str) -> dict[str, str]:
     :raises RuntimeError: If a required Linux musl toolchain is unavailable.
     """
 
+    target_architectures: dict[str, str] = {
+        "aarch64-unknown-linux-musl": "aarch64",
+        "x86_64-unknown-linux-musl": "x86_64",
+    }
+    target_architecture = target_architectures.get(target_triple)
+    if target_architecture is None:
+        raise RuntimeError(f"unsupported static Linux target: {target_triple}")
+
     environment = os.environ.copy()
-    if target_triple != "x86_64-unknown-linux-musl":
-        return environment
-    if platform_module.system() != "Linux":
-        return environment
-    if shutil.which("x86_64-linux-musl-gcc") is not None:
+    variable_suffix = target_triple.replace("-", "_")
+    cc_variable = f"CC_{variable_suffix}"
+    linker_variable = f"CARGO_TARGET_{variable_suffix.upper()}_LINKER"
+    if environment.get(cc_variable) is not None and environment.get(linker_variable) is not None:
         return environment
 
-    musl_gcc = shutil.which("musl-gcc")
-    if musl_gcc is None:
+    host_architecture = platform_module.machine().lower()
+    if host_architecture == "arm64":
+        host_architecture = "aarch64"
+    elif host_architecture == "amd64":
+        host_architecture = "x86_64"
+
+    compiler_names: list[str] = []
+    if platform_module.system() == "Linux" and host_architecture == target_architecture:
+        compiler_names.append("musl-gcc")
+    compiler_names.append(f"{target_architecture}-linux-musl-gcc")
+
+    compiler = environment.get(cc_variable)
+    if compiler is None:
+        compiler = next(
+            (
+                resolved
+                for name in compiler_names
+                if (resolved := shutil.which(name)) is not None
+            ),
+            None,
+        )
+    if compiler is None:
+        expected_compilers = " or ".join(compiler_names)
         raise RuntimeError(
-            "building x86_64-unknown-linux-musl requires a musl C toolchain; "
-            "install musl-tools or provide x86_64-linux-musl-gcc"
+            f"building {target_triple} requires {expected_compilers}; "
+            "install a musl C toolchain for the target architecture"
         )
 
-    environment["CC_x86_64_unknown_linux_musl"] = musl_gcc
-    environment["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"] = musl_gcc
+    environment[cc_variable] = compiler
+    environment.setdefault(linker_variable, compiler)
     return environment
 
 

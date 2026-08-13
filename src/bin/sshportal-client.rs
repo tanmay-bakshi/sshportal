@@ -10,9 +10,9 @@ use hostname::get;
 
 use sshportal::{
     AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ControlPacket,
-    OfferedSession, PROTOCOL_VERSION, Platform, ShellLaunch, authorized_key_support,
+    OfferedSession, PROTOCOL_VERSION, Platform, ShellLaunch, VpnScope, authorized_key_support,
     connect_async_with_env_proxy, install_default_rustls_crypto_provider, normalize_websocket_url,
-    parse_public_key, recv_packet, run_client_socks_proxy, run_remote_shell_server, send_packet,
+    parse_public_key, recv_packet, run_client_network_proxy, run_remote_shell_server, send_packet,
     validate_protocol_version, websocket_to_io,
 };
 
@@ -20,7 +20,7 @@ use sshportal::{
 #[command(
     name = "sshportal-client",
     about = "Connect back to an sshportal server and request local user approval.",
-    long_about = "Connect to an sshportal rendezvous endpoint, complete the handshake, and serve the approved SSH or SOCKS-only support session back to the operator over the upgraded transport.",
+    long_about = "Connect to an sshportal rendezvous endpoint, complete the handshake, and serve the approved SSH, SOCKS, or VPN session back to the operator over the upgraded transport.",
     after_help = "Examples:\n  sshportal-client --server http://server-host:8080?token=<join-token>\n  sshportal-client --server https://support.example.com?token=<join-token> --approve-session"
 )]
 struct ClientCli {
@@ -70,10 +70,33 @@ async fn main() -> Result<()> {
     };
     validate_protocol_version(offer.protocol_version)?;
 
+    if let Some(note) = session_transport_refusal(&offer.session, &server_url) {
+        let decision = ClientDecision {
+            session_allowed: false,
+            key_installed: false,
+            note: Some(note.clone()),
+        };
+        send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
+        bail!("{note}");
+    }
+
     let session_description = match &offer.session {
-        OfferedSession::Ssh { .. } => "open SSH support sessions into this environment",
+        OfferedSession::Ssh { .. } => "open SSH support sessions into this environment".to_string(),
         OfferedSession::Socks => {
-            "route TCP connections through this environment using a SOCKS5 proxy"
+            "route TCP connections through this environment using a SOCKS5 proxy".to_string()
+        }
+        OfferedSession::Vpn {
+            scope: VpnScope::System,
+        } => {
+            "route the operator's system-wide internet-bound TCP, UDP, and DNS traffic through this environment"
+                .to_string()
+        }
+        OfferedSession::Vpn {
+            scope: VpnScope::Application { application },
+        } => {
+            format!(
+                "route traffic from the operator's {application} application through this environment"
+            )
         }
     };
     let session_allowed = if cli.approve_session {
@@ -140,9 +163,29 @@ async fn main() -> Result<()> {
             };
             send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
             println!("SOCKS-only support session approved (SSH disabled)");
-            run_client_socks_proxy(websocket).await
+            run_client_network_proxy(websocket).await
+        }
+        OfferedSession::Vpn { .. } => {
+            let decision = ClientDecision {
+                session_allowed: true,
+                key_installed: false,
+                note: None,
+            };
+            send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
+            println!("VPN egress session approved (SSH disabled; no local privileges required)");
+            run_client_network_proxy(websocket).await
         }
     }
+}
+
+fn session_transport_refusal(session: &OfferedSession, server_url: &url::Url) -> Option<String> {
+    if matches!(session, OfferedSession::Vpn { .. }) && server_url.scheme() != "wss" {
+        return Some(
+            "VPN mode requires an encrypted HTTPS/WSS server URL; refusing plain WebSocket transport"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn gather_client_environment() -> Result<LocalClientEnvironment> {
@@ -244,5 +287,50 @@ fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
         "y" | "yes" => Ok(true),
         "n" | "no" => Ok(false),
         _ => bail!("unrecognized response `{normalized}`"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sshportal::OfferedSession;
+    use url::Url;
+
+    use super::session_transport_refusal;
+
+    #[test]
+    fn vpn_mode_rejects_plain_websocket_transport() {
+        let url = Url::parse("ws://support.example/connect").unwrap();
+
+        let refusal = session_transport_refusal(
+            &OfferedSession::Vpn {
+                scope: sshportal::VpnScope::System,
+            },
+            &url,
+        )
+        .unwrap();
+
+        assert!(refusal.contains("requires an encrypted HTTPS/WSS"));
+    }
+
+    #[test]
+    fn vpn_mode_accepts_encrypted_websocket_transport() {
+        let url = Url::parse("wss://support.example/connect").unwrap();
+
+        assert!(
+            session_transport_refusal(
+                &OfferedSession::Vpn {
+                    scope: sshportal::VpnScope::System,
+                },
+                &url,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn non_vpn_modes_retain_plain_websocket_support() {
+        let url = Url::parse("ws://support.example/connect").unwrap();
+
+        assert!(session_transport_refusal(&OfferedSession::Socks, &url).is_none());
     }
 }

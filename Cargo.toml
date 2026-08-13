@@ -1,12 +1,12 @@
 [package]
 name = "sshportal"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Consent-gated SSH and SOCKS proxy access over an HTTP or WebSocket rendezvous."
+rust-version = "1.90"
+description = "Consent-gated SSH, SOCKS proxy, and VPN access over a WebSocket rendezvous."
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["ssh", "socks", "remote-support", "proxy", "websocket"]
+keywords = ["ssh", "socks", "vpn", "remote-support", "websocket"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
@@ -22,7 +22,8 @@ hyper-tungstenite = "0.19.0"
 hyper-util = { version = "0.1.16", features = ["tokio", "client-proxy"] }
 pin-project-lite = "0.2.16"
 portable-pty = "0.9.0"
-russh = { version = "0.58.0", default-features = false, features = ["flate2", "rsa", "ring"] }
+rand = "0.10.0"
+russh = { version = "0.62.6", default-features = false, features = ["flate2", "rsa", "ring"] }
 rustls = { version = "0.23.37", default-features = false, features = ["std", "ring"] }
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -31,9 +32,14 @@ tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = { version = "0.26.4", default-features = false }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
+tun = { version = "0.8.14", features = ["async", "verify_binary_signature"] }
+tun2proxy = { version = "0.8.3", default-features = false }
 url = "2.5.4"
 webpki-roots = "0.26.11"
 whoami = "1.6.1"
 
 [dev-dependencies]
 tempfile = "3.20.0"
+
+[patch.crates-io]
+ipstack = { path = "vendor/ipstack" }

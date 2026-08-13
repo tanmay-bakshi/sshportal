@@ -36,11 +36,8 @@ pub async fn run_remote_shell_server<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let host_key = PrivateKey::random(
-        &mut russh::keys::ssh_key::rand_core::OsRng,
-        ssh_key::Algorithm::Ed25519,
-    )
-    .context("failed to generate SSH host key")?;
+    let host_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
+        .context("failed to generate SSH host key")?;
     debug_log("starting SSH server session");
     let config = server::Config {
         auth_rejection_time: Duration::from_secs(2),
@@ -485,8 +482,9 @@ impl server::Handler for RemoteShellHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         debug_log(format!(
             "channel_open_session received for {:?}",
             channel.id()
@@ -498,7 +496,8 @@ impl server::Handler for RemoteShellHandler {
                 env_vars: Vec::new(),
             }),
         );
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn channel_open_direct_tcpip(
@@ -508,15 +507,16 @@ impl server::Handler for RemoteShellHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let port = match u16::try_from(port_to_connect) {
             Ok(port) => port,
             Err(_) => {
                 debug_log(format!(
                     "rejecting direct-tcpip request with invalid port {port_to_connect}"
                 ));
-                return Ok(false);
+                return Ok(());
             }
         };
         let outbound = match TcpStream::connect((host_to_connect, port)).await {
@@ -526,7 +526,7 @@ impl server::Handler for RemoteShellHandler {
                     "failed to connect direct-tcpip target {host_to_connect}:{port} from \
                      {originator_address}:{originator_port}: {error}"
                 ));
-                return Ok(false);
+                return Ok(());
             }
         };
         debug_log(format!(
@@ -538,7 +538,8 @@ impl server::Handler for RemoteShellHandler {
                 debug_log(format!("direct-tcpip bridge failed: {error:#}"));
             }
         });
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(

@@ -36,6 +36,16 @@ pub enum OfferedSession {
         persist_key_requested: bool,
     },
     Socks,
+    Vpn {
+        scope: VpnScope,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VpnScope {
+    System,
+    Application { application: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -105,4 +115,45 @@ pub fn validate_protocol_version(version: u32) -> Result<()> {
         bail!("protocol version mismatch: local={PROTOCOL_VERSION} remote={version}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlPacket, OfferedSession, ServerOffer, VpnScope};
+
+    #[test]
+    fn system_vpn_offer_identifies_its_scope() {
+        let packet = ControlPacket::ServerOffer(ServerOffer {
+            protocol_version: 5,
+            operator_name: "support".to_string(),
+            session: OfferedSession::Vpn {
+                scope: VpnScope::System,
+            },
+        });
+
+        let encoded = serde_json::to_value(packet).unwrap();
+
+        assert_eq!(encoded["type"], "server_offer");
+        assert_eq!(encoded["session"]["mode"], "vpn");
+        assert_eq!(encoded["session"]["scope"]["kind"], "system");
+    }
+
+    #[test]
+    fn application_vpn_offer_names_the_scoped_application() {
+        let packet = ControlPacket::ServerOffer(ServerOffer {
+            protocol_version: 5,
+            operator_name: "support".to_string(),
+            session: OfferedSession::Vpn {
+                scope: VpnScope::Application {
+                    application: "Firefox".to_string(),
+                },
+            },
+        });
+
+        let encoded = serde_json::to_value(packet).unwrap();
+
+        assert_eq!(encoded["session"]["mode"], "vpn");
+        assert_eq!(encoded["session"]["scope"]["kind"], "application");
+        assert_eq!(encoded["session"]["scope"]["application"], "Firefox");
+    }
 }

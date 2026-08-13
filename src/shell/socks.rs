@@ -9,7 +9,8 @@ use tokio::task::JoinHandle;
 
 use crate::debug::debug_log;
 use crate::socks::{
-    SOCKS_REPLY_GENERAL_FAILURE, SOCKS_REPLY_SUCCESS, negotiate_socks5, write_socks5_response,
+    SOCKS_REPLY_GENERAL_FAILURE, SOCKS_REPLY_SUCCESS, SocksAuthentication,
+    negotiate_socks5_connect, write_socks5_response,
 };
 
 use super::common::NoopClientHandler;
@@ -71,7 +72,7 @@ async fn handle_dynamic_forward_connection(
     mut stream: TcpStream,
     session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
 ) -> Result<()> {
-    let target = negotiate_socks5(&mut stream).await?;
+    let target = negotiate_socks5_connect(&mut stream, &SocksAuthentication::None).await?;
     let originator_addr = stream
         .peer_addr()
         .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
@@ -93,7 +94,7 @@ async fn handle_dynamic_forward_connection(
     let channel = match channel_result {
         Ok(channel) => channel,
         Err(error) => {
-            write_socks5_response(&mut stream, SOCKS_REPLY_GENERAL_FAILURE)
+            write_socks5_response(&mut stream, SOCKS_REPLY_GENERAL_FAILURE, None)
                 .await
                 .context("failed to send SOCKS connect failure")?;
             return Err(error).context(format!(
@@ -102,7 +103,7 @@ async fn handle_dynamic_forward_connection(
             ));
         }
     };
-    write_socks5_response(&mut stream, SOCKS_REPLY_SUCCESS)
+    write_socks5_response(&mut stream, SOCKS_REPLY_SUCCESS, None)
         .await
         .context("failed to send SOCKS connect success")?;
     bridge_ssh_channel_with_tcp_stream(channel, stream)

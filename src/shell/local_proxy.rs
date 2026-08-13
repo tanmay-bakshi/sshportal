@@ -34,11 +34,8 @@ impl Drop for SshProxyListener {
 }
 
 fn build_ssh_proxy_server_config() -> Result<Arc<server::Config>> {
-    let host_key = PrivateKey::random(
-        &mut russh::keys::ssh_key::rand_core::OsRng,
-        ssh_key::Algorithm::Ed25519,
-    )
-    .context("failed to generate SSH proxy host key")?;
+    let host_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
+        .context("failed to generate SSH proxy host key")?;
     let config = server::Config {
         auth_rejection_time: Duration::from_secs(2),
         inactivity_timeout: None,
@@ -235,8 +232,9 @@ impl server::Handler for LocalSshProxyHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let local_channel = channel.id();
         let upstream_channel = {
             let session_guard = self.upstream_session.lock().await;
@@ -248,7 +246,7 @@ impl server::Handler for LocalSshProxyHandler {
                 debug_log(format!(
                     "failed to open upstream session channel for {local_channel:?}: {error}"
                 ));
-                return Ok(false);
+                return Ok(());
             }
         };
         let (upstream_reader, upstream_writer) = upstream_channel.split();
@@ -273,7 +271,8 @@ impl server::Handler for LocalSshProxyHandler {
             )
             .await;
         });
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(

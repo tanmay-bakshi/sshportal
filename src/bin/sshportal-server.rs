@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -24,21 +24,21 @@ use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use url::form_urlencoded;
 
+#[cfg(target_os = "macos")]
+use sshportal::MacosPerAppVpn;
 use sshportal::{
     ClientDecision, ClientHello, ControlPacket, DEFAULT_CONNECT_PATH, DEFAULT_HEALTH_PATH,
-    OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, load_operator_key,
-    recv_packet, run_client_session_proxy, run_operator_socks_proxy, send_packet,
-    validate_protocol_version, websocket_to_io,
+    OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, VpnScope,
+    load_operator_key, recv_packet, run_client_session_proxy, run_operator_socks_proxy,
+    run_operator_vpn, send_packet, validate_protocol_version, websocket_to_io,
 };
-
-use russh::keys::ssh_key::rand_core::{OsRng, RngCore};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sshportal-server",
-    about = "Accept one consent-gated support client and expose an SSH or SOCKS proxy.",
-    long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and exposes either an SSH session or a SOCKS-only proxy after client approval.",
-    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080"
+    about = "Accept one consent-gated support client and expose SSH, SOCKS, or VPN access.",
+    long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and starts exactly one client-approved SSH, SOCKS, or VPN session.",
+    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080\n  sudo sshportal-server --vpn\n  sshportal-server --vpn-app /Applications/Firefox.app"
 )]
 struct ServerCli {
     /// HTTP address for the one-time rendezvous endpoint.
@@ -66,19 +66,58 @@ struct ServerCli {
         long,
         default_value = "127.0.0.1:0",
         value_name = "LISTEN_ADDR",
-        conflicts_with = "socks_only"
+        conflicts_with_all = ["socks_only", "vpn", "vpn_app"]
     )]
     ssh_listen: SocketAddr,
     /// Optional local SOCKS5 listener to expose for the lifetime of the session.
-    #[arg(long, value_name = "LISTEN_ADDR", conflicts_with = "socks_only")]
+    #[arg(
+        long,
+        value_name = "LISTEN_ADDR",
+        conflicts_with_all = ["socks_only", "vpn", "vpn_app"]
+    )]
     dynamic_forward: Option<SocketAddr>,
     /// Run without SSH and expose only this local SOCKS5 listener.
     #[arg(
         long,
         value_name = "LISTEN_ADDR",
-        conflicts_with_all = ["operator_key", "persist_operator_key"]
+        conflicts_with_all = ["operator_key", "persist_operator_key", "vpn", "vpn_app"]
     )]
     socks_only: Option<SocketAddr>,
+    /// Route this machine's internet-bound IPv4, IPv6, TCP, UDP, and DNS traffic through the client.
+    ///
+    /// This mode requires administrator/root privileges and an encrypted WSS endpoint.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "operator_key",
+            "persist_operator_key",
+            "ssh_listen",
+            "dynamic_forward",
+            "socks_only",
+            "vpn_app"
+        ]
+    )]
+    vpn: bool,
+    /// On macOS, route only new connections from this signed application through the client.
+    ///
+    /// The server remains unprivileged. macOS may require administrator approval when the native
+    /// SSHPortal system extension is installed for the first time.
+    #[arg(
+        long,
+        value_name = "APP_BUNDLE",
+        conflicts_with_all = [
+            "operator_key",
+            "persist_operator_key",
+            "ssh_listen",
+            "dynamic_forward",
+            "socks_only",
+            "vpn"
+        ]
+    )]
+    vpn_app: Option<PathBuf>,
+    /// Explicit SSHPortal.app bundle to use for native per-app VPN support.
+    #[arg(long, value_name = "APP_BUNDLE", requires = "vpn_app")]
+    vpn_companion: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +189,11 @@ enum ServerSessionMode {
     Socks {
         listen_addr: SocketAddr,
     },
+    VpnSystem,
+    #[cfg(target_os = "macos")]
+    VpnApplication {
+        configuration: MacosPerAppVpn,
+    },
 }
 
 impl ServerSessionMode {
@@ -160,6 +204,15 @@ impl ServerSessionMode {
                 persist_key_requested: operator_key.persistent(),
             },
             Self::Socks { .. } => OfferedSession::Socks,
+            Self::VpnSystem => OfferedSession::Vpn {
+                scope: VpnScope::System,
+            },
+            #[cfg(target_os = "macos")]
+            Self::VpnApplication { configuration } => OfferedSession::Vpn {
+                scope: VpnScope::Application {
+                    application: configuration.application_name().to_string(),
+                },
+            },
         };
         ServerOffer {
             protocol_version: PROTOCOL_VERSION,
@@ -172,6 +225,7 @@ impl ServerSessionMode {
 struct EstablishedSession {
     websocket: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     client_hello: ClientHello,
+    transport_peers: Vec<IpAddr>,
 }
 
 #[tokio::main]
@@ -220,6 +274,23 @@ async fn main() -> Result<()> {
             println!("SOCKS-only proxy requested on {listen_addr} (SSH disabled)");
             println!("SOCKS-only traffic relies on WSS for transport encryption");
         }
+        ServerSessionMode::VpnSystem => {
+            println!("VPN mode requested (SSH disabled)");
+            println!("VPN mode requires administrator/root privileges and WSS");
+        }
+        #[cfg(target_os = "macos")]
+        ServerSessionMode::VpnApplication { configuration } => {
+            println!(
+                "native per-app VPN requested for {} ({})",
+                configuration.application_name(),
+                configuration.application_bundle().display()
+            );
+            println!(
+                "macOS companion: {}",
+                configuration.companion_bundle().display()
+            );
+            println!("per-app VPN requires WSS but does not require root privileges");
+        }
     }
 
     let http_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));
@@ -252,6 +323,17 @@ async fn main() -> Result<()> {
         ServerSessionMode::Socks { listen_addr } => {
             run_operator_socks_proxy(established_session.websocket, *listen_addr).await
         }
+        ServerSessionMode::VpnSystem => {
+            run_operator_vpn(
+                established_session.websocket,
+                established_session.transport_peers,
+            )
+            .await
+        }
+        #[cfg(target_os = "macos")]
+        ServerSessionMode::VpnApplication { configuration } => {
+            configuration.run(established_session.websocket).await
+        }
     };
     {
         let mut status = state.status.write().await;
@@ -272,14 +354,16 @@ async fn run_http_server(listener: TcpListener, state: Arc<AppState>) -> Result<
                 break;
             }
             accept_result = listener.accept() => {
-                let (stream, _) = accept_result.context("failed to accept HTTP connection")?;
+                let (stream, peer_addr) = accept_result.context("failed to accept HTTP connection")?;
                 stream
                     .set_nodelay(true)
                     .context("failed to enable TCP_NODELAY on the accepted HTTP socket")?;
                 let state_for_connection = Arc::clone(&state);
                 let connection_builder = builder.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |request| handle_request(request, Arc::clone(&state_for_connection)));
+                    let service = service_fn(move |request| {
+                        handle_request(request, Arc::clone(&state_for_connection), peer_addr)
+                    });
                     let connection = connection_builder
                         .serve_connection(TokioIo::new(stream), service)
                         .with_upgrades();
@@ -296,11 +380,14 @@ async fn run_http_server(listener: TcpListener, state: Arc<AppState>) -> Result<
 async fn handle_request(
     mut request: Request<Incoming>,
     state: Arc<AppState>,
+    peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/") => status_response(&state).await,
         (&Method::GET, DEFAULT_HEALTH_PATH) => health_response(&state).await,
-        (&Method::GET, DEFAULT_CONNECT_PATH) => websocket_response(&mut request, state).await,
+        (&Method::GET, DEFAULT_CONNECT_PATH) => {
+            websocket_response(&mut request, state, peer_addr).await
+        }
         _ => plain_response(StatusCode::NOT_FOUND, "not found"),
     };
     Ok(response)
@@ -330,6 +417,7 @@ async fn health_response(state: &Arc<AppState>) -> Response<Full<Bytes>> {
 async fn websocket_response(
     request: &mut Request<Incoming>,
     state: Arc<AppState>,
+    peer_addr: SocketAddr,
 ) -> Response<Full<Bytes>> {
     if !is_upgrade_request(request) {
         return plain_response(StatusCode::BAD_REQUEST, "websocket upgrade required");
@@ -343,6 +431,7 @@ async fn websocket_response(
             "server is already negotiating another client",
         );
     }
+    let transport_peers = transport_peers(request, peer_addr);
 
     let (response, websocket) = match upgrade(request, None) {
         Ok(parts) => parts,
@@ -366,7 +455,11 @@ async fn websocket_response(
             Ok(websocket_stream) => {
                 let timeout_result = tokio::time::timeout(
                     state_for_task.handshake_timeout,
-                    handle_support_session(websocket_stream, Arc::clone(&state_for_task)),
+                    handle_support_session(
+                        websocket_stream,
+                        Arc::clone(&state_for_task),
+                        transport_peers,
+                    ),
                 )
                 .await;
                 match timeout_result {
@@ -399,6 +492,7 @@ async fn websocket_response(
 async fn handle_support_session(
     mut websocket: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     state: Arc<AppState>,
+    transport_peers: Vec<IpAddr>,
 ) -> Result<EstablishedSession> {
     let client_hello = match recv_packet(&mut websocket).await? {
         ControlPacket::ClientHello(hello) => hello,
@@ -421,7 +515,30 @@ async fn handle_support_session(
     Ok(EstablishedSession {
         websocket,
         client_hello,
+        transport_peers,
     })
+}
+
+fn transport_peers<B>(request: &Request<B>, peer_addr: SocketAddr) -> Vec<IpAddr> {
+    let mut peers = vec![peer_addr.ip()];
+    if !peer_addr.ip().is_loopback() {
+        return peers;
+    }
+
+    let forwarded_peer = request
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .last()
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    if let Some(forwarded_peer) = forwarded_peer
+        && !peers.contains(&forwarded_peer)
+    {
+        peers.push(forwarded_peer);
+    }
+    peers
 }
 
 fn handle_client_decision(decision: &ClientDecision) -> Result<()> {
@@ -446,6 +563,22 @@ fn plain_response(status: StatusCode, body: impl Into<String>) -> Response<Full<
 }
 
 fn resolve_session_mode(cli: &ServerCli) -> Result<ServerSessionMode> {
+    if cli.vpn {
+        return Ok(ServerSessionMode::VpnSystem);
+    }
+    if let Some(application_bundle) = &cli.vpn_app {
+        #[cfg(target_os = "macos")]
+        {
+            let configuration =
+                MacosPerAppVpn::resolve(application_bundle, cli.vpn_companion.as_deref())?;
+            return Ok(ServerSessionMode::VpnApplication { configuration });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = application_bundle;
+            bail!("--vpn-app is supported only on macOS");
+        }
+    }
     if let Some(listen_addr) = cli.socks_only {
         return Ok(ServerSessionMode::Socks { listen_addr });
     }
@@ -467,7 +600,7 @@ fn resolve_join_token(join_token: Option<String>) -> Result<String> {
     }
 
     let mut token_bytes = [0_u8; 16];
-    OsRng.fill_bytes(&mut token_bytes);
+    rand::fill(&mut token_bytes);
     Ok(hex_encode(&token_bytes))
 }
 
@@ -526,7 +659,6 @@ mod tests {
 
     use clap::Parser;
     use hyper::{Request, StatusCode};
-    use russh::keys::ssh_key::rand_core::OsRng as KeyOsRng;
     use russh::keys::{PrivateKey, ssh_key};
     use tokio::net::TcpListener;
     use tokio::sync::{Mutex, Notify, RwLock, oneshot};
@@ -535,6 +667,7 @@ mod tests {
     use super::{
         AppState, ServerCli, ServerSessionMode, SessionSummary, render_status_body,
         request_matches_join_token, resolve_join_token, resolve_session_mode, run_http_server,
+        transport_peers,
     };
     use sshportal::{DEFAULT_CONNECT_PATH, OperatorKeyMaterial};
 
@@ -580,6 +713,48 @@ mod tests {
     }
 
     #[test]
+    fn vpn_mode_does_not_require_ssh_configuration() {
+        let cli = ServerCli::try_parse_from(["sshportal-server", "--vpn"]).unwrap();
+
+        let mode = resolve_session_mode(&cli).unwrap();
+
+        assert!(matches!(mode, ServerSessionMode::VpnSystem));
+    }
+
+    #[test]
+    fn vpn_mode_rejects_every_other_session_mode_option() {
+        for arguments in [
+            vec![
+                "sshportal-server",
+                "--vpn",
+                "--socks-only",
+                "127.0.0.1:1080",
+            ],
+            vec![
+                "sshportal-server",
+                "--vpn",
+                "--ssh-listen",
+                "127.0.0.1:2222",
+            ],
+            vec![
+                "sshportal-server",
+                "--vpn",
+                "--dynamic-forward",
+                "127.0.0.1:1080",
+            ],
+            vec![
+                "sshportal-server",
+                "--vpn",
+                "--operator-key",
+                "operator-key",
+            ],
+            vec!["sshportal-server", "--vpn", "--persist-operator-key"],
+        ] {
+            assert!(ServerCli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
     fn request_join_token_must_match_query_parameter() {
         let request = Request::builder()
             .uri("http://127.0.0.1/connect?token=expected&token=ignored")
@@ -588,6 +763,39 @@ mod tests {
 
         assert!(request_matches_join_token(&request, "expected"));
         assert!(!request_matches_join_token(&request, "missing"));
+    }
+
+    #[test]
+    fn loopback_reverse_proxy_contributes_its_forwarded_client_to_route_bypasses() {
+        let request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.4, 203.0.113.9")
+            .body(())
+            .unwrap();
+
+        let peers = transport_peers(&request, "127.0.0.1:45000".parse().unwrap());
+
+        assert_eq!(
+            peers,
+            vec![
+                "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+                "203.0.113.9".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_loopback_peer_cannot_inject_a_route_bypass_header() {
+        let request = Request::builder()
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(())
+            .unwrap();
+
+        let peers = transport_peers(&request, "192.0.2.10:45000".parse().unwrap());
+
+        assert_eq!(
+            peers,
+            vec!["192.0.2.10".parse::<std::net::IpAddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -674,7 +882,8 @@ mod tests {
     }
 
     fn test_operator_key_material() -> OperatorKeyMaterial {
-        let private_key = PrivateKey::random(&mut KeyOsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let private_key =
+            PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
         OperatorKeyMaterial::from_private_key(private_key, false).unwrap()
     }
 }

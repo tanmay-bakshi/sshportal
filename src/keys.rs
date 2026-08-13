@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{self, PrivateKey, PublicKey, ssh_key};
 
 #[derive(Clone)]
@@ -52,7 +51,7 @@ pub fn load_operator_key(
         keys::load_secret_key(path, None)
             .with_context(|| format!("failed to load private key from {}", path.display()))?
     } else {
-        PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
+        PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
             .context("failed to generate an ephemeral SSH key")?
     };
     OperatorKeyMaterial::from_private_key(private_key, persistent)
