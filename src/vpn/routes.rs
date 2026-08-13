@@ -677,8 +677,8 @@ mod tests {
         assert_eq!(
             servers,
             vec![
-                "127.0.0.53".parse().unwrap(),
-                "2001:db8::53".parse().unwrap()
+                "127.0.0.53".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8::53".parse::<std::net::IpAddr>().unwrap()
             ]
         );
     }
