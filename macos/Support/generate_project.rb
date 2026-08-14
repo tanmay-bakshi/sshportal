@@ -4,6 +4,20 @@ require 'fileutils'
 require 'xcodeproj'
 
 module SSHPortalMacProject
+  class DeterministicProject < Xcodeproj::Project
+    def initialize(path, skip_initialization = false, object_version = Xcodeproj::Constants::DEFAULT_OBJECT_VERSION)
+      @next_object_identifier = 0
+      super
+    end
+
+    def generate_uuid
+      @next_object_identifier += 1
+      uuid = format('%024X', @next_object_identifier)
+      @generated_uuids << uuid
+      uuid
+    end
+  end
+
   ROOT = File.expand_path('..', __dir__)
   PROJECT_PATH = File.join(ROOT, 'SSHPortal.xcodeproj')
   CARGO_MANIFEST = File.expand_path('../Cargo.toml', ROOT)
@@ -17,7 +31,7 @@ module SSHPortalMacProject
 
   def self.run
     FileUtils.rm_rf(PROJECT_PATH)
-    project = Xcodeproj::Project.new(PROJECT_PATH)
+    project = DeterministicProject.new(PROJECT_PATH)
     project.root_object.attributes['LastUpgradeCheck'] = '2700'
     project.root_object.attributes['ORGANIZATIONNAME'] = 'Tanmay Bakshi'
 
@@ -30,10 +44,11 @@ module SSHPortalMacProject
     configure_tests(targets[:tests])
     add_sources(groups, targets)
     add_dependencies(project, targets)
-    create_scheme(targets)
 
     project.sort
+    project.predictabilize_uuids
     project.save
+    create_scheme(targets)
   end
 
   def self.create_groups(project)
@@ -54,12 +69,12 @@ module SSHPortalMacProject
   end
 
   def self.create_targets(project)
-    app = project.new_target(:application, APP_TARGET_NAME, :osx, '13.0', nil, :swift, 'SSHPortal')
+    app = project.new_target(:application, APP_TARGET_NAME, :osx, '15.0', nil, :swift, 'SSHPortal')
     extension = project.new_target(
       :app_extension,
       EXTENSION_TARGET_NAME,
       :osx,
-      '13.0',
+      '15.0',
       nil,
       :swift,
       'SSHPortalAppProxy'
@@ -71,7 +86,7 @@ module SSHPortalMacProject
       :unit_test_bundle,
       TEST_TARGET_NAME,
       :osx,
-      '13.0',
+      '15.0',
       nil,
       :swift,
       'SSHPortalAppProxyTests'
@@ -93,8 +108,9 @@ module SSHPortalMacProject
   def self.configure_project(project)
     project.build_configurations.each do |configuration|
       settings = configuration.build_settings
-      settings['SWIFT_VERSION'] = '5.0'
-      settings['MACOSX_DEPLOYMENT_TARGET'] = '13.0'
+      settings['SWIFT_VERSION'] = '6.0'
+      settings['SWIFT_STRICT_CONCURRENCY'] = 'complete'
+      settings['MACOSX_DEPLOYMENT_TARGET'] = '15.0'
       next unless configuration.name == 'Release'
 
       settings.delete('SWIFT_COMPILATION_MODE')
@@ -109,7 +125,8 @@ module SSHPortalMacProject
       settings['CODE_SIGN_STYLE'] = 'Automatic'
       settings['MARKETING_VERSION'] = MARKETING_VERSION
       settings['CURRENT_PROJECT_VERSION'] = PROJECT_VERSION
-      settings['SWIFT_VERSION'] = '5.0'
+      settings['SWIFT_VERSION'] = '6.0'
+      settings['SWIFT_STRICT_CONCURRENCY'] = 'complete'
       settings['ENABLE_HARDENED_RUNTIME'] = 'YES'
       settings['CLANG_ENABLE_MODULES'] = 'YES'
       settings['GENERATE_INFOPLIST_FILE'] = info_plist.nil? ? 'YES' : 'NO'
@@ -179,7 +196,15 @@ module SSHPortalMacProject
     shared = %w(SSHPortalConfiguration.swift).map { |name| groups[:shared].new_file(name) }
     app = %w(
       ApplicationCoordinator.swift
+      NetworkExtensionPerAppVPNManager.swift
+      NetworkExtensionPerAppVPNManagerStore.swift
       PerAppVPNController.swift
+      PerAppVPNFileOwnershipProvider.swift
+      PerAppVPNManager.swift
+      PerAppVPNManagerStore.swift
+      PerAppVPNOwnershipError.swift
+      PerAppVPNOwnershipLease.swift
+      PerAppVPNOwnershipProvider.swift
       SystemExtensionInstaller.swift
       main.swift
     ).map { |name| groups[:app].new_file(name) }
@@ -188,25 +213,37 @@ module SSHPortalMacProject
     extension = %w(
       AppProxyProvider.swift
       FlowBridge.swift
+      FlowBridgeRegistry.swift
       FlowIO.swift
       SOCKSConnection.swift
+      SOCKSConnectionTransport.swift
       main.swift
     ).map { |name| groups[:extension].new_file(name) }
     socks_protocol = groups[:extension].new_file('SOCKSProtocol.swift')
     tests = %w(
       ControlProtocolTests.swift
+      FlowBridgeRegistryTests.swift
+      FlowIOTests.swift
+      PerAppVPNControllerTests.swift
+      SOCKSConnectionTests.swift
       SignedApplicationTests.swift
       SOCKSProtocolTests.swift
+      SystemExtensionInstallerTests.swift
     ).map { |name| groups[:tests].new_file(name) }
 
     targets[:app].add_file_references(shared + app + [control_protocol, signed_application])
     targets[:app].add_system_frameworks(%w(AppKit NetworkExtension Security SystemExtensions))
     targets[:extension].add_file_references(shared + extension + [socks_protocol])
     targets[:extension].add_system_frameworks(%w(Network NetworkExtension OSLog))
-    targets[:tests].add_file_references(
-      shared + tests + [control_protocol, signed_application, socks_protocol]
+    test_sources = shared + tests + [control_protocol, signed_application, socks_protocol]
+    test_sources += extension.select { |file| %w(FlowBridgeRegistry.swift FlowIO.swift).include?(file.path) }
+    test_sources += app.select { |file| file.path.match?(/PerAppVPN/) }
+    test_sources << app.find { |file| file.path == 'SystemExtensionInstaller.swift' }
+    test_sources += extension.select { |file| file.path.start_with?('SOCKSConnection') }
+    targets[:tests].add_file_references(test_sources)
+    targets[:tests].add_system_frameworks(
+      %w(Network NetworkExtension Security SystemExtensions XCTest)
     )
-    targets[:tests].add_system_frameworks(%w(Network NetworkExtension Security XCTest))
 
     groups[:app].new_file('Info.plist').last_known_file_type = 'text.plist.xml'
     groups[:extension].new_file('Info.plist').last_known_file_type = 'text.plist.xml'

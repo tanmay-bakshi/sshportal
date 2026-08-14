@@ -1,78 +1,13 @@
 import Foundation
 import NetworkExtension
 
-extension NEAppProxyFlow {
-    func openAsync() async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            open(withLocalEndpoint: nil) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
-        }
-    }
-}
+/// NetworkExtension declares every `NEAppProxyFlow` instance thread-safe, but its Objective-C
+/// interface does not carry that guarantee into Swift's concurrency type system.
+struct ThreadSafeAppProxyFlow<Flow: NEAppProxyFlow>: @unchecked Sendable {
+    let value: Flow
 
-extension NEAppProxyTCPFlow {
-    func readDataAsync() async throws -> Data {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Data, Error>) in
-            readData { data, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: data ?? Data())
-                }
-            }
-        }
-    }
-
-    func writeDataAsync(_ data: Data) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            write(data) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
-        }
-    }
-}
-
-extension NEAppProxyUDPFlow {
-    func readDatagramsAsync() async throws -> ([Data], [NWEndpoint]) {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<([Data], [NWEndpoint]), Error>) in
-            readDatagrams { datagrams, endpoints, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                guard let datagrams, let endpoints, datagrams.count == endpoints.count else {
-                    continuation.resume(throwing: FlowIOError.invalidDatagramBatch)
-                    return
-                }
-                continuation.resume(returning: (datagrams, endpoints))
-            }
-        }
-    }
-
-    func writeDatagramAsync(_ data: Data, from endpoint: NWEndpoint) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            writeDatagrams([data], sentBy: [endpoint]) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
-        }
+    init(_ value: Flow) {
+        self.value = value
     }
 }
 
@@ -121,4 +56,11 @@ func appProxyFlowError(from error: Error?) -> NSError? {
         code: code.rawValue,
         userInfo: [NSLocalizedDescriptionKey: error.localizedDescription]
     )
+}
+
+func validatedDatagramBatch<Element>(_ batch: [Element]?) throws -> [Element] {
+    guard let batch, batch.isEmpty == false else {
+        throw FlowIOError.invalidDatagramBatch
+    }
+    return batch
 }

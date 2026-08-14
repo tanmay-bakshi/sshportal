@@ -1,9 +1,7 @@
 import Foundation
-import struct Network.IPv4Address
-import struct Network.IPv6Address
-import NetworkExtension
+import Network
 
-struct SOCKSEndpoint: Equatable {
+struct SOCKSEndpoint: Equatable, Sendable {
     let host: String
     let port: UInt16
 
@@ -16,7 +14,7 @@ struct SOCKSEndpoint: Equatable {
     }
 
     init(endpoint: NWEndpoint, preferredHostname: String? = nil) throws {
-        guard let hostEndpoint = endpoint as? NWHostEndpoint, let port = UInt16(hostEndpoint.port) else {
+        guard case .hostPort(let endpointHost, let endpointPort) = endpoint else {
             throw SOCKSError.unsupportedEndpoint
         }
         let preferredHostname = preferredHostname?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -24,13 +22,25 @@ struct SOCKSEndpoint: Equatable {
         if let preferredHostname, preferredHostname.isEmpty == false {
             host = preferredHostname
         } else {
-            host = hostEndpoint.hostname
+            switch endpointHost {
+            case .name(let hostname, _):
+                host = hostname
+            case .ipv4(let address):
+                host = address.debugDescription
+            case .ipv6(let address):
+                host = address.debugDescription
+            @unknown default:
+                throw SOCKSError.unsupportedEndpoint
+            }
         }
-        try self.init(host: host, port: port)
+        try self.init(host: host, port: endpointPort.rawValue)
     }
 
-    var networkEndpoint: NWHostEndpoint {
-        NWHostEndpoint(hostname: host, port: String(port))
+    var networkEndpoint: NWEndpoint {
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            preconditionFailure("Every UInt16 is a valid Network framework port.")
+        }
+        return .hostPort(host: NWEndpoint.Host(host), port: endpointPort)
     }
 }
 
@@ -269,6 +279,7 @@ enum SOCKSError: LocalizedError {
     case datagramTooLarge
     case connectionClosed
     case unexpectedControlData
+    case invalidReadBounds
 
     var errorDescription: String? {
         switch self {
@@ -298,6 +309,8 @@ enum SOCKSError: LocalizedError {
             return "The private SOCKS connection closed unexpectedly."
         case .unexpectedControlData:
             return "The private SOCKS UDP control connection returned unexpected data."
+        case .invalidReadBounds:
+            return "The private SOCKS stream received invalid read bounds."
         }
     }
 }

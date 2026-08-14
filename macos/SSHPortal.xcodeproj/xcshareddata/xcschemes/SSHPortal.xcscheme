@@ -14,7 +14,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "BC5B8DE57101619A5270AFD4"
+               BlueprintIdentifier = "931B58820733E7D9B083F23A8AACAD0E"
                BuildableName = "SSHPortal.app"
                BlueprintName = "SSHPortal"
                ReferencedContainer = "container:SSHPortal.xcodeproj">
@@ -28,7 +28,7 @@
             buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "53F1010CBEC0DE856D5F5EBD"
+               BlueprintIdentifier = "BA8986AB920501362BB879EF1D9D73FB"
                BuildableName = "SSHPortal App Proxy Tests.xctest"
                BlueprintName = "SSHPortal App Proxy Tests"
                ReferencedContainer = "container:SSHPortal.xcodeproj">
@@ -44,7 +44,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "BC5B8DE57101619A5270AFD4"
+            BlueprintIdentifier = "931B58820733E7D9B083F23A8AACAD0E"
             BuildableName = "SSHPortal.app"
             BlueprintName = "SSHPortal"
             ReferencedContainer = "container:SSHPortal.xcodeproj">
@@ -55,7 +55,7 @@
             skipped = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "53F1010CBEC0DE856D5F5EBD"
+               BlueprintIdentifier = "BA8986AB920501362BB879EF1D9D73FB"
                BuildableName = "SSHPortal App Proxy Tests.xctest"
                BlueprintName = "SSHPortal App Proxy Tests"
                ReferencedContainer = "container:SSHPortal.xcodeproj">
@@ -77,7 +77,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "BC5B8DE57101619A5270AFD4"
+            BlueprintIdentifier = "931B58820733E7D9B083F23A8AACAD0E"
             BuildableName = "SSHPortal.app"
             BlueprintName = "SSHPortal"
             ReferencedContainer = "container:SSHPortal.xcodeproj">
@@ -94,7 +94,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "BC5B8DE57101619A5270AFD4"
+            BlueprintIdentifier = "931B58820733E7D9B083F23A8AACAD0E"
             BuildableName = "SSHPortal.app"
             BlueprintName = "SSHPortal"
             ReferencedContainer = "container:SSHPortal.xcodeproj">

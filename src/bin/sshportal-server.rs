@@ -1,12 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,11 +14,12 @@ use hyper::header::{CONTENT_TYPE, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_tungstenite::{is_upgrade_request, upgrade};
-use hyper_util::rt::TokioIo;
+use hyper_tungstenite::{HyperWebsocket, is_upgrade_request, upgrade};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use ipnet::IpNet;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, RwLock, oneshot};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio_tungstenite::WebSocketStream;
 use url::form_urlencoded;
 
@@ -30,8 +28,8 @@ use sshportal::MacosPerAppVpn;
 use sshportal::{
     ClientDecision, ClientHello, ControlPacket, DEFAULT_CONNECT_PATH, DEFAULT_HEALTH_PATH,
     OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, SystemVpnPolicy, VpnScope,
-    load_operator_key, recv_packet, run_client_session_proxy, run_operator_socks_proxy,
-    run_operator_vpn, send_packet, validate_protocol_version, websocket_to_io,
+    harden_dynamic_library_search, load_operator_key, recv_packet, run_client_session_proxy,
+    run_operator_socks_proxy, run_operator_vpn, send_packet, websocket_config, websocket_to_io,
 };
 
 #[derive(Parser, Debug)]
@@ -184,14 +182,81 @@ impl SessionSummary {
 }
 
 struct AppState {
-    session_claimed: AtomicBool,
-    shutdown_notify: Notify,
+    rendezvous_state: watch::Sender<RendezvousState>,
     status: RwLock<SessionSummary>,
     session_sender: Mutex<Option<oneshot::Sender<EstablishedSession>>>,
     operator_name: String,
     join_token: String,
     handshake_timeout: Duration,
     session_mode: ServerSessionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RendezvousState {
+    Accepting,
+    Negotiating,
+    Established,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RendezvousLimits {
+    max_connections: usize,
+    header_timeout: Duration,
+}
+
+const MAX_HTTP_HEADERS: usize = 64;
+const MAX_HTTP_HEADER_BUFFER_BYTES: usize = 16 * 1024;
+
+impl Default for RendezvousLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            header_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+struct NegotiationJob {
+    websocket: HyperWebsocket,
+    transport_local: SocketAddr,
+    transport_peer: SocketAddr,
+}
+
+impl AppState {
+    async fn try_begin_negotiation(&self) -> bool {
+        let mut status = self.status.write().await;
+        let claimed = self.rendezvous_state.send_if_modified(|rendezvous_state| {
+            if *rendezvous_state != RendezvousState::Accepting {
+                return false;
+            }
+            *rendezvous_state = RendezvousState::Negotiating;
+            true
+        });
+        if claimed {
+            *status = SessionSummary::negotiating();
+        }
+        claimed
+    }
+
+    async fn release_negotiation(&self) {
+        let mut status = self.status.write().await;
+        let released = self.rendezvous_state.send_if_modified(|rendezvous_state| {
+            if *rendezvous_state != RendezvousState::Negotiating {
+                return false;
+            }
+            *rendezvous_state = RendezvousState::Accepting;
+            true
+        });
+        if released {
+            *status = SessionSummary::waiting();
+        }
+    }
+
+    async fn mark_established(&self) {
+        let _status = self.status.write().await;
+        self.rendezvous_state
+            .send_replace(RendezvousState::Established);
+    }
 }
 
 enum ServerSessionMode {
@@ -219,7 +284,7 @@ impl ServerSessionMode {
                 ssh_public_key: operator_key.public_key_openssh().to_string(),
                 persist_key_requested: operator_key.persistent(),
             },
-            Self::Socks { .. } => OfferedSession::Socks,
+            Self::Socks { .. } => OfferedSession::Socks {},
             Self::VpnSystem { policy } => OfferedSession::Vpn {
                 scope: VpnScope::System {
                     policy: policy.clone(),
@@ -243,11 +308,20 @@ impl ServerSessionMode {
 struct EstablishedSession {
     websocket: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     client_hello: ClientHello,
-    transport_peers: Vec<IpAddr>,
+    transport_local: SocketAddr,
+    transport_peer: SocketAddr,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    harden_dynamic_library_search()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize the asynchronous runtime")?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = ServerCli::parse();
     let session_mode = resolve_session_mode(&cli)?;
     let join_token = resolve_join_token(cli.join_token)?;
@@ -256,9 +330,9 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind HTTP server to {}", cli.listen))?;
     let (session_sender, session_receiver) = oneshot::channel();
+    let (rendezvous_state, _) = watch::channel(RendezvousState::Accepting);
     let state = Arc::new(AppState {
-        session_claimed: AtomicBool::new(false),
-        shutdown_notify: Notify::new(),
+        rendezvous_state,
         status: RwLock::new(SessionSummary::default()),
         session_sender: Mutex::new(Some(session_sender)),
         operator_name: cli.operator_name.clone(),
@@ -332,10 +406,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    let http_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));
-    let established_session = session_receiver
-        .await
-        .context("server shut down before any client session started")?;
+    let mut http_task = tokio::spawn(run_http_server(
+        listener,
+        Arc::clone(&state),
+        RendezvousLimits::default(),
+    ));
+    let established_session =
+        wait_for_established_session(session_receiver, &mut http_task).await?;
     http_task
         .await
         .context("HTTP server task failed to join")??;
@@ -365,7 +442,8 @@ async fn main() -> Result<()> {
         ServerSessionMode::VpnSystem { policy } => {
             run_operator_vpn(
                 established_session.websocket,
-                established_session.transport_peers,
+                established_session.transport_local,
+                established_session.transport_peer,
                 policy.clone(),
             )
             .await
@@ -386,47 +464,199 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_http_server(listener: TcpListener, state: Arc<AppState>) -> Result<()> {
-    let builder = http1::Builder::new();
-    loop {
-        tokio::select! {
-            _ = state.shutdown_notify.notified() => {
-                break;
-            }
-            accept_result = listener.accept() => {
-                let (stream, peer_addr) = accept_result.context("failed to accept HTTP connection")?;
-                stream
-                    .set_nodelay(true)
-                    .context("failed to enable TCP_NODELAY on the accepted HTTP socket")?;
-                let state_for_connection = Arc::clone(&state);
-                let connection_builder = builder.clone();
-                tokio::spawn(async move {
-                    let service = service_fn(move |request| {
-                        handle_request(request, Arc::clone(&state_for_connection), peer_addr)
-                    });
-                    let connection = connection_builder
-                        .serve_connection(TokioIo::new(stream), service)
-                        .with_upgrades();
-                    if let Err(error) = connection.await {
-                        eprintln!("HTTP connection error: {error}");
-                    }
-                });
-            }
+async fn wait_for_established_session(
+    session_receiver: oneshot::Receiver<EstablishedSession>,
+    http_task: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<EstablishedSession> {
+    tokio::select! {
+        biased;
+        result = session_receiver => {
+            result.context("server shut down before any client session started")
+        }
+        result = http_task => {
+            result.context("HTTP server task failed to join")??;
+            bail!("HTTP server stopped before any client session started");
         }
     }
-    Ok(())
+}
+
+async fn run_http_server(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    limits: RendezvousLimits,
+) -> Result<()> {
+    if limits.max_connections == 0 {
+        bail!("HTTP rendezvous connection limit must not be zero");
+    }
+    if limits.header_timeout.is_zero() {
+        bail!("HTTP rendezvous header timeout must not be zero");
+    }
+
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_timeout)
+        .max_headers(MAX_HTTP_HEADERS)
+        .max_buf_size(MAX_HTTP_HEADER_BUFFER_BYTES);
+    let admission = Arc::new(Semaphore::new(limits.max_connections));
+    let (negotiation_sender, mut negotiation_receiver) = mpsc::channel(1);
+    let mut connections = JoinSet::new();
+    let mut negotiations = JoinSet::new();
+    let mut state_updates = state.rendezvous_state.subscribe();
+    let mut rendezvous_state = *state_updates.borrow_and_update();
+
+    let server_result = loop {
+        if rendezvous_state == RendezvousState::Established {
+            break Ok(());
+        }
+        tokio::select! {
+            changed = state_updates.changed() => {
+                if changed.is_err() {
+                    break Err(anyhow!("HTTP rendezvous state channel closed unexpectedly"));
+                }
+                rendezvous_state = *state_updates.borrow_and_update();
+            }
+            accepted = async {
+                let permit = Arc::clone(&admission)
+                    .acquire_owned()
+                    .await
+                    .expect("HTTP admission semaphore remains open");
+                let (stream, peer_addr) = listener.accept().await?;
+                Ok::<_, std::io::Error>((stream, peer_addr, permit))
+            }, if rendezvous_state == RendezvousState::Accepting => {
+                let (stream, peer_addr, permit) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        break Err(error).context("failed to accept HTTP connection");
+                    }
+                };
+                if *state_updates.borrow() != RendezvousState::Accepting {
+                    drop(stream);
+                    continue;
+                }
+                if stream.set_nodelay(true).is_err() {
+                    continue;
+                }
+                let local_addr = match stream.local_addr() {
+                    Ok(local_addr) => local_addr,
+                    Err(error) => {
+                        break Err(error).context(
+                            "failed to read the accepted HTTP socket's local address",
+                        );
+                    }
+                };
+                let state_for_connection = Arc::clone(&state);
+                let negotiation_sender = negotiation_sender.clone();
+                let connection_builder = builder.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let service = service_fn(move |request| {
+                        handle_request(
+                            request,
+                            Arc::clone(&state_for_connection),
+                            local_addr,
+                            peer_addr,
+                            negotiation_sender.clone(),
+                        )
+                    });
+                    connection_builder
+                        .serve_connection(TokioIo::new(stream), service)
+                        .with_upgrades()
+                        .await
+                        .context("HTTP rendezvous connection failed")
+                });
+            }
+            job = negotiation_receiver.recv() => {
+                let Some(job) = job else {
+                    break Err(anyhow!("HTTP rendezvous negotiation queue closed unexpectedly"));
+                };
+                let state_for_negotiation = Arc::clone(&state);
+                negotiations.spawn(async move {
+                    run_negotiation(job, state_for_negotiation).await
+                });
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(error) = observe_rendezvous_task("HTTP connection", result) {
+                    break Err(error);
+                }
+            }
+            result = negotiations.join_next(), if !negotiations.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) => {
+                        state.release_negotiation().await;
+                        eprintln!("WebSocket negotiation failed: {error:#}");
+                    }
+                    Some(Err(error)) if error.is_cancelled() => {}
+                    Some(Err(error)) => {
+                        break Err(anyhow!(error).context("WebSocket negotiation task failed to join"));
+                    }
+                }
+            }
+        }
+    };
+
+    drop(listener);
+    drop(negotiation_sender);
+    let negotiation_shutdown =
+        abort_and_join_tasks(&mut negotiations, "WebSocket negotiation").await;
+    let connection_shutdown = abort_and_join_tasks(&mut connections, "HTTP connection").await;
+    server_result
+        .and(negotiation_shutdown)
+        .and(connection_shutdown)
+}
+
+fn observe_rendezvous_task(
+    label: &str,
+    result: Option<Result<Result<()>, tokio::task::JoinError>>,
+) -> Option<anyhow::Error> {
+    match result {
+        Some(Ok(Ok(()))) | None => None,
+        Some(Ok(Err(_))) => None,
+        Some(Err(error)) if error.is_cancelled() => None,
+        Some(Err(error)) => Some(anyhow!(error).context(format!("{label} task failed to join"))),
+    }
+}
+
+async fn abort_and_join_tasks(tasks: &mut JoinSet<Result<()>>, label: &str) -> Result<()> {
+    tasks.abort_all();
+    let mut join_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) if join_error.is_none() => {
+                join_error = Some(anyhow!(error).context(format!("{label} task failed to join")));
+            }
+            Err(_) => {}
+        }
+    }
+    match join_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn handle_request(
     mut request: Request<Incoming>,
     state: Arc<AppState>,
+    local_addr: SocketAddr,
     peer_addr: SocketAddr,
+    negotiation_sender: mpsc::Sender<NegotiationJob>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/") => status_response(&state).await,
         (&Method::GET, DEFAULT_HEALTH_PATH) => health_response(&state).await,
         (&Method::GET, DEFAULT_CONNECT_PATH) => {
-            websocket_response(&mut request, state, peer_addr).await
+            websocket_response(
+                &mut request,
+                state,
+                local_addr,
+                peer_addr,
+                negotiation_sender,
+            )
+            .await
         }
         _ => plain_response(StatusCode::NOT_FOUND, "not found"),
     };
@@ -457,7 +687,9 @@ async fn health_response(state: &Arc<AppState>) -> Response<Full<Bytes>> {
 async fn websocket_response(
     request: &mut Request<Incoming>,
     state: Arc<AppState>,
+    local_addr: SocketAddr,
     peer_addr: SocketAddr,
+    negotiation_sender: mpsc::Sender<NegotiationJob>,
 ) -> Response<Full<Bytes>> {
     if !is_upgrade_request(request) {
         return plain_response(StatusCode::BAD_REQUEST, "websocket upgrade required");
@@ -465,18 +697,16 @@ async fn websocket_response(
     if !request_matches_join_token(request, &state.join_token) {
         return plain_response(StatusCode::NOT_FOUND, "not found");
     }
-    if state.session_claimed.swap(true, Ordering::SeqCst) {
+    if !state.try_begin_negotiation().await {
         return plain_response(
             StatusCode::CONFLICT,
             "server is already negotiating another client",
         );
     }
-    let transport_peers = transport_peers(request, peer_addr);
-
-    let (response, websocket) = match upgrade(request, None) {
+    let (response, websocket) = match upgrade(request, Some(websocket_config())) {
         Ok(parts) => parts,
         Err(error) => {
-            state.session_claimed.store(false, Ordering::SeqCst);
+            state.release_negotiation().await;
             return plain_response(
                 StatusCode::BAD_REQUEST,
                 format!("failed to upgrade websocket: {error}"),
@@ -484,62 +714,68 @@ async fn websocket_response(
         }
     };
 
+    if negotiation_sender
+        .try_send(NegotiationJob {
+            websocket,
+            transport_local: local_addr,
+            transport_peer: peer_addr,
+        })
+        .is_err()
     {
-        let mut status = state.status.write().await;
-        *status = SessionSummary::negotiating();
+        state.release_negotiation().await;
+        return plain_response(StatusCode::SERVICE_UNAVAILABLE, "server is shutting down");
     }
-
-    let state_for_task = Arc::clone(&state);
-    tokio::spawn(async move {
-        let negotiation_result = match websocket.await {
-            Ok(websocket_stream) => {
-                let timeout_result = tokio::time::timeout(
-                    state_for_task.handshake_timeout,
-                    handle_support_session(
-                        websocket_stream,
-                        Arc::clone(&state_for_task),
-                        transport_peers,
-                    ),
-                )
-                .await;
-                match timeout_result {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow!(
-                        "support client did not finish the handshake within {}",
-                        format_duration(state_for_task.handshake_timeout)
-                    )),
-                }
-            }
-            Err(error) => Err(anyhow!("failed to finalize websocket upgrade: {error}")),
-        };
-        match negotiation_result {
-            Ok(established_session) => {
-                let mut sender_guard = state_for_task.session_sender.lock().await;
-                if let Some(sender) = sender_guard.take() {
-                    let _ = sender.send(established_session);
-                    state_for_task.shutdown_notify.notify_waiters();
-                }
-            }
-            Err(error) => {
-                eprintln!("support negotiation failed: {error:#}");
-                release_negotiation_claim(&state_for_task).await;
-            }
-        }
-    });
     response
+}
+
+async fn run_negotiation(job: NegotiationJob, state: Arc<AppState>) -> Result<()> {
+    let handshake = async {
+        let websocket = job
+            .websocket
+            .await
+            .context("failed to finalize websocket upgrade")?;
+        handle_support_session(
+            websocket,
+            Arc::clone(&state),
+            job.transport_local,
+            job.transport_peer,
+        )
+        .await
+    };
+    let established_session = match tokio::time::timeout(state.handshake_timeout, handshake).await {
+        Ok(Ok(established_session)) => established_session,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => bail!(
+            "support client did not finish the handshake within {}",
+            format_duration(state.handshake_timeout)
+        ),
+    };
+
+    let sender = match state.session_sender.lock().await.take() {
+        Some(sender) => sender,
+        None => {
+            state.mark_established().await;
+            bail!("support session receiver is unavailable");
+        }
+    };
+    if sender.send(established_session).is_err() {
+        state.mark_established().await;
+        bail!("support session receiver closed before accepting the established session");
+    }
+    state.mark_established().await;
+    Ok(())
 }
 
 async fn handle_support_session(
     mut websocket: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     state: Arc<AppState>,
-    transport_peers: Vec<IpAddr>,
+    transport_local: SocketAddr,
+    transport_peer: SocketAddr,
 ) -> Result<EstablishedSession> {
     let client_hello = match recv_packet(&mut websocket).await? {
         ControlPacket::ClientHello(hello) => hello,
         unexpected => bail!("expected client_hello packet, received {unexpected:?}"),
     };
-    validate_protocol_version(client_hello.protocol_version)?;
-
     let offer = state.session_mode.offer(state.operator_name.clone());
     send_packet(&mut websocket, &ControlPacket::ServerOffer(offer)).await?;
 
@@ -555,30 +791,9 @@ async fn handle_support_session(
     Ok(EstablishedSession {
         websocket,
         client_hello,
-        transport_peers,
+        transport_local,
+        transport_peer,
     })
-}
-
-fn transport_peers<B>(request: &Request<B>, peer_addr: SocketAddr) -> Vec<IpAddr> {
-    let mut peers = vec![peer_addr.ip()];
-    if !peer_addr.ip().is_loopback() {
-        return peers;
-    }
-
-    let forwarded_peer = request
-        .headers()
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .last()
-        .and_then(|value| value.trim().parse::<IpAddr>().ok());
-    if let Some(forwarded_peer) = forwarded_peer
-        && !peers.contains(&forwarded_peer)
-    {
-        peers.push(forwarded_peer);
-    }
-    peers
 }
 
 fn handle_client_decision(decision: &ClientDecision) -> Result<()> {
@@ -680,12 +895,6 @@ fn format_duration(duration: Duration) -> String {
     format!("{} ms", duration.as_millis())
 }
 
-async fn release_negotiation_claim(state: &Arc<AppState>) {
-    state.session_claimed.store(false, Ordering::SeqCst);
-    let mut status = state.status.write().await;
-    *status = SessionSummary::waiting();
-}
-
 fn render_status_body(summary: &SessionSummary) -> String {
     format!(
         "sshportal server\nphase: {}\ndetail: {}\n",
@@ -696,22 +905,29 @@ fn render_status_body(summary: &SessionSummary) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use clap::Parser;
+    use futures_util::{SinkExt, StreamExt};
     use hyper::{Request, StatusCode};
     use russh::keys::{PrivateKey, ssh_key};
-    use tokio::net::TcpListener;
-    use tokio::sync::{Mutex, Notify, RwLock, oneshot};
-    use tokio_tungstenite::{connect_async, tungstenite::Error as WebSocketError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{Mutex, RwLock, oneshot, watch};
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Error as WebSocketError, Message},
+    };
 
     use super::{
-        AppState, ServerCli, ServerSessionMode, SessionSummary, render_status_body,
-        request_matches_join_token, resolve_join_token, resolve_session_mode, run_http_server,
-        transport_peers,
+        AppState, EstablishedSession, RendezvousLimits, RendezvousState, ServerCli,
+        ServerSessionMode, SessionSummary, render_status_body, request_matches_join_token,
+        resolve_join_token, resolve_session_mode, run_http_server, wait_for_established_session,
     };
-    use sshportal::{DEFAULT_CONNECT_PATH, OperatorKeyMaterial};
+    use sshportal::{
+        ClientDecision, ClientHello, ClientMetadata, ControlPacket, DEFAULT_CONNECT_PATH,
+        OperatorKeyMaterial, PROTOCOL_VERSION, Platform, recv_packet, send_packet,
+    };
 
     #[test]
     fn explicit_join_token_is_preserved() {
@@ -866,39 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn loopback_reverse_proxy_contributes_its_forwarded_client_to_route_bypasses() {
-        let request = Request::builder()
-            .header("x-forwarded-for", "198.51.100.4, 203.0.113.9")
-            .body(())
-            .unwrap();
-
-        let peers = transport_peers(&request, "127.0.0.1:45000".parse().unwrap());
-
-        assert_eq!(
-            peers,
-            vec![
-                "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
-                "203.0.113.9".parse().unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn non_loopback_peer_cannot_inject_a_route_bypass_header() {
-        let request = Request::builder()
-            .header("x-forwarded-for", "203.0.113.9")
-            .body(())
-            .unwrap();
-
-        let peers = transport_peers(&request, "192.0.2.10:45000".parse().unwrap());
-
-        assert_eq!(
-            peers,
-            vec!["192.0.2.10".parse::<std::net::IpAddr>().unwrap()]
-        );
-    }
-
-    #[test]
     fn rendered_status_body_is_generic_plain_text() {
         let body = render_status_body(&SessionSummary::connected());
 
@@ -914,59 +1097,53 @@ mod tests {
     async fn provisional_claim_is_released_after_handshake_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        let (session_sender, _session_receiver) = oneshot::channel();
-        let state = Arc::new(AppState {
-            session_claimed: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
-            status: RwLock::new(SessionSummary::default()),
-            session_sender: Mutex::new(Some(session_sender)),
-            operator_name: "support".to_string(),
-            join_token: "join-token".to_string(),
-            handshake_timeout: Duration::from_millis(150),
-            session_mode: ServerSessionMode::Ssh {
-                operator_key: test_operator_key_material(),
-                ssh_listen: "127.0.0.1:0".parse().unwrap(),
-                dynamic_forward: None,
-            },
-        });
+        let (state, _session_receiver) = test_state(Duration::from_millis(150));
 
-        let server_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(8, Duration::from_secs(2)),
+        ));
         let first_url = format!("ws://{listen_addr}{DEFAULT_CONNECT_PATH}?token=join-token");
         let second_url = first_url.clone();
 
         let first_socket = connect_async(first_url).await.unwrap().0;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut queued_http = TcpStream::connect(listen_addr).await.unwrap();
+        queued_http
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = [0_u8; 1024];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), queued_http.read(&mut response))
+                .await
+                .is_err()
+        );
+        let response_bytes =
+            tokio::time::timeout(Duration::from_secs(1), queued_http.read(&mut response))
+                .await
+                .expect("HTTP listener did not resume after the provisional claim expired")
+                .unwrap();
+        assert!(response_bytes > 0);
         let second_socket = connect_async(second_url).await.unwrap().0;
 
         drop(first_socket);
+        drop(queued_http);
         drop(second_socket);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        state.shutdown_notify.notify_waiters();
-        server_task.await.unwrap().unwrap();
+        stop_server(&state, server_task).await;
     }
 
     #[tokio::test]
     async fn websocket_upgrade_requires_join_token() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        let (session_sender, _session_receiver) = oneshot::channel();
-        let state = Arc::new(AppState {
-            session_claimed: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
-            status: RwLock::new(SessionSummary::default()),
-            session_sender: Mutex::new(Some(session_sender)),
-            operator_name: "support".to_string(),
-            join_token: "join-token".to_string(),
-            handshake_timeout: Duration::from_secs(1),
-            session_mode: ServerSessionMode::Ssh {
-                operator_key: test_operator_key_material(),
-                ssh_listen: "127.0.0.1:0".parse().unwrap(),
-                dynamic_forward: None,
-            },
-        });
+        let (state, _session_receiver) = test_state(Duration::from_secs(1));
 
-        let server_task = tokio::spawn(run_http_server(listener, Arc::clone(&state)));
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(8, Duration::from_secs(2)),
+        ));
         let missing_token_url = format!("ws://{listen_addr}{DEFAULT_CONNECT_PATH}");
         let error = connect_async(missing_token_url).await.unwrap_err();
 
@@ -977,8 +1154,229 @@ mod tests {
             unexpected => panic!("expected HTTP websocket rejection, received {unexpected:?}"),
         }
 
-        state.shutdown_notify.notify_waiters();
-        server_task.await.unwrap().unwrap();
+        stop_server(&state, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn partial_http_headers_are_closed_at_the_read_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let (state, _session_receiver) = test_state(Duration::from_secs(1));
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(8, Duration::from_millis(100)),
+        ));
+        let mut stream = TcpStream::connect(listen_addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Incomplete:")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut Vec::new()))
+            .await
+            .expect("partial HTTP headers remained open after their deadline")
+            .unwrap();
+
+        stop_server(&state, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn connection_admission_waits_for_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let (state, _session_receiver) = test_state(Duration::from_secs(1));
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(1, Duration::from_secs(5)),
+        ));
+
+        let mut first = TcpStream::connect(listen_addr).await.unwrap();
+        first
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = [0_u8; 1024];
+        let first_bytes = tokio::time::timeout(Duration::from_secs(1), first.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first_bytes > 0);
+
+        let mut second = TcpStream::connect(listen_addr).await.unwrap();
+        second
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second.read(&mut response))
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        let second_bytes = tokio::time::timeout(Duration::from_secs(1), second.read(&mut response))
+            .await
+            .expect("queued HTTP connection was not admitted after capacity returned")
+            .unwrap();
+        assert!(second_bytes > 0);
+
+        stop_server(&state, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_idle_http_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let (state, _session_receiver) = test_state(Duration::from_secs(1));
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(4, Duration::from_secs(5)),
+        ));
+        let mut stream = TcpStream::connect(listen_addr).await.unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost:").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        stop_server(&state, server_task).await;
+
+        let mut byte = [0_u8; 1];
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("idle HTTP connection survived rendezvous shutdown");
+    }
+
+    #[tokio::test]
+    async fn upgraded_websocket_survives_http_task_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let (state, session_receiver) = test_state(Duration::from_secs(1));
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(8, Duration::from_secs(2)),
+        ));
+        let url = format!("ws://{listen_addr}{DEFAULT_CONNECT_PATH}?token=join-token");
+        let mut client = connect_async(url).await.unwrap().0;
+
+        send_packet(
+            &mut client,
+            &ControlPacket::ClientHello(ClientHello {
+                protocol_version: PROTOCOL_VERSION,
+                metadata: ClientMetadata {
+                    hostname: "test-client".to_string(),
+                    username: "test-user".to_string(),
+                    working_directory: "/test".to_string(),
+                    platform: Platform::current().unwrap(),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_packet(&mut client).await.unwrap(),
+            ControlPacket::ServerOffer(_)
+        ));
+        send_packet(
+            &mut client,
+            &ControlPacket::ClientDecision(ClientDecision {
+                session_allowed: true,
+                key_installed: false,
+                note: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut established = tokio::time::timeout(Duration::from_secs(1), session_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("HTTP task did not stop after the session was established")
+            .unwrap()
+            .unwrap();
+
+        client
+            .send(Message::Binary(b"still-open".to_vec().into()))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(1), established.websocket.next())
+            .await
+            .expect("upgraded WebSocket stopped with the HTTP rendezvous")
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_data(), b"still-open".as_slice());
+    }
+
+    #[tokio::test]
+    async fn established_session_wait_fails_when_the_http_task_stops_first() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (state, session_receiver) = test_state(Duration::from_secs(1));
+        let mut server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(0, Duration::from_secs(1)),
+        ));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_established_session(session_receiver, &mut server_task),
+        )
+        .await
+        .expect("session wait ignored the failed HTTP task");
+        let Err(error) = result else {
+            panic!("HTTP task failure unexpectedly produced a session");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("connection limit must not be zero")
+        );
+    }
+
+    fn test_state(
+        handshake_timeout: Duration,
+    ) -> (Arc<AppState>, oneshot::Receiver<EstablishedSession>) {
+        let (session_sender, session_receiver) = oneshot::channel();
+        let (rendezvous_state, _) = watch::channel(RendezvousState::Accepting);
+        let state = Arc::new(AppState {
+            rendezvous_state,
+            status: RwLock::new(SessionSummary::default()),
+            session_sender: Mutex::new(Some(session_sender)),
+            operator_name: "support".to_string(),
+            join_token: "join-token".to_string(),
+            handshake_timeout,
+            session_mode: ServerSessionMode::Ssh {
+                operator_key: test_operator_key_material(),
+                ssh_listen: "127.0.0.1:0".parse().unwrap(),
+                dynamic_forward: None,
+            },
+        });
+        (state, session_receiver)
+    }
+
+    fn test_limits(max_connections: usize, header_timeout: Duration) -> RendezvousLimits {
+        RendezvousLimits {
+            max_connections,
+            header_timeout,
+        }
+    }
+
+    async fn stop_server(
+        state: &AppState,
+        server_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        state
+            .rendezvous_state
+            .send_replace(RendezvousState::Established);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("HTTP rendezvous did not stop")
+            .unwrap()
+            .unwrap();
     }
 
     fn test_operator_key_material() -> OperatorKeyMaterial {

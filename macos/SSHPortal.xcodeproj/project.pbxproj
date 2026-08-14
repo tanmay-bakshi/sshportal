@@ -7,62 +7,92 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		030EAC4BF02946C4AB67E550 /* SOCKSProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EC8213AED881B1AC542BDFD /* SOCKSProtocol.swift */; };
-		0BDC6093263B658DE442B54D /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9D6F096AC53469674F4DE71F /* SystemExtensions.framework */; };
-		22375D43DF222AC806461235 /* SSHPortalConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9896ABBCAFAAB4FF1490905E /* SSHPortalConfiguration.swift */; };
-		24191A91D567092132F96AC5 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F09E2B5D892AC6CE2C817BC9 /* Security.framework */; };
-		2D6DD8790EB1215DB7037B23 /* ControlProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 208E9716C089ECF6E161932D /* ControlProtocol.swift */; };
-		2DD9F3D51FC0A2DE2D41984B /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89AEDCA07F8F5F7CF6E2D737 /* main.swift */; };
-		38E4C7655F35AA08008D5817 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6E77E4E7F6466A498263347E /* AppKit.framework */; };
-		4C29AF1FAB662E5F6A50F1E0 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 287631FF839C0D6E816C8E2C /* XCTest.framework */; };
-		599FD9DF66ABE2F59C103A47 /* SOCKSProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC8FB660ED26DFB05D0E024E /* SOCKSProtocolTests.swift */; };
-		5FFBC45F13FB618E46940DAE /* FlowIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266245A11D00F3BE54DDAA11 /* FlowIO.swift */; };
-		645F82491D5E5836FD183568 /* SystemExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86F8883BEF20380E2B3AEB1A /* SystemExtensionInstaller.swift */; };
-		683EF069C6EFD9FDC7B9CB93 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 37B1AF8224BFB0E60E0CAC1B /* Network.framework */; };
-		685696C0E35C03ADE7D23A87 /* SSHPortalConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9896ABBCAFAAB4FF1490905E /* SSHPortalConfiguration.swift */; };
-		6C34F2FD717BB81D9B3DC7B4 /* PerAppVPNController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6B810E02E03936505153D23 /* PerAppVPNController.swift */; };
-		6F0F0A28C975EAFF919DFDB8 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F09E2B5D892AC6CE2C817BC9 /* Security.framework */; };
-		711479036F6E958A6E4A3D42 /* ControlProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB067928DAC16702BFDAC82A /* ControlProtocolTests.swift */; };
-		84968DFE52E955335E20EF89 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BE1459BD0C540A31615DE856 /* Cocoa.framework */; };
-		8C12324358E6FCE3C1008E05 /* SignedApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0904CADC2CCCE46671AFCCF8 /* SignedApplication.swift */; };
-		8F332A7BD57647C10847F791 /* ApplicationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC887C5CD04DA6F89FF20D0A /* ApplicationCoordinator.swift */; };
-		92B3291668F8A5AA05C209FA /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E0CD6AA3047A80E1C3E87F8B /* NetworkExtension.framework */; };
-		9FD7F23758027B6CBD1DF84E /* SignedApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0904CADC2CCCE46671AFCCF8 /* SignedApplication.swift */; };
-		9FF381D6783939C7CC234B7A /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E0CD6AA3047A80E1C3E87F8B /* NetworkExtension.framework */; };
-		A34BA229D18020A183443D19 /* SOCKSProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EC8213AED881B1AC542BDFD /* SOCKSProtocol.swift */; };
-		A880C754458D339BB3737FB8 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BE1459BD0C540A31615DE856 /* Cocoa.framework */; };
-		AC4A52DC1E638EB7440B7DAB /* AppProxyProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6621A87FF59B14290B14A3C5 /* AppProxyProvider.swift */; };
-		AEB6F903C4D6E1204C085106 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BE1459BD0C540A31615DE856 /* Cocoa.framework */; };
-		B22B89EEA1D7BBAA390D113D /* FlowBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B54E4B1FA970B2FA12B2997 /* FlowBridge.swift */; };
-		B5E1727DE184B1B38ADD820C /* OSLog.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A3DB33E7BB28D5218AD2061D /* OSLog.framework */; };
-		C0E3041EEDEFF840DCB3E083 /* SSHPortalConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9896ABBCAFAAB4FF1490905E /* SSHPortalConfiguration.swift */; };
-		C676F35D1BD9C3F2F65CE78A /* ControlProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 208E9716C089ECF6E161932D /* ControlProtocol.swift */; };
-		C75C418D72078E8D126F5CCB /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 37B1AF8224BFB0E60E0CAC1B /* Network.framework */; };
-		CE9C7E6567942F668C870C7C /* SignedApplicationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E69786820EBFA1E6766D9DAF /* SignedApplicationTests.swift */; };
-		D240D3C002FA7FD6F629B430 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40B4275F9E7D3969C9C8E2E /* main.swift */; };
-		D6C3B37C21D5AEDEEA4E7916 /* SSHPortalAppProxy.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = B7891E34ACA1A7CE027BBA63 /* SSHPortalAppProxy.systemextension */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		DCE1E05065F620E6FFC9D64E /* SOCKSConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = F22D3B36BFAB7C78243DFB7B /* SOCKSConnection.swift */; };
-		F2A4424EFA081BDFCB8653CA /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E0CD6AA3047A80E1C3E87F8B /* NetworkExtension.framework */; };
+		05BCC08EEE0C075D548CD34FEF180EF0 /* PerAppVPNOwnershipLease.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6128BF9730ED4D8C8BE4360174D38ED1 /* PerAppVPNOwnershipLease.swift */; };
+		0E72A4361BFC602C5E8FDB8071F07B1C /* ControlProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B63B77FBAC526BCE77FBE233EA1803E3 /* ControlProtocolTests.swift */; };
+		0E8C3654AD9AA05B814A8047540C5BA0 /* PerAppVPNOwnershipProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A61550F5DC5E328405977FF5035CF048 /* PerAppVPNOwnershipProvider.swift */; };
+		0F283A245CA0668D6987253A3F1302FA /* PerAppVPNController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16D2453A74D50C5D64F706BB19F99F06 /* PerAppVPNController.swift */; };
+		127C0B348EB225CC7C81FC5F6F05D378 /* NetworkExtensionPerAppVPNManagerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1D48463CFF71FEFFA27D92DDAEE99BE /* NetworkExtensionPerAppVPNManagerStore.swift */; };
+		17CBF516980C6B82DE64D3098B3118E8 /* SOCKSConnectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCDE7A76CED82D5E98265F4251494CD /* SOCKSConnectionTests.swift */; };
+		19094BC86EC287EFCAB020A8FEB0FD22 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C88437266D086D078A536A0DB5E8E06 /* Cocoa.framework */; };
+		1C6CEB23E7762AC5A230C85EB8545AB7 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 694EE049A068501E97F33333E7B8EB90 /* NetworkExtension.framework */; };
+		2A000EDC04405E3191DA648ED3AC70C5 /* SystemExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C71D13E07E798192E8985B9CDE2ADF8 /* SystemExtensionInstaller.swift */; };
+		2D4112E5147ACBBE981AC8432A95CFFC /* SignedApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92EAB33551D9FEDF3CE587CB90CC5948 /* SignedApplication.swift */; };
+		2F90B0322BBDAC50F862A2365047B8EF /* SSHPortalConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBD9CE20C41C9A7768E4D61EE9B04FCA /* SSHPortalConfiguration.swift */; };
+		301906B154F6325E77F74A749E5C44F0 /* PerAppVPNOwnershipError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 387546B8846F311817AAE2F0F533D551 /* PerAppVPNOwnershipError.swift */; };
+		31D842F00C3FC616C83F93C1FF05AFAC /* SSHPortalAppProxy.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = DE4CD439CC04D025842661101BD9C22A /* SSHPortalAppProxy.systemextension */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		35D81DA385F6C15304E022CC412ACF3E /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 22BD1881D1E075EACF3929E4E6D68448 /* SystemExtensions.framework */; };
+		37D2678B3A8ECCC350E01BF40374B590 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1C095E6A33DA616F4AE5436229ABB9B7 /* Security.framework */; };
+		395A7DCDA22317943F5CC2B1A8C82C90 /* FlowIOTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7578A0B89D5010FA4D57E4B22E291F0B /* FlowIOTests.swift */; };
+		39E490FC5EADEE2000D01975682B015F /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59FCA948FA8A5105424B558AA04572AC /* main.swift */; };
+		44BC77DBD1F9F58A2FD0B617B4290A39 /* SystemExtensionInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D98F53D2EA08C5DE1F2040FBC541B822 /* SystemExtensionInstallerTests.swift */; };
+		49A2F00A78E1E3977373BFD81C9F6169 /* ApplicationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 131186CB60CD1E4EE72CFD26CEFB4F6F /* ApplicationCoordinator.swift */; };
+		4C6A7A23827AE541CDFDFFF39C442323 /* FlowBridgeRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD180BBFD418943D8CCB6BD73A906A30 /* FlowBridgeRegistry.swift */; };
+		58C90FCEC8595E8A9375A4A83B73607C /* SOCKSConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 842B84AFF8E3A218416B677B34979E19 /* SOCKSConnection.swift */; };
+		59E30CDC2AEFD3D687A6B632228CF623 /* FlowIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FBE1D6FA0CFC0D510982926E3D7D9EE /* FlowIO.swift */; };
+		69934326B87A43B7A1848B669D781BB1 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 694EE049A068501E97F33333E7B8EB90 /* NetworkExtension.framework */; };
+		6C3E4A61F6C170D219F6E6D58A47ECE0 /* PerAppVPNFileOwnershipProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E7E5349A1F026177D0F4F644688F4F /* PerAppVPNFileOwnershipProvider.swift */; };
+		6C999B1133CE6F4EF5988EC13534B3D9 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DBA808AA357A56891D14950E20C8D51A /* XCTest.framework */; };
+		713E88FDC416C4FD378E347EFCA708FD /* PerAppVPNFileOwnershipProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E7E5349A1F026177D0F4F644688F4F /* PerAppVPNFileOwnershipProvider.swift */; };
+		76492BC0730856E3CD62FB62F164135B /* SignedApplicationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E70B2DA58DF2D8A76C582894255A948 /* SignedApplicationTests.swift */; };
+		7E63391EFA89C276C95B4E2C375A43C8 /* ControlProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0306C7048524A1DCF1529180D211F9D /* ControlProtocol.swift */; };
+		7E96608F582E747176B7052817EA8A1C /* SOCKSProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30C6431BA7AD029AA613CBC7896278EE /* SOCKSProtocol.swift */; };
+		89DD6386FACE2D043379B1C27608183C /* FlowBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAFE2C45E067406D2BDCBFB530268321 /* FlowBridge.swift */; };
+		8E097500BDDCF111D8266E08FE582A4D /* PerAppVPNOwnershipProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A61550F5DC5E328405977FF5035CF048 /* PerAppVPNOwnershipProvider.swift */; };
+		9174A0A0A82BDA68694265E6E75FE673 /* SSHPortalConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBD9CE20C41C9A7768E4D61EE9B04FCA /* SSHPortalConfiguration.swift */; };
+		94E44927B71B5C280115C478266B7E93 /* AppProxyProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A3D67DE2A0372690FE487CC7DBB3177 /* AppProxyProvider.swift */; };
+		97D1F58291BECC01CBD34BA508533B54 /* PerAppVPNManagerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F19D6C1D247CCA6EED005C4C64EAA618 /* PerAppVPNManagerStore.swift */; };
+		9804D6C693C4F6CB0C0121386C09555D /* NetworkExtensionPerAppVPNManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504D0A43E642A806880AF033DA83C8E8 /* NetworkExtensionPerAppVPNManager.swift */; };
+		9D2B5BAFF61F8E9D2FD154CA138A63E9 /* SystemExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C71D13E07E798192E8985B9CDE2ADF8 /* SystemExtensionInstaller.swift */; };
+		9E0FF7A291A10776DBA08B2F6BA821E3 /* SOCKSConnectionTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEE852FC78F38680A7A9D78BA339C2CE /* SOCKSConnectionTransport.swift */; };
+		A1B03F08BF823DB44D5A59DE1574564B /* FlowBridgeRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD180BBFD418943D8CCB6BD73A906A30 /* FlowBridgeRegistry.swift */; };
+		A31C9B7302F9114917C10A741CEE0ECF /* PerAppVPNManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 924AD06836B463EB26FD04E370E984DD /* PerAppVPNManager.swift */; };
+		A8404121DE22A6BC3BA388CBC3B40D56 /* PerAppVPNOwnershipError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 387546B8846F311817AAE2F0F533D551 /* PerAppVPNOwnershipError.swift */; };
+		A9A00D10B1B225B95176AB548582759E /* FlowIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FBE1D6FA0CFC0D510982926E3D7D9EE /* FlowIO.swift */; };
+		AAD242119D631D8CB90F3D2BCF38E33B /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1C095E6A33DA616F4AE5436229ABB9B7 /* Security.framework */; };
+		AD8E1372E005C87B51C7306B8F39CF67 /* PerAppVPNOwnershipLease.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6128BF9730ED4D8C8BE4360174D38ED1 /* PerAppVPNOwnershipLease.swift */; };
+		AEBECCF0B4082E660C9A3C59D5A51B31 /* PerAppVPNController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16D2453A74D50C5D64F706BB19F99F06 /* PerAppVPNController.swift */; };
+		B015BA22787D17F57B5A4514A89DB4E0 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DC967354DC08990A483D4DF0B42905E /* main.swift */; };
+		B65DF25584B5E53D296105456D118232 /* PerAppVPNManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 924AD06836B463EB26FD04E370E984DD /* PerAppVPNManager.swift */; };
+		C0235F315464B43E2F9F7BD6168A52B7 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 694EE049A068501E97F33333E7B8EB90 /* NetworkExtension.framework */; };
+		C50617216C45DC35BB0C75309375E307 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78276CDFE18C539815F51D1EFA6028F7 /* AppKit.framework */; };
+		C62DA306F5CD28BC8F6F63E0891123C4 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C88437266D086D078A536A0DB5E8E06 /* Cocoa.framework */; };
+		C87501DEEC3C0EEF584AD18E6BC0D267 /* ControlProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0306C7048524A1DCF1529180D211F9D /* ControlProtocol.swift */; };
+		CDAD2874ACE4D6B3E6E69730E21F2FB6 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BEF868B15B3D8556B8E9F9A5BEE41803 /* Network.framework */; };
+		CF0744095480C6069CD21CDC59E63F59 /* PerAppVPNControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0BC88E8BA68179F9B5A945E06BA749A /* PerAppVPNControllerTests.swift */; };
+		D06F4EA07EFA06691A837DE08F1D0695 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C88437266D086D078A536A0DB5E8E06 /* Cocoa.framework */; };
+		D1353080EADB06C49EF0D149D22619F4 /* SOCKSProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30C6431BA7AD029AA613CBC7896278EE /* SOCKSProtocol.swift */; };
+		D6EA79E185EEBB52350D6DA8B24B2429 /* NetworkExtensionPerAppVPNManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504D0A43E642A806880AF033DA83C8E8 /* NetworkExtensionPerAppVPNManager.swift */; };
+		E2FBF6BA2D51A8CB94AAA11BF023A92C /* SOCKSConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 842B84AFF8E3A218416B677B34979E19 /* SOCKSConnection.swift */; };
+		E52474D9F46B4E558199593DF82A9FB3 /* NetworkExtensionPerAppVPNManagerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1D48463CFF71FEFFA27D92DDAEE99BE /* NetworkExtensionPerAppVPNManagerStore.swift */; };
+		E577BB27288DEB9CF54D3EAF4B15EFCE /* SSHPortalConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBD9CE20C41C9A7768E4D61EE9B04FCA /* SSHPortalConfiguration.swift */; };
+		E79B16CFD2C2A9E7FE458CDEC41F3E40 /* FlowBridgeRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1CF9116E397DE66365AEBCBFA108AA7 /* FlowBridgeRegistryTests.swift */; };
+		E8058BFBEC9CCD19F29D184D34E93196 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BEF868B15B3D8556B8E9F9A5BEE41803 /* Network.framework */; };
+		ED603BD1DC6CD7FDF3A63E62CC7143EE /* PerAppVPNManagerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F19D6C1D247CCA6EED005C4C64EAA618 /* PerAppVPNManagerStore.swift */; };
+		ED97DFB6AB2F3735ACC4012F2D516C70 /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 22BD1881D1E075EACF3929E4E6D68448 /* SystemExtensions.framework */; };
+		F702B42E87827A45CAA71FC5F290089E /* OSLog.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F8FF7F192D70BCCF3FB1BAD8251EE800 /* OSLog.framework */; };
+		F95F501D54877A074FCA39FDFC431505 /* SOCKSProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17C74C6FBAA2394B582B2029CFC08C05 /* SOCKSProtocolTests.swift */; };
+		FB21753E6EC89C15ABB09A92ABD84B21 /* SOCKSConnectionTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEE852FC78F38680A7A9D78BA339C2CE /* SOCKSConnectionTransport.swift */; };
+		FD556206306C40DF30824D40A33C5931 /* SignedApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92EAB33551D9FEDF3CE587CB90CC5948 /* SignedApplication.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		7B5468BE49B3F4B8D80153E2 /* PBXContainerItemProxy */ = {
+		8D658394D11FD55352C492F8BCB5D4CA /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = C48C37F6FF62B6A14FFEF2A5 /* Project object */;
+			containerPortal = B0E5F3FF5D8E21E989054D54B1CD2984 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 9036BB44520513A797A94B0C;
+			remoteGlobalIDString = 9FA8E31BDACE6A9722C7582D2F995023;
 			remoteInfo = "SSHPortal App Proxy";
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		767CCF90275A855CF955916B /* Embed System Extensions */ = {
+		DFF534C79A3F4C238FADB7CC9B45E82C /* Embed System Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = Contents/Library/SystemExtensions;
 			dstSubfolderSpec = 1;
 			files = (
-				D6C3B37C21D5AEDEEA4E7916 /* SSHPortalAppProxy.systemextension in Embed System Extensions */,
+				31D842F00C3FC616C83F93C1FF05AFAC /* SSHPortalAppProxy.systemextension in Embed System Extensions */,
 			);
 			name = "Embed System Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -70,212 +100,245 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		0904CADC2CCCE46671AFCCF8 /* SignedApplication.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SignedApplication.swift; sourceTree = "<group>"; };
-		1478385F6C34CFC3D452C1C3 /* SSHPortalAppProxy.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortalAppProxy.entitlements; sourceTree = "<group>"; };
-		151AC27727F9223A839779C3 /* SSHPortalDeveloperID.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortalDeveloperID.entitlements; sourceTree = "<group>"; };
-		208E9716C089ECF6E161932D /* ControlProtocol.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ControlProtocol.swift; sourceTree = "<group>"; };
-		248E719F060E0317CF02F055 /* SSHPortal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SSHPortal.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		266245A11D00F3BE54DDAA11 /* FlowIO.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowIO.swift; sourceTree = "<group>"; };
-		287631FF839C0D6E816C8E2C /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
-		37B1AF8224BFB0E60E0CAC1B /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Network.framework; sourceTree = DEVELOPER_DIR; };
-		477AFED7BC8EBD3D60C02EAC /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		5EC8213AED881B1AC542BDFD /* SOCKSProtocol.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSProtocol.swift; sourceTree = "<group>"; };
-		6621A87FF59B14290B14A3C5 /* AppProxyProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AppProxyProvider.swift; sourceTree = "<group>"; };
-		6E77E4E7F6466A498263347E /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/AppKit.framework; sourceTree = DEVELOPER_DIR; };
-		711B1D01E946614118E181A5 /* SSHPortalAppProxyTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; name = SSHPortalAppProxyTests.xctest; path = "SSHPortal App Proxy Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
-		86F8883BEF20380E2B3AEB1A /* SystemExtensionInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstaller.swift; sourceTree = "<group>"; };
-		89AEDCA07F8F5F7CF6E2D737 /* main.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		8B54E4B1FA970B2FA12B2997 /* FlowBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowBridge.swift; sourceTree = "<group>"; };
-		963909224ADAB97B804888CE /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		9715CB4600504002FCC4FF75 /* SSHPortalAppProxyDeveloperID.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortalAppProxyDeveloperID.entitlements; sourceTree = "<group>"; };
-		9896ABBCAFAAB4FF1490905E /* SSHPortalConfiguration.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SSHPortalConfiguration.swift; sourceTree = "<group>"; };
-		9D6F096AC53469674F4DE71F /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/SystemExtensions.framework; sourceTree = DEVELOPER_DIR; };
-		A3DB33E7BB28D5218AD2061D /* OSLog.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = OSLog.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/OSLog.framework; sourceTree = DEVELOPER_DIR; };
-		B40B4275F9E7D3969C9C8E2E /* main.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		B4DC8C5A1C5AE94554BB8262 /* SSHPortal.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortal.entitlements; sourceTree = "<group>"; };
-		B6B810E02E03936505153D23 /* PerAppVPNController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNController.swift; sourceTree = "<group>"; };
-		B7891E34ACA1A7CE027BBA63 /* SSHPortalAppProxy.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = SSHPortalAppProxy.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
-		BE1459BD0C540A31615DE856 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
-		CBB1BDDAB742E62A4E965421 /* generate_project.rb */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.script.ruby; path = generate_project.rb; sourceTree = "<group>"; };
-		DC887C5CD04DA6F89FF20D0A /* ApplicationCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ApplicationCoordinator.swift; sourceTree = "<group>"; };
-		E0CD6AA3047A80E1C3E87F8B /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/NetworkExtension.framework; sourceTree = DEVELOPER_DIR; };
-		E69786820EBFA1E6766D9DAF /* SignedApplicationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SignedApplicationTests.swift; sourceTree = "<group>"; };
-		EC8FB660ED26DFB05D0E024E /* SOCKSProtocolTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSProtocolTests.swift; sourceTree = "<group>"; };
-		F09E2B5D892AC6CE2C817BC9 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Security.framework; sourceTree = DEVELOPER_DIR; };
-		F22D3B36BFAB7C78243DFB7B /* SOCKSConnection.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSConnection.swift; sourceTree = "<group>"; };
-		FB067928DAC16702BFDAC82A /* ControlProtocolTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ControlProtocolTests.swift; sourceTree = "<group>"; };
+		131186CB60CD1E4EE72CFD26CEFB4F6F /* ApplicationCoordinator.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ApplicationCoordinator.swift; sourceTree = "<group>"; };
+		16D2453A74D50C5D64F706BB19F99F06 /* PerAppVPNController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNController.swift; sourceTree = "<group>"; };
+		17C74C6FBAA2394B582B2029CFC08C05 /* SOCKSProtocolTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSProtocolTests.swift; sourceTree = "<group>"; };
+		1C095E6A33DA616F4AE5436229ABB9B7 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Security.framework; sourceTree = DEVELOPER_DIR; };
+		1C5C63F0FD201769FD869794477F1821 /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1C77E8329111A39D45DD01C5AFCDB020 /* SSHPortalAppProxy.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortalAppProxy.entitlements; sourceTree = "<group>"; };
+		1F5B009ACD4EF3A5C0D0539690C9B56A /* SSHPortal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SSHPortal.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		22BD1881D1E075EACF3929E4E6D68448 /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/SystemExtensions.framework; sourceTree = DEVELOPER_DIR; };
+		2DD9AF634BF8D3E7354D412A9875003C /* SSHPortalAppProxyDeveloperID.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortalAppProxyDeveloperID.entitlements; sourceTree = "<group>"; };
+		30C6431BA7AD029AA613CBC7896278EE /* SOCKSProtocol.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSProtocol.swift; sourceTree = "<group>"; };
+		312D6A18ADE957832BC66E4F21548E32 /* SSHPortalDeveloperID.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortalDeveloperID.entitlements; sourceTree = "<group>"; };
+		387546B8846F311817AAE2F0F533D551 /* PerAppVPNOwnershipError.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNOwnershipError.swift; sourceTree = "<group>"; };
+		492B6FFD8A9EB16D58570822CAE722B4 /* SSHPortal.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = SSHPortal.entitlements; sourceTree = "<group>"; };
+		504D0A43E642A806880AF033DA83C8E8 /* NetworkExtensionPerAppVPNManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = NetworkExtensionPerAppVPNManager.swift; sourceTree = "<group>"; };
+		59FCA948FA8A5105424B558AA04572AC /* main.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		5DC967354DC08990A483D4DF0B42905E /* main.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		6128BF9730ED4D8C8BE4360174D38ED1 /* PerAppVPNOwnershipLease.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNOwnershipLease.swift; sourceTree = "<group>"; };
+		694EE049A068501E97F33333E7B8EB90 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/NetworkExtension.framework; sourceTree = DEVELOPER_DIR; };
+		6C71D13E07E798192E8985B9CDE2ADF8 /* SystemExtensionInstaller.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstaller.swift; sourceTree = "<group>"; };
+		7578A0B89D5010FA4D57E4B22E291F0B /* FlowIOTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowIOTests.swift; sourceTree = "<group>"; };
+		78276CDFE18C539815F51D1EFA6028F7 /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/AppKit.framework; sourceTree = DEVELOPER_DIR; };
+		7E70B2DA58DF2D8A76C582894255A948 /* SignedApplicationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SignedApplicationTests.swift; sourceTree = "<group>"; };
+		842B84AFF8E3A218416B677B34979E19 /* SOCKSConnection.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSConnection.swift; sourceTree = "<group>"; };
+		89A334C4EE95902DCADE8095A63564D2 /* generate_project.rb */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.script.ruby; path = generate_project.rb; sourceTree = "<group>"; };
+		8A3D67DE2A0372690FE487CC7DBB3177 /* AppProxyProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AppProxyProvider.swift; sourceTree = "<group>"; };
+		8FBE1D6FA0CFC0D510982926E3D7D9EE /* FlowIO.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowIO.swift; sourceTree = "<group>"; };
+		924AD06836B463EB26FD04E370E984DD /* PerAppVPNManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNManager.swift; sourceTree = "<group>"; };
+		92EAB33551D9FEDF3CE587CB90CC5948 /* SignedApplication.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SignedApplication.swift; sourceTree = "<group>"; };
+		9C88437266D086D078A536A0DB5E8E06 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
+		A61550F5DC5E328405977FF5035CF048 /* PerAppVPNOwnershipProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNOwnershipProvider.swift; sourceTree = "<group>"; };
+		A8E7E5349A1F026177D0F4F644688F4F /* PerAppVPNFileOwnershipProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNFileOwnershipProvider.swift; sourceTree = "<group>"; };
+		AAFE2C45E067406D2BDCBFB530268321 /* FlowBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowBridge.swift; sourceTree = "<group>"; };
+		AD180BBFD418943D8CCB6BD73A906A30 /* FlowBridgeRegistry.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowBridgeRegistry.swift; sourceTree = "<group>"; };
+		AEE852FC78F38680A7A9D78BA339C2CE /* SOCKSConnectionTransport.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSConnectionTransport.swift; sourceTree = "<group>"; };
+		B27BD3FCBC04285A6424E8CDF01A278B /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B63B77FBAC526BCE77FBE233EA1803E3 /* ControlProtocolTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ControlProtocolTests.swift; sourceTree = "<group>"; };
+		BEF868B15B3D8556B8E9F9A5BEE41803 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Network.framework; sourceTree = DEVELOPER_DIR; };
+		C0306C7048524A1DCF1529180D211F9D /* ControlProtocol.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ControlProtocol.swift; sourceTree = "<group>"; };
+		C08D0964E78501C275E1764F0EAC25B1 /* SSHPortalAppProxyTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; name = SSHPortalAppProxyTests.xctest; path = "SSHPortal App Proxy Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		CFCDE7A76CED82D5E98265F4251494CD /* SOCKSConnectionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SOCKSConnectionTests.swift; sourceTree = "<group>"; };
+		D1D48463CFF71FEFFA27D92DDAEE99BE /* NetworkExtensionPerAppVPNManagerStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = NetworkExtensionPerAppVPNManagerStore.swift; sourceTree = "<group>"; };
+		D98F53D2EA08C5DE1F2040FBC541B822 /* SystemExtensionInstallerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SystemExtensionInstallerTests.swift; sourceTree = "<group>"; };
+		DBA808AA357A56891D14950E20C8D51A /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
+		DE4CD439CC04D025842661101BD9C22A /* SSHPortalAppProxy.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = SSHPortalAppProxy.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		E0BC88E8BA68179F9B5A945E06BA749A /* PerAppVPNControllerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNControllerTests.swift; sourceTree = "<group>"; };
+		F19D6C1D247CCA6EED005C4C64EAA618 /* PerAppVPNManagerStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PerAppVPNManagerStore.swift; sourceTree = "<group>"; };
+		F1CF9116E397DE66365AEBCBFA108AA7 /* FlowBridgeRegistryTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FlowBridgeRegistryTests.swift; sourceTree = "<group>"; };
+		F8FF7F192D70BCCF3FB1BAD8251EE800 /* OSLog.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = OSLog.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/OSLog.framework; sourceTree = DEVELOPER_DIR; };
+		FBD9CE20C41C9A7768E4D61EE9B04FCA /* SSHPortalConfiguration.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SSHPortalConfiguration.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		D489003A34E7A40BE430D5E6 /* Frameworks */ = {
+		4D57B55672D3DCFEC16C26CB6ADD2DE6 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				38E4C7655F35AA08008D5817 /* AppKit.framework in Frameworks */,
-				A880C754458D339BB3737FB8 /* Cocoa.framework in Frameworks */,
-				F2A4424EFA081BDFCB8653CA /* NetworkExtension.framework in Frameworks */,
-				24191A91D567092132F96AC5 /* Security.framework in Frameworks */,
-				0BDC6093263B658DE442B54D /* SystemExtensions.framework in Frameworks */,
+				C50617216C45DC35BB0C75309375E307 /* AppKit.framework in Frameworks */,
+				D06F4EA07EFA06691A837DE08F1D0695 /* Cocoa.framework in Frameworks */,
+				69934326B87A43B7A1848B669D781BB1 /* NetworkExtension.framework in Frameworks */,
+				37D2678B3A8ECCC350E01BF40374B590 /* Security.framework in Frameworks */,
+				35D81DA385F6C15304E022CC412ACF3E /* SystemExtensions.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		E2869D87C8858424276EFB97 /* Frameworks */ = {
+		9E3926B4E0A9661FC04EF9E4A7DE0C0E /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AEB6F903C4D6E1204C085106 /* Cocoa.framework in Frameworks */,
-				683EF069C6EFD9FDC7B9CB93 /* Network.framework in Frameworks */,
-				92B3291668F8A5AA05C209FA /* NetworkExtension.framework in Frameworks */,
-				6F0F0A28C975EAFF919DFDB8 /* Security.framework in Frameworks */,
-				4C29AF1FAB662E5F6A50F1E0 /* XCTest.framework in Frameworks */,
+				C62DA306F5CD28BC8F6F63E0891123C4 /* Cocoa.framework in Frameworks */,
+				CDAD2874ACE4D6B3E6E69730E21F2FB6 /* Network.framework in Frameworks */,
+				1C6CEB23E7762AC5A230C85EB8545AB7 /* NetworkExtension.framework in Frameworks */,
+				AAD242119D631D8CB90F3D2BCF38E33B /* Security.framework in Frameworks */,
+				ED97DFB6AB2F3735ACC4012F2D516C70 /* SystemExtensions.framework in Frameworks */,
+				6C999B1133CE6F4EF5988EC13534B3D9 /* XCTest.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		FE433E1BEA8D28E021A7E29F /* Frameworks */ = {
+		A6CBC95199447FF37BC2AE7E0319AF25 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				84968DFE52E955335E20EF89 /* Cocoa.framework in Frameworks */,
-				C75C418D72078E8D126F5CCB /* Network.framework in Frameworks */,
-				9FF381D6783939C7CC234B7A /* NetworkExtension.framework in Frameworks */,
-				B5E1727DE184B1B38ADD820C /* OSLog.framework in Frameworks */,
+				19094BC86EC287EFCAB020A8FEB0FD22 /* Cocoa.framework in Frameworks */,
+				E8058BFBEC9CCD19F29D184D34E93196 /* Network.framework in Frameworks */,
+				C0235F315464B43E2F9F7BD6168A52B7 /* NetworkExtension.framework in Frameworks */,
+				F702B42E87827A45CAA71FC5F290089E /* OSLog.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		19536B4DB16493823EA0C8DE /* App */ = {
+		014AD5DDFED00BC7183A6F837C681ADE /* Tests */ = {
 			isa = PBXGroup;
 			children = (
-				DC887C5CD04DA6F89FF20D0A /* ApplicationCoordinator.swift */,
-				208E9716C089ECF6E161932D /* ControlProtocol.swift */,
-				477AFED7BC8EBD3D60C02EAC /* Info.plist */,
-				B40B4275F9E7D3969C9C8E2E /* main.swift */,
-				B6B810E02E03936505153D23 /* PerAppVPNController.swift */,
-				0904CADC2CCCE46671AFCCF8 /* SignedApplication.swift */,
-				86F8883BEF20380E2B3AEB1A /* SystemExtensionInstaller.swift */,
-			);
-			path = App;
-			sourceTree = "<group>";
-		};
-		1F54577A0CC2709B6A551725 /* Support */ = {
-			isa = PBXGroup;
-			children = (
-				CBB1BDDAB742E62A4E965421 /* generate_project.rb */,
-				B4DC8C5A1C5AE94554BB8262 /* SSHPortal.entitlements */,
-				1478385F6C34CFC3D452C1C3 /* SSHPortalAppProxy.entitlements */,
-				9715CB4600504002FCC4FF75 /* SSHPortalAppProxyDeveloperID.entitlements */,
-				151AC27727F9223A839779C3 /* SSHPortalDeveloperID.entitlements */,
-			);
-			path = Support;
-			sourceTree = "<group>";
-		};
-		261932EC176BCE2985022101 /* Shared */ = {
-			isa = PBXGroup;
-			children = (
-				9896ABBCAFAAB4FF1490905E /* SSHPortalConfiguration.swift */,
-			);
-			path = Shared;
-			sourceTree = "<group>";
-		};
-		304625CC71D65103784393A9 /* AppProxyExtension */ = {
-			isa = PBXGroup;
-			children = (
-				6621A87FF59B14290B14A3C5 /* AppProxyProvider.swift */,
-				8B54E4B1FA970B2FA12B2997 /* FlowBridge.swift */,
-				266245A11D00F3BE54DDAA11 /* FlowIO.swift */,
-				963909224ADAB97B804888CE /* Info.plist */,
-				89AEDCA07F8F5F7CF6E2D737 /* main.swift */,
-				F22D3B36BFAB7C78243DFB7B /* SOCKSConnection.swift */,
-				5EC8213AED881B1AC542BDFD /* SOCKSProtocol.swift */,
-			);
-			path = AppProxyExtension;
-			sourceTree = "<group>";
-		};
-		3917C40D05657A50802234D3 /* Tests */ = {
-			isa = PBXGroup;
-			children = (
-				FB067928DAC16702BFDAC82A /* ControlProtocolTests.swift */,
-				E69786820EBFA1E6766D9DAF /* SignedApplicationTests.swift */,
-				EC8FB660ED26DFB05D0E024E /* SOCKSProtocolTests.swift */,
+				B63B77FBAC526BCE77FBE233EA1803E3 /* ControlProtocolTests.swift */,
+				F1CF9116E397DE66365AEBCBFA108AA7 /* FlowBridgeRegistryTests.swift */,
+				7578A0B89D5010FA4D57E4B22E291F0B /* FlowIOTests.swift */,
+				E0BC88E8BA68179F9B5A945E06BA749A /* PerAppVPNControllerTests.swift */,
+				7E70B2DA58DF2D8A76C582894255A948 /* SignedApplicationTests.swift */,
+				CFCDE7A76CED82D5E98265F4251494CD /* SOCKSConnectionTests.swift */,
+				17C74C6FBAA2394B582B2029CFC08C05 /* SOCKSProtocolTests.swift */,
+				D98F53D2EA08C5DE1F2040FBC541B822 /* SystemExtensionInstallerTests.swift */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
 		};
-		4D3141699625BF38D577E441 = {
+		08C3D38D4EE4C40A5396D71BCEA7D792 = {
 			isa = PBXGroup;
 			children = (
-				19536B4DB16493823EA0C8DE /* App */,
-				304625CC71D65103784393A9 /* AppProxyExtension */,
-				8197A2B77BFCDFA1444DBCCA /* Frameworks */,
-				62801A6C57A08B12F01A09FC /* Products */,
-				261932EC176BCE2985022101 /* Shared */,
-				1F54577A0CC2709B6A551725 /* Support */,
-				3917C40D05657A50802234D3 /* Tests */,
+				3463EBDCE84C6FFD2334CE0296D39478 /* App */,
+				BA61CE8A09945F042886F99D2680EC33 /* AppProxyExtension */,
+				4173682D3F82F9692C7C46C66ADE396C /* Frameworks */,
+				60F684F551792D453300B08968FF5920 /* Products */,
+				5CC6176E89BBF2D04FA87DECC7B174A9 /* Shared */,
+				EA7FFD01BA6020552BEB030B6859B729 /* Support */,
+				014AD5DDFED00BC7183A6F837C681ADE /* Tests */,
 			);
 			sourceTree = "<group>";
 		};
-		62801A6C57A08B12F01A09FC /* Products */ = {
+		3463EBDCE84C6FFD2334CE0296D39478 /* App */ = {
 			isa = PBXGroup;
 			children = (
-				248E719F060E0317CF02F055 /* SSHPortal.app */,
-				B7891E34ACA1A7CE027BBA63 /* SSHPortalAppProxy.systemextension */,
-				711B1D01E946614118E181A5 /* SSHPortalAppProxyTests.xctest */,
+				131186CB60CD1E4EE72CFD26CEFB4F6F /* ApplicationCoordinator.swift */,
+				C0306C7048524A1DCF1529180D211F9D /* ControlProtocol.swift */,
+				B27BD3FCBC04285A6424E8CDF01A278B /* Info.plist */,
+				5DC967354DC08990A483D4DF0B42905E /* main.swift */,
+				504D0A43E642A806880AF033DA83C8E8 /* NetworkExtensionPerAppVPNManager.swift */,
+				D1D48463CFF71FEFFA27D92DDAEE99BE /* NetworkExtensionPerAppVPNManagerStore.swift */,
+				16D2453A74D50C5D64F706BB19F99F06 /* PerAppVPNController.swift */,
+				A8E7E5349A1F026177D0F4F644688F4F /* PerAppVPNFileOwnershipProvider.swift */,
+				924AD06836B463EB26FD04E370E984DD /* PerAppVPNManager.swift */,
+				F19D6C1D247CCA6EED005C4C64EAA618 /* PerAppVPNManagerStore.swift */,
+				387546B8846F311817AAE2F0F533D551 /* PerAppVPNOwnershipError.swift */,
+				6128BF9730ED4D8C8BE4360174D38ED1 /* PerAppVPNOwnershipLease.swift */,
+				A61550F5DC5E328405977FF5035CF048 /* PerAppVPNOwnershipProvider.swift */,
+				92EAB33551D9FEDF3CE587CB90CC5948 /* SignedApplication.swift */,
+				6C71D13E07E798192E8985B9CDE2ADF8 /* SystemExtensionInstaller.swift */,
 			);
-			name = Products;
+			path = App;
 			sourceTree = "<group>";
 		};
-		8197A2B77BFCDFA1444DBCCA /* Frameworks */ = {
+		4173682D3F82F9692C7C46C66ADE396C /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				F6FDD9A36EA1258F69A1F645 /* OS X */,
+				4321797200675F3CF926B2DD9D37CAA0 /* OS X */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		F6FDD9A36EA1258F69A1F645 /* OS X */ = {
+		4321797200675F3CF926B2DD9D37CAA0 /* OS X */ = {
 			isa = PBXGroup;
 			children = (
-				6E77E4E7F6466A498263347E /* AppKit.framework */,
-				BE1459BD0C540A31615DE856 /* Cocoa.framework */,
-				37B1AF8224BFB0E60E0CAC1B /* Network.framework */,
-				E0CD6AA3047A80E1C3E87F8B /* NetworkExtension.framework */,
-				A3DB33E7BB28D5218AD2061D /* OSLog.framework */,
-				F09E2B5D892AC6CE2C817BC9 /* Security.framework */,
-				9D6F096AC53469674F4DE71F /* SystemExtensions.framework */,
-				287631FF839C0D6E816C8E2C /* XCTest.framework */,
+				78276CDFE18C539815F51D1EFA6028F7 /* AppKit.framework */,
+				9C88437266D086D078A536A0DB5E8E06 /* Cocoa.framework */,
+				BEF868B15B3D8556B8E9F9A5BEE41803 /* Network.framework */,
+				694EE049A068501E97F33333E7B8EB90 /* NetworkExtension.framework */,
+				F8FF7F192D70BCCF3FB1BAD8251EE800 /* OSLog.framework */,
+				1C095E6A33DA616F4AE5436229ABB9B7 /* Security.framework */,
+				22BD1881D1E075EACF3929E4E6D68448 /* SystemExtensions.framework */,
+				DBA808AA357A56891D14950E20C8D51A /* XCTest.framework */,
 			);
 			name = "OS X";
+			sourceTree = "<group>";
+		};
+		5CC6176E89BBF2D04FA87DECC7B174A9 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				FBD9CE20C41C9A7768E4D61EE9B04FCA /* SSHPortalConfiguration.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		60F684F551792D453300B08968FF5920 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1F5B009ACD4EF3A5C0D0539690C9B56A /* SSHPortal.app */,
+				DE4CD439CC04D025842661101BD9C22A /* SSHPortalAppProxy.systemextension */,
+				C08D0964E78501C275E1764F0EAC25B1 /* SSHPortalAppProxyTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		BA61CE8A09945F042886F99D2680EC33 /* AppProxyExtension */ = {
+			isa = PBXGroup;
+			children = (
+				8A3D67DE2A0372690FE487CC7DBB3177 /* AppProxyProvider.swift */,
+				AAFE2C45E067406D2BDCBFB530268321 /* FlowBridge.swift */,
+				AD180BBFD418943D8CCB6BD73A906A30 /* FlowBridgeRegistry.swift */,
+				8FBE1D6FA0CFC0D510982926E3D7D9EE /* FlowIO.swift */,
+				1C5C63F0FD201769FD869794477F1821 /* Info.plist */,
+				59FCA948FA8A5105424B558AA04572AC /* main.swift */,
+				842B84AFF8E3A218416B677B34979E19 /* SOCKSConnection.swift */,
+				AEE852FC78F38680A7A9D78BA339C2CE /* SOCKSConnectionTransport.swift */,
+				30C6431BA7AD029AA613CBC7896278EE /* SOCKSProtocol.swift */,
+			);
+			path = AppProxyExtension;
+			sourceTree = "<group>";
+		};
+		EA7FFD01BA6020552BEB030B6859B729 /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				89A334C4EE95902DCADE8095A63564D2 /* generate_project.rb */,
+				492B6FFD8A9EB16D58570822CAE722B4 /* SSHPortal.entitlements */,
+				1C77E8329111A39D45DD01C5AFCDB020 /* SSHPortalAppProxy.entitlements */,
+				2DD9AF634BF8D3E7354D412A9875003C /* SSHPortalAppProxyDeveloperID.entitlements */,
+				312D6A18ADE957832BC66E4F21548E32 /* SSHPortalDeveloperID.entitlements */,
+			);
+			path = Support;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		53F1010CBEC0DE856D5F5EBD /* SSHPortal App Proxy Tests */ = {
+		931B58820733E7D9B083F23A8AACAD0E /* SSHPortal */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 900E9DAE858FE6FF461A1940 /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy Tests" */;
+			buildConfigurationList = AE1DAE185C5BB33A2E0EFB16FC351625 /* Build configuration list for PBXNativeTarget "SSHPortal" */;
 			buildPhases = (
-				4D8347EF2523C5740CD4566D /* Sources */,
-				E2869D87C8858424276EFB97 /* Frameworks */,
-				EFF925FFFB9FBB41A9BAB35D /* Resources */,
+				08A25E27552933B50CF0CA57D7F01C48 /* Sources */,
+				4D57B55672D3DCFEC16C26CB6ADD2DE6 /* Frameworks */,
+				233BEBB139AFBA57CA186C7B3024F7FE /* Resources */,
+				DFF534C79A3F4C238FADB7CC9B45E82C /* Embed System Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				CD0174399BF80613719D5CA5F1802BCB /* PBXTargetDependency */,
 			);
-			name = "SSHPortal App Proxy Tests";
-			productName = SSHPortalAppProxyTests;
-			productReference = 711B1D01E946614118E181A5 /* SSHPortalAppProxyTests.xctest */;
-			productType = "com.apple.product-type.bundle.unit-test";
+			name = SSHPortal;
+			productName = SSHPortal;
+			productReference = 1F5B009ACD4EF3A5C0D0539690C9B56A /* SSHPortal.app */;
+			productType = "com.apple.product-type.application";
 		};
-		9036BB44520513A797A94B0C /* SSHPortal App Proxy */ = {
+		9FA8E31BDACE6A9722C7582D2F995023 /* SSHPortal App Proxy */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = BEED5CF90776AED53959DB20 /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy" */;
+			buildConfigurationList = 7AC2BFD92E229E549ABFA10584B25C35 /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy" */;
 			buildPhases = (
-				74957F38C9EE5A8D0CEC958C /* Sources */,
-				FE433E1BEA8D28E021A7E29F /* Frameworks */,
-				8640D7A1EAC5837B36916017 /* Resources */,
+				5F7C1E365C8ACF6F1F2557030986E746 /* Sources */,
+				A6CBC95199447FF37BC2AE7E0319AF25 /* Frameworks */,
+				6F7CA8E70B27BBE90FDDAA3764D177B8 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -283,52 +346,50 @@
 			);
 			name = "SSHPortal App Proxy";
 			productName = SSHPortalAppProxy;
-			productReference = B7891E34ACA1A7CE027BBA63 /* SSHPortalAppProxy.systemextension */;
+			productReference = DE4CD439CC04D025842661101BD9C22A /* SSHPortalAppProxy.systemextension */;
 			productType = "com.apple.product-type.system-extension";
 		};
-		BC5B8DE57101619A5270AFD4 /* SSHPortal */ = {
+		BA8986AB920501362BB879EF1D9D73FB /* SSHPortal App Proxy Tests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = CC5F4DD91BCE0745DC2E83FC /* Build configuration list for PBXNativeTarget "SSHPortal" */;
+			buildConfigurationList = 5448CF7E14ABE461BCB7ACBFED9B1B8D /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy Tests" */;
 			buildPhases = (
-				29F8DBBDF0CE432B3DC7372E /* Sources */,
-				D489003A34E7A40BE430D5E6 /* Frameworks */,
-				6E14D2DE5FDA4A75E927B3B1 /* Resources */,
-				767CCF90275A855CF955916B /* Embed System Extensions */,
+				910889B26F28CA3BCEE798E09F17E1F2 /* Sources */,
+				9E3926B4E0A9661FC04EF9E4A7DE0C0E /* Frameworks */,
+				37840731DEF657CAD9C11EC84CB31BCA /* Resources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				D990BC73B6AF3295F7A1B2F3 /* PBXTargetDependency */,
 			);
-			name = SSHPortal;
-			productName = SSHPortal;
-			productReference = 248E719F060E0317CF02F055 /* SSHPortal.app */;
-			productType = "com.apple.product-type.application";
+			name = "SSHPortal App Proxy Tests";
+			productName = SSHPortalAppProxyTests;
+			productReference = C08D0964E78501C275E1764F0EAC25B1 /* SSHPortalAppProxyTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		C48C37F6FF62B6A14FFEF2A5 /* Project object */ = {
+		B0E5F3FF5D8E21E989054D54B1CD2984 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 2700;
 				ORGANIZATIONNAME = "Tanmay Bakshi";
 				TargetAttributes = {
-					53F1010CBEC0DE856D5F5EBD = {
-						ProvisioningStyle = Automatic;
-					};
-					9036BB44520513A797A94B0C = {
+					931B58820733E7D9B083F23A8AACAD0E = {
 						DevelopmentTeam = 998XWVFVMR;
 						ProvisioningStyle = Automatic;
 					};
-					BC5B8DE57101619A5270AFD4 = {
+					9FA8E31BDACE6A9722C7582D2F995023 = {
 						DevelopmentTeam = 998XWVFVMR;
+						ProvisioningStyle = Automatic;
+					};
+					BA8986AB920501362BB879EF1D9D73FB = {
 						ProvisioningStyle = Automatic;
 					};
 				};
 			};
-			buildConfigurationList = 3864EDED87D4A811F1511788 /* Build configuration list for PBXProject "SSHPortal" */;
+			buildConfigurationList = 4891CB378031452EE97B25072FB9B57D /* Build configuration list for PBXProject "SSHPortal" */;
 			compatibilityVersion = "Xcode 3.2";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -336,34 +397,36 @@
 				en,
 				Base,
 			);
-			mainGroup = 4D3141699625BF38D577E441;
-			productRefGroup = 62801A6C57A08B12F01A09FC /* Products */;
+			mainGroup = 08C3D38D4EE4C40A5396D71BCEA7D792;
+			minimizedProjectReferenceProxies = 0;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 60F684F551792D453300B08968FF5920 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				BC5B8DE57101619A5270AFD4 /* SSHPortal */,
-				9036BB44520513A797A94B0C /* SSHPortal App Proxy */,
-				53F1010CBEC0DE856D5F5EBD /* SSHPortal App Proxy Tests */,
+				931B58820733E7D9B083F23A8AACAD0E /* SSHPortal */,
+				9FA8E31BDACE6A9722C7582D2F995023 /* SSHPortal App Proxy */,
+				BA8986AB920501362BB879EF1D9D73FB /* SSHPortal App Proxy Tests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		6E14D2DE5FDA4A75E927B3B1 /* Resources */ = {
+		233BEBB139AFBA57CA186C7B3024F7FE /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		8640D7A1EAC5837B36916017 /* Resources */ = {
+		37840731DEF657CAD9C11EC84CB31BCA /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		EFF925FFFB9FBB41A9BAB35D /* Resources */ = {
+		6F7CA8E70B27BBE90FDDAA3764D177B8 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -373,61 +436,188 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		29F8DBBDF0CE432B3DC7372E /* Sources */ = {
+		08A25E27552933B50CF0CA57D7F01C48 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				8F332A7BD57647C10847F791 /* ApplicationCoordinator.swift in Sources */,
-				2D6DD8790EB1215DB7037B23 /* ControlProtocol.swift in Sources */,
-				D240D3C002FA7FD6F629B430 /* main.swift in Sources */,
-				6C34F2FD717BB81D9B3DC7B4 /* PerAppVPNController.swift in Sources */,
-				9FD7F23758027B6CBD1DF84E /* SignedApplication.swift in Sources */,
-				C0E3041EEDEFF840DCB3E083 /* SSHPortalConfiguration.swift in Sources */,
-				645F82491D5E5836FD183568 /* SystemExtensionInstaller.swift in Sources */,
+				49A2F00A78E1E3977373BFD81C9F6169 /* ApplicationCoordinator.swift in Sources */,
+				C87501DEEC3C0EEF584AD18E6BC0D267 /* ControlProtocol.swift in Sources */,
+				B015BA22787D17F57B5A4514A89DB4E0 /* main.swift in Sources */,
+				D6EA79E185EEBB52350D6DA8B24B2429 /* NetworkExtensionPerAppVPNManager.swift in Sources */,
+				127C0B348EB225CC7C81FC5F6F05D378 /* NetworkExtensionPerAppVPNManagerStore.swift in Sources */,
+				AEBECCF0B4082E660C9A3C59D5A51B31 /* PerAppVPNController.swift in Sources */,
+				6C3E4A61F6C170D219F6E6D58A47ECE0 /* PerAppVPNFileOwnershipProvider.swift in Sources */,
+				B65DF25584B5E53D296105456D118232 /* PerAppVPNManager.swift in Sources */,
+				97D1F58291BECC01CBD34BA508533B54 /* PerAppVPNManagerStore.swift in Sources */,
+				A8404121DE22A6BC3BA388CBC3B40D56 /* PerAppVPNOwnershipError.swift in Sources */,
+				AD8E1372E005C87B51C7306B8F39CF67 /* PerAppVPNOwnershipLease.swift in Sources */,
+				0E8C3654AD9AA05B814A8047540C5BA0 /* PerAppVPNOwnershipProvider.swift in Sources */,
+				2D4112E5147ACBBE981AC8432A95CFFC /* SignedApplication.swift in Sources */,
+				E577BB27288DEB9CF54D3EAF4B15EFCE /* SSHPortalConfiguration.swift in Sources */,
+				2A000EDC04405E3191DA648ED3AC70C5 /* SystemExtensionInstaller.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		4D8347EF2523C5740CD4566D /* Sources */ = {
+		5F7C1E365C8ACF6F1F2557030986E746 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				C676F35D1BD9C3F2F65CE78A /* ControlProtocol.swift in Sources */,
-				711479036F6E958A6E4A3D42 /* ControlProtocolTests.swift in Sources */,
-				8C12324358E6FCE3C1008E05 /* SignedApplication.swift in Sources */,
-				CE9C7E6567942F668C870C7C /* SignedApplicationTests.swift in Sources */,
-				A34BA229D18020A183443D19 /* SOCKSProtocol.swift in Sources */,
-				599FD9DF66ABE2F59C103A47 /* SOCKSProtocolTests.swift in Sources */,
-				22375D43DF222AC806461235 /* SSHPortalConfiguration.swift in Sources */,
+				94E44927B71B5C280115C478266B7E93 /* AppProxyProvider.swift in Sources */,
+				89DD6386FACE2D043379B1C27608183C /* FlowBridge.swift in Sources */,
+				A1B03F08BF823DB44D5A59DE1574564B /* FlowBridgeRegistry.swift in Sources */,
+				59E30CDC2AEFD3D687A6B632228CF623 /* FlowIO.swift in Sources */,
+				39E490FC5EADEE2000D01975682B015F /* main.swift in Sources */,
+				E2FBF6BA2D51A8CB94AAA11BF023A92C /* SOCKSConnection.swift in Sources */,
+				9E0FF7A291A10776DBA08B2F6BA821E3 /* SOCKSConnectionTransport.swift in Sources */,
+				D1353080EADB06C49EF0D149D22619F4 /* SOCKSProtocol.swift in Sources */,
+				2F90B0322BBDAC50F862A2365047B8EF /* SSHPortalConfiguration.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		74957F38C9EE5A8D0CEC958C /* Sources */ = {
+		910889B26F28CA3BCEE798E09F17E1F2 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AC4A52DC1E638EB7440B7DAB /* AppProxyProvider.swift in Sources */,
-				B22B89EEA1D7BBAA390D113D /* FlowBridge.swift in Sources */,
-				5FFBC45F13FB618E46940DAE /* FlowIO.swift in Sources */,
-				2DD9F3D51FC0A2DE2D41984B /* main.swift in Sources */,
-				DCE1E05065F620E6FFC9D64E /* SOCKSConnection.swift in Sources */,
-				030EAC4BF02946C4AB67E550 /* SOCKSProtocol.swift in Sources */,
-				685696C0E35C03ADE7D23A87 /* SSHPortalConfiguration.swift in Sources */,
+				7E63391EFA89C276C95B4E2C375A43C8 /* ControlProtocol.swift in Sources */,
+				0E72A4361BFC602C5E8FDB8071F07B1C /* ControlProtocolTests.swift in Sources */,
+				4C6A7A23827AE541CDFDFFF39C442323 /* FlowBridgeRegistry.swift in Sources */,
+				E79B16CFD2C2A9E7FE458CDEC41F3E40 /* FlowBridgeRegistryTests.swift in Sources */,
+				A9A00D10B1B225B95176AB548582759E /* FlowIO.swift in Sources */,
+				395A7DCDA22317943F5CC2B1A8C82C90 /* FlowIOTests.swift in Sources */,
+				9804D6C693C4F6CB0C0121386C09555D /* NetworkExtensionPerAppVPNManager.swift in Sources */,
+				E52474D9F46B4E558199593DF82A9FB3 /* NetworkExtensionPerAppVPNManagerStore.swift in Sources */,
+				0F283A245CA0668D6987253A3F1302FA /* PerAppVPNController.swift in Sources */,
+				CF0744095480C6069CD21CDC59E63F59 /* PerAppVPNControllerTests.swift in Sources */,
+				713E88FDC416C4FD378E347EFCA708FD /* PerAppVPNFileOwnershipProvider.swift in Sources */,
+				A31C9B7302F9114917C10A741CEE0ECF /* PerAppVPNManager.swift in Sources */,
+				ED603BD1DC6CD7FDF3A63E62CC7143EE /* PerAppVPNManagerStore.swift in Sources */,
+				301906B154F6325E77F74A749E5C44F0 /* PerAppVPNOwnershipError.swift in Sources */,
+				05BCC08EEE0C075D548CD34FEF180EF0 /* PerAppVPNOwnershipLease.swift in Sources */,
+				8E097500BDDCF111D8266E08FE582A4D /* PerAppVPNOwnershipProvider.swift in Sources */,
+				FD556206306C40DF30824D40A33C5931 /* SignedApplication.swift in Sources */,
+				76492BC0730856E3CD62FB62F164135B /* SignedApplicationTests.swift in Sources */,
+				58C90FCEC8595E8A9375A4A83B73607C /* SOCKSConnection.swift in Sources */,
+				17CBF516980C6B82DE64D3098B3118E8 /* SOCKSConnectionTests.swift in Sources */,
+				FB21753E6EC89C15ABB09A92ABD84B21 /* SOCKSConnectionTransport.swift in Sources */,
+				7E96608F582E747176B7052817EA8A1C /* SOCKSProtocol.swift in Sources */,
+				F95F501D54877A074FCA39FDFC431505 /* SOCKSProtocolTests.swift in Sources */,
+				9174A0A0A82BDA68694265E6E75FE673 /* SSHPortalConfiguration.swift in Sources */,
+				9D2B5BAFF61F8E9D2FD154CA138A63E9 /* SystemExtensionInstaller.swift in Sources */,
+				44BC77DBD1F9F58A2FD0B617B4290A39 /* SystemExtensionInstallerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		D990BC73B6AF3295F7A1B2F3 /* PBXTargetDependency */ = {
+		CD0174399BF80613719D5CA5F1802BCB /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			name = "SSHPortal App Proxy";
-			target = 9036BB44520513A797A94B0C /* SSHPortal App Proxy */;
-			targetProxy = 7B5468BE49B3F4B8D80153E2 /* PBXContainerItemProxy */;
+			target = 9FA8E31BDACE6A9722C7582D2F995023 /* SSHPortal App Proxy */;
+			targetProxy = 8D658394D11FD55352C492F8BCB5D4CA /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		0D465674893879E45B17B14A /* Debug */ = {
+		21D8F3AC794938206EF0B30BD77D75A1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Owholemodule";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		345B5E8E76EC3B5C8772CAF7249103C8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = Support/SSHPortalAppProxy.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 998XWVFVMR;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AppProxyExtension/Info.plist;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.5.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyExtension;
+				PRODUCT_NAME = SSHPortalAppProxy;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				WRAPPER_EXTENSION = systemextension;
+			};
+			name = Debug;
+		};
+		3D196CA0ADB5EADDCD6F9EBB0D10F076 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.5.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyTests;
+				SDKROOT = macosx;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "";
+			};
+			name = Release;
+		};
+		43706BD8E5D768F2118E4E74E45EB1A0 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -478,18 +668,19 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
-				SWIFT_VERSION = 5.0;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
 		};
-		0FA64A0F7CF263263F63134E /* Debug */ = {
+		7B4041B8820615FDEFB758838ED5F354 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
@@ -498,16 +689,17 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.1;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyTests;
 				SDKROOT = macosx;
-				SWIFT_VERSION = 5.0;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
 				TEST_HOST = "";
 			};
 			name = Debug;
 		};
-		2402044CC651B755920829E3 /* Release */ = {
+		BBA94CDA88F57312427F4844C280AADD /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
@@ -519,19 +711,20 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AppProxyExtension/Info.plist;
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.1;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyExtension;
 				PRODUCT_NAME = SSHPortalAppProxy;
 				PROVISIONING_PROFILE_SPECIFIER = "$(SSHPORTAL_EXTENSION_PROFILE)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
-				SWIFT_VERSION = 5.0;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
 				WRAPPER_EXTENSION = systemextension;
 			};
 			name = Release;
 		};
-		2D04DE78868521BD5833A7AA /* Release */ = {
+		CC120AC6C4F1323E55E79D0D9890A632 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -546,94 +739,18 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.1;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos;
 				PRODUCT_NAME = SSHPortal;
 				PROVISIONING_PROFILE_SPECIFIER = "$(SSHPORTAL_APP_PROFILE)";
 				SDKROOT = macosx;
-				SWIFT_VERSION = 5.0;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};
-		3BF39AC33C9C90A86CC69A42 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ALWAYS_SEARCH_USER_PATHS = NO;
-				CLANG_ANALYZER_NONNULL = YES;
-				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
-				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
-				CLANG_CXX_LIBRARY = "libc++";
-				CLANG_ENABLE_MODULES = YES;
-				CLANG_ENABLE_OBJC_ARC = YES;
-				CLANG_ENABLE_OBJC_WEAK = YES;
-				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
-				CLANG_WARN_BOOL_CONVERSION = YES;
-				CLANG_WARN_COMMA = YES;
-				CLANG_WARN_CONSTANT_CONVERSION = YES;
-				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
-				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
-				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
-				CLANG_WARN_EMPTY_BODY = YES;
-				CLANG_WARN_ENUM_CONVERSION = YES;
-				CLANG_WARN_INFINITE_RECURSION = YES;
-				CLANG_WARN_INT_CONVERSION = YES;
-				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
-				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
-				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
-				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
-				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
-				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
-				CLANG_WARN_STRICT_PROTOTYPES = YES;
-				CLANG_WARN_SUSPICIOUS_MOVE = YES;
-				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
-				CLANG_WARN_UNREACHABLE_CODE = YES;
-				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
-				COPY_PHASE_STRIP = NO;
-				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				ENABLE_NS_ASSERTIONS = NO;
-				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu11;
-				GCC_NO_COMMON_BLOCKS = YES;
-				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
-				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
-				GCC_WARN_UNDECLARED_SELECTOR = YES;
-				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
-				GCC_WARN_UNUSED_FUNCTION = YES;
-				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MTL_ENABLE_DEBUG_INFO = NO;
-				MTL_FAST_MATH = YES;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_OPTIMIZATION_LEVEL = "-Owholemodule";
-				SWIFT_VERSION = 5.0;
-			};
-			name = Release;
-		};
-		800D0EE19F39E97B94D15D28 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				APPLICATION_EXTENSION_API_ONLY = YES;
-				CLANG_ENABLE_MODULES = YES;
-				CODE_SIGN_ENTITLEMENTS = Support/SSHPortalAppProxy.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 998XWVFVMR;
-				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = AppProxyExtension/Info.plist;
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyExtension;
-				PRODUCT_NAME = SSHPortalAppProxy;
-				SDKROOT = macosx;
-				SKIP_INSTALL = YES;
-				SWIFT_VERSION = 5.0;
-				WRAPPER_EXTENSION = systemextension;
-			};
-			name = Debug;
-		};
-		A41C5BCF91FE4773128D9959 /* Debug */ = {
+		D263D31D27403C91727FEC162E692A7F /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -648,73 +765,56 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.1;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos;
 				PRODUCT_NAME = SSHPortal;
 				SDKROOT = macosx;
-				SWIFT_VERSION = 5.0;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
-		};
-		CA234888F73EC49F7403F438 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CLANG_ENABLE_MODULES = YES;
-				CODE_SIGNING_ALLOWED = NO;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.4.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.tanmaybakshi.sshportal.macos.AppProxyTests;
-				SDKROOT = macosx;
-				SWIFT_VERSION = 5.0;
-				TEST_HOST = "";
-			};
-			name = Release;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		3864EDED87D4A811F1511788 /* Build configuration list for PBXProject "SSHPortal" */ = {
+		4891CB378031452EE97B25072FB9B57D /* Build configuration list for PBXProject "SSHPortal" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				0D465674893879E45B17B14A /* Debug */,
-				3BF39AC33C9C90A86CC69A42 /* Release */,
+				43706BD8E5D768F2118E4E74E45EB1A0 /* Debug */,
+				21D8F3AC794938206EF0B30BD77D75A1 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		900E9DAE858FE6FF461A1940 /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy Tests" */ = {
+		5448CF7E14ABE461BCB7ACBFED9B1B8D /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy Tests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				0FA64A0F7CF263263F63134E /* Debug */,
-				CA234888F73EC49F7403F438 /* Release */,
+				7B4041B8820615FDEFB758838ED5F354 /* Debug */,
+				3D196CA0ADB5EADDCD6F9EBB0D10F076 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		BEED5CF90776AED53959DB20 /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy" */ = {
+		7AC2BFD92E229E549ABFA10584B25C35 /* Build configuration list for PBXNativeTarget "SSHPortal App Proxy" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				800D0EE19F39E97B94D15D28 /* Debug */,
-				2402044CC651B755920829E3 /* Release */,
+				345B5E8E76EC3B5C8772CAF7249103C8 /* Debug */,
+				BBA94CDA88F57312427F4844C280AADD /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		CC5F4DD91BCE0745DC2E83FC /* Build configuration list for PBXNativeTarget "SSHPortal" */ = {
+		AE1DAE185C5BB33A2E0EFB16FC351625 /* Build configuration list for PBXNativeTarget "SSHPortal" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				A41C5BCF91FE4773128D9959 /* Debug */,
-				2D04DE78868521BD5833A7AA /* Release */,
+				D263D31D27403C91727FEC162E692A7F /* Debug */,
+				CC120AC6C4F1323E55E79D0D9890A632 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};
-	rootObject = C48C37F6FF62B6A14FFEF2A5 /* Project object */;
+	rootObject = B0E5F3FF5D8E21E989054D54B1CD2984 /* Project object */;
 }

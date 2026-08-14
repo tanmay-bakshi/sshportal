@@ -5,6 +5,8 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use url::Host;
 
+use super::dns::DnsName;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SystemVpnPolicy {
     include_cidrs: Vec<IpNet>,
@@ -12,6 +14,7 @@ pub struct SystemVpnPolicy {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnvalidatedSystemVpnPolicy {
     include_cidrs: Vec<IpNet>,
     include_domains: Vec<String>,
@@ -51,12 +54,24 @@ impl SystemVpnPolicy {
     }
 
     pub fn matches_domain(&self, hostname: &str) -> bool {
-        let Ok(hostname) = normalize_domain(hostname) else {
+        let Some(hostname) = normalize_candidate_domain(hostname) else {
             return false;
         };
         self.include_domains
             .iter()
             .any(|suffix| domain_matches_suffix(&hostname, suffix))
+    }
+
+    pub(crate) fn matches_dns_name(&self, name: &DnsName) -> bool {
+        self.include_domains
+            .iter()
+            .any(|suffix| name.ends_with_ascii_suffix(suffix))
+    }
+
+    pub fn contains_ip(&self, address: IpAddr) -> bool {
+        self.include_cidrs
+            .iter()
+            .any(|network| network.contains(&address))
     }
 
     pub(super) fn contains_exact_ip(&self, address: IpAddr) -> bool {
@@ -154,6 +169,17 @@ fn normalize_domain(value: &str) -> Result<String> {
     Ok(canonical)
 }
 
+fn normalize_candidate_domain(value: &str) -> Option<String> {
+    let domain = value.strip_suffix('.').unwrap_or(value);
+    if domain.is_empty() {
+        return None;
+    }
+    match Host::parse(domain).ok()? {
+        Host::Domain(domain) => Some(domain),
+        Host::Ipv4(_) | Host::Ipv6(_) => None,
+    }
+}
+
 fn validate_dns_name(domain: &str) -> Result<()> {
     if domain.len() > 253 {
         bail!("domain name exceeds 253 bytes");
@@ -188,6 +214,7 @@ fn domain_matches_suffix(hostname: &str, suffix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::SystemVpnPolicy;
+    use crate::vpn::dns::DnsName;
 
     #[test]
     fn empty_policy_is_full_tunnel() {
@@ -220,6 +247,10 @@ mod tests {
         );
         assert!(!policy.is_full_tunnel());
         assert!(!policy.uses_virtual_dns());
+        assert!(policy.contains_ip("10.20.255.254".parse().unwrap()));
+        assert!(policy.contains_ip("2001:db8:1:ffff::1".parse().unwrap()));
+        assert!(!policy.contains_ip("10.21.0.1".parse().unwrap()));
+        assert!(!policy.contains_ip("2001:db8:2::1".parse().unwrap()));
     }
 
     #[test]
@@ -248,6 +279,31 @@ mod tests {
         assert!(policy.matches_domain("login.care.anthem.com"));
         assert!(!policy.matches_domain("notanthem.com"));
         assert!(!policy.matches_domain("anthem.com.example"));
+    }
+
+    #[test]
+    fn domain_selector_accepts_arbitrary_query_labels_under_the_suffix() {
+        let policy =
+            SystemVpnPolicy::new(Vec::new(), vec!["elevancehealth.com".to_string()]).unwrap();
+
+        assert!(policy.matches_domain("_service.jira.elevancehealth.com"));
+        assert!(
+            policy.matches_dns_name(
+                &DnsName::from_ascii("_SERVICE.Jira.ElevanceHealth.Com").unwrap()
+            )
+        );
+        assert!(
+            policy.matches_dns_name(
+                &DnsName::from_wire_labels(vec![
+                    vec![b'c', b'a', b'c', b'h', b'e', b'.', b'k', b'e', b'y'],
+                    b"jira".to_vec(),
+                    b"elevancehealth".to_vec(),
+                    b"com".to_vec(),
+                ])
+                .unwrap()
+            )
+        );
+        assert!(!policy.matches_domain("_service.jira.notelevancehealth.com"));
     }
 
     #[test]

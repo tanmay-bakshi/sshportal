@@ -7,7 +7,8 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     private let vpnController = PerAppVPNController()
     private let eventWriter = EventWriter()
     private var commandTask: Task<Void, Never>?
-    private var operationTask: Task<Void, Never>?
+    private var startTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
     private var hasStarted = false
     private var isStopping = false
 
@@ -63,7 +64,7 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
             return
         }
         hasStarted = true
-        operationTask = Task { [weak self] in
+        startTask = Task { [weak self] in
             guard let self else {
                 return
             }
@@ -90,17 +91,20 @@ final class ApplicationCoordinator: NSObject, NSApplicationDelegate {
     }
 
     private func stop() {
-        guard !isStopping else {
+        guard isStopping == false, stopTask == nil else {
             return
         }
         isStopping = true
         commandTask?.cancel()
         commandTask = nil
-        operationTask?.cancel()
-        operationTask = Task { [weak self] in
+        let activeStartTask = startTask
+        activeStartTask?.cancel()
+        stopTask = Task { [weak self] in
             guard let self else {
                 return
             }
+            await activeStartTask?.value
+            startTask = nil
             do {
                 try await vpnController.stop()
                 eventWriter.send(.stopped)

@@ -47,6 +47,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       TAG_NAME: ${{ github.ref_name }}
+      RUST_TOOLCHAIN: 1.91.0
       CC_x86_64_unknown_linux_musl: musl-gcc
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
@@ -63,10 +64,10 @@ jobs:
       - name: Install Rust target
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --target "${TARGET}"
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --target "${TARGET}"
 
       - name: Build static musl binaries
-        run: cargo +stable build --locked --release --target "${TARGET}" --bins
+        run: cargo "+${RUST_TOOLCHAIN}" build --locked --release --target "${TARGET}" --bins
 
       - name: Verify static linkage
         run: |
@@ -121,7 +122,19 @@ jobs:
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Verify Wintun loader feature selection
+        shell: pwsh
+        run: |
+          $featureTree = cargo tree --locked `
+            --target $env:TARGET `
+            --edges features `
+            --invert wintun-bindings
+          $featureTree
+          if ($featureTree -match 'verify_binary_signature') {
+              throw "wintun-bindings/verify_binary_signature executes the DLL before verification"
+          }
 
       - name: Build static-CRT Windows binaries
         run: cargo build --locked --release --target $env:TARGET --bins
@@ -136,9 +149,26 @@ jobs:
               throw "The tun build did not produce $wintunPath"
           }
 
+          $checksumFields = (Get-Content tools/wintun-amd64.sha256 -Raw).Trim() -split "\s+"
+          $expectedWintunHash = $checksumFields[0].ToLowerInvariant()
+          if ($expectedWintunHash -notmatch "^[0-9a-f]{64}$") {
+              throw "tools/wintun-amd64.sha256 does not contain a valid SHA-256"
+          }
+          $wintunHash = (Get-FileHash -Algorithm SHA256 $wintunPath).Hash.ToLowerInvariant()
+          if ($wintunHash -ne $expectedWintunHash) {
+              throw "wintun.dll has an unexpected SHA-256: $wintunHash"
+          }
+
           $signature = Get-AuthenticodeSignature $wintunPath
           if ($signature.Status -ne "Valid") {
               throw "wintun.dll has an invalid Authenticode signature: $($signature.Status)"
+          }
+          $publisher = $signature.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false
+          )
+          if ($publisher -ne "WireGuard LLC") {
+              throw "wintun.dll has an unexpected Authenticode publisher: $publisher"
           }
 
           $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
@@ -150,6 +180,19 @@ jobs:
               throw "Could not locate dumpbin.exe"
           }
 
+          $allowedDependencies = [System.Collections.Generic.HashSet[string]]::new(
+              [System.StringComparer]::OrdinalIgnoreCase
+          )
+          foreach ($dependency in Get-Content tools/windows-system-dlls.txt) {
+              if ($dependency -notmatch "^[a-z0-9_.-]+\.dll$") {
+                  throw "tools/windows-system-dlls.txt is malformed"
+              }
+              [void] $allowedDependencies.Add($dependency)
+          }
+          if ($allowedDependencies.Count -eq 0) {
+              throw "tools/windows-system-dlls.txt is empty"
+          }
+
           foreach ($binary in @("sshportal-client.exe", "sshportal-server.exe")) {
               $binaryPath = "$releaseDirectory/$binary"
               $dependencyOutput = & $dumpbin /dependents $binaryPath
@@ -158,8 +201,27 @@ jobs:
               }
               $dependencies = $dependencyOutput -join "`n"
               $dependencies
-              if ($dependencies -match "(?i)(vcruntime|msvcp|msvcr|ucrtbase|api-ms-win-crt)[^\s]*\.dll") {
-                  throw "$binary dynamically depends on the Microsoft C/C++ runtime"
+              $dependencyNames = [regex]::Matches(
+                  $dependencies,
+                  "(?im)^\s+([a-z0-9_.-]+\.dll)\s*$"
+              ) | ForEach-Object { $_.Groups[1].Value }
+              if ($dependencyNames.Count -eq 0) {
+                  throw "dumpbin found no readable imports for $binary"
+              }
+              foreach ($dependency in $dependencyNames) {
+                  if (-not $allowedDependencies.Contains($dependency)) {
+                      throw "$binary unexpectedly imports non-system DLL $dependency"
+                  }
+              }
+
+              $loadConfigOutput = & $dumpbin /loadconfig $binaryPath
+              if ($LASTEXITCODE -ne 0) {
+                  throw "dumpbin failed to inspect the load configuration for $binary"
+              }
+              $loadConfig = $loadConfigOutput -join "`n"
+              $loadConfig
+              if ($loadConfig -notmatch "(?im)^\s+0*800\s+Dependent Load Flag(?:s)?\s*$") {
+                  throw "$binary does not restrict static imports to System32"
               }
           }
 

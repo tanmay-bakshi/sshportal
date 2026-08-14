@@ -24,6 +24,16 @@ final class SOCKSProtocolTests: XCTestCase {
         XCTAssertEqual(decodedEndpoint, endpoint)
     }
 
+    func testZeroLengthUDPDatagramRoundTrip() throws {
+        let endpoint = try SOCKSEndpoint(host: "192.0.2.40", port: 53)
+
+        let encoded = try SOCKSProtocol.encodeUDPDatagram(data: Data(), endpoint: endpoint)
+        let (decodedPayload, decodedEndpoint) = try SOCKSProtocol.decodeUDPDatagram(encoded)
+
+        XCTAssertTrue(decodedPayload.isEmpty)
+        XCTAssertEqual(decodedEndpoint, endpoint)
+    }
+
     func testFragmentedUDPDatagramIsRejected() throws {
         let packet = Data([0, 0, 1, 1, 127, 0, 0, 1, 0, 53])
 

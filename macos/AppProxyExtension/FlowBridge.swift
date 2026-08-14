@@ -1,62 +1,46 @@
 import Foundation
 import NetworkExtension
 
-protocol FlowBridge: AnyObject {
-    func start()
-    func cancel()
-}
-
-final class TCPFlowBridge: FlowBridge {
-    private let flow: NEAppProxyTCPFlow
+actor TCPFlowBridge: FlowBridge {
+    private let flow: ThreadSafeAppProxyFlow<NEAppProxyTCPFlow>
     private let configuration: ProxyConfiguration
     private let queue: DispatchQueue
-    private let completion: () -> Void
-    private let lock = NSLock()
-    private var task: Task<Void, Never>?
     private var socksConnection: SOCKSConnection?
+    private var isRunning = false
     private var isFinished = false
 
     init(
-        flow: NEAppProxyTCPFlow,
+        flow: ThreadSafeAppProxyFlow<NEAppProxyTCPFlow>,
         configuration: ProxyConfiguration,
-        queue: DispatchQueue,
-        completion: @escaping () -> Void
+        queue: DispatchQueue
     ) {
         self.flow = flow
         self.configuration = configuration
         self.queue = queue
-        self.completion = completion
     }
 
-    func start() {
-        lock.lock()
-        guard isFinished == false, task == nil else {
-            lock.unlock()
+    func run() async {
+        guard isRunning == false, isFinished == false else {
             return
         }
-        let task = Task { [weak self] in
-            guard let self else {
-                return
-            }
-            do {
-                try await run()
-                finish(error: nil, cancelTask: false)
-            } catch {
-                finish(error: error, cancelTask: false)
-            }
+        isRunning = true
+
+        do {
+            try await relay()
+            await finish(error: nil)
+        } catch {
+            await finish(error: error)
         }
-        self.task = task
-        lock.unlock()
     }
 
-    func cancel() {
-        finish(error: CancellationError(), cancelTask: true)
+    func cancel() async {
+        await finish(error: CancellationError())
     }
 
-    private func run() async throws {
+    private func relay() async throws {
         let target = try SOCKSEndpoint(
-            endpoint: flow.remoteEndpoint,
-            preferredHostname: flow.remoteHostname
+            endpoint: flow.value.remoteFlowEndpoint,
+            preferredHostname: flow.value.remoteHostname
         )
         let socksConnection = try SOCKSConnection(
             host: configuration.socksHost,
@@ -64,141 +48,162 @@ final class TCPFlowBridge: FlowBridge {
             parameters: .tcp,
             queue: queue
         )
-        try retain(socksConnection)
+        self.socksConnection = socksConnection
+        try Task.checkCancellation()
         try await socksConnection.start()
         try await socksConnection.authenticate(configuration: configuration)
         try await socksConnection.connect(to: target)
-        try await flow.openAsync()
+        try await openFlow()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { [flow] in
-                while true {
-                    try Task.checkCancellation()
-                    let data = try await flow.readDataAsync()
-                    if data.isEmpty {
-                        try await socksConnection.send(Data(), isComplete: true)
-                        return
-                    }
-                    try await socksConnection.send(data)
-                }
+            group.addTask { [self, socksConnection] in
+                try await relayApplicationToProxy(socksConnection)
             }
-            group.addTask { [flow] in
-                while true {
-                    try Task.checkCancellation()
-                    let (data, isComplete) = try await socksConnection.receive()
-                    if data.isEmpty == false {
-                        try await flow.writeDataAsync(data)
-                    }
-                    if isComplete {
-                        flow.closeWriteWithError(nil)
-                        return
-                    }
-                }
+            group.addTask { [self, socksConnection] in
+                try await relayProxyToApplication(socksConnection)
             }
             do {
                 try await group.waitForAll()
             } catch {
                 group.cancelAll()
-                socksConnection.cancel()
-                let flowError = appProxyFlowError(from: error)
-                flow.closeReadWithError(flowError)
-                flow.closeWriteWithError(flowError)
+                await socksConnection.cancel()
+                closeFlow(error: error)
                 throw error
             }
         }
     }
 
-    private func retain(_ connection: SOCKSConnection) throws {
-        lock.lock()
-        guard isFinished == false else {
-            lock.unlock()
-            connection.cancel()
-            throw CancellationError()
+    private func relayApplicationToProxy(_ socksConnection: SOCKSConnection) async throws {
+        while true {
+            try Task.checkCancellation()
+            let data = try await readFlowData()
+            if data.isEmpty {
+                try await socksConnection.send(Data(), isComplete: true)
+                return
+            }
+            try await socksConnection.send(data)
         }
-        socksConnection = connection
-        lock.unlock()
     }
 
-    private func finish(error: Error?, cancelTask: Bool) {
-        lock.lock()
+    private func relayProxyToApplication(_ socksConnection: SOCKSConnection) async throws {
+        while true {
+            try Task.checkCancellation()
+            let (data, isComplete) = try await socksConnection.receiveStream()
+            if data.isEmpty == false {
+                try await writeFlowData(data)
+            }
+            if isComplete {
+                flow.value.closeWriteWithError(nil)
+                return
+            }
+        }
+    }
+
+    private func finish(error: Error?) async {
         guard isFinished == false else {
-            lock.unlock()
             return
         }
         isFinished = true
-        let activeTask = task
         let activeConnection = socksConnection
-        task = nil
         socksConnection = nil
-        lock.unlock()
-
-        if cancelTask {
-            activeTask?.cancel()
+        if let activeConnection {
+            await activeConnection.cancel()
         }
-        activeConnection?.cancel()
+        closeFlow(error: error)
+    }
+
+    private func closeFlow(error: Error?) {
         let flowError = appProxyFlowError(from: error)
-        flow.closeReadWithError(flowError)
-        flow.closeWriteWithError(flowError)
-        completion()
+        flow.value.closeReadWithError(flowError)
+        flow.value.closeWriteWithError(flowError)
+    }
+
+    private func openFlow() async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            flow.value.open(withLocalFlowEndpoint: nil) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    private func readFlowData() async throws -> Data {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Data, Error>) in
+            flow.value.readData { data, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: data ?? Data())
+                }
+            }
+        }
+    }
+
+    private func writeFlowData(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            flow.value.write(data) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
     }
 }
 
-final class UDPFlowBridge: FlowBridge {
-    private let flow: NEAppProxyUDPFlow
+actor UDPFlowBridge: FlowBridge {
+    private let flow: ThreadSafeAppProxyFlow<NEAppProxyUDPFlow>
     private let configuration: ProxyConfiguration
     private let queue: DispatchQueue
-    private let completion: () -> Void
-    private let lock = NSLock()
-    private var task: Task<Void, Never>?
     private var controlConnection: SOCKSConnection?
     private var datagramConnection: SOCKSConnection?
+    private var isRunning = false
     private var isFinished = false
 
     init(
-        flow: NEAppProxyUDPFlow,
+        flow: ThreadSafeAppProxyFlow<NEAppProxyUDPFlow>,
         configuration: ProxyConfiguration,
-        queue: DispatchQueue,
-        completion: @escaping () -> Void
+        queue: DispatchQueue
     ) {
         self.flow = flow
         self.configuration = configuration
         self.queue = queue
-        self.completion = completion
     }
 
-    func start() {
-        lock.lock()
-        guard isFinished == false, task == nil else {
-            lock.unlock()
+    func run() async {
+        guard isRunning == false, isFinished == false else {
             return
         }
-        let task = Task { [weak self] in
-            guard let self else {
-                return
-            }
-            do {
-                try await run()
-                finish(error: nil, cancelTask: false)
-            } catch {
-                finish(error: error, cancelTask: false)
-            }
+        isRunning = true
+
+        do {
+            try await relay()
+            await finish(error: nil)
+        } catch {
+            await finish(error: error)
         }
-        self.task = task
-        lock.unlock()
     }
 
-    func cancel() {
-        finish(error: CancellationError(), cancelTask: true)
+    func cancel() async {
+        await finish(error: CancellationError())
     }
 
-    private func run() async throws {
+    private func relay() async throws {
         let controlConnection = try SOCKSConnection(
             host: configuration.socksHost,
             port: configuration.socksPort,
             parameters: .tcp,
             queue: queue
         )
-        try retainControlConnection(controlConnection)
+        self.controlConnection = controlConnection
+        try Task.checkCancellation()
         try await controlConnection.start()
         try await controlConnection.authenticate(configuration: configuration)
         var relay = try await controlConnection.associateUDP()
@@ -212,35 +217,20 @@ final class UDPFlowBridge: FlowBridge {
             parameters: .udp,
             queue: queue
         )
-        try retainDatagramConnection(datagramConnection)
+        self.datagramConnection = datagramConnection
+        try Task.checkCancellation()
         try await datagramConnection.start()
-        try await flow.openAsync()
+        try await openFlow()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { [flow] in
-                while true {
-                    try Task.checkCancellation()
-                    let (datagrams, endpoints) = try await flow.readDatagramsAsync()
-                    for (datagram, endpoint) in zip(datagrams, endpoints) {
-                        let target = try SOCKSEndpoint(endpoint: endpoint)
-                        let packet = try SOCKSProtocol.encodeUDPDatagram(
-                            data: datagram,
-                            endpoint: target
-                        )
-                        try await datagramConnection.sendMessage(packet)
-                    }
-                }
+            group.addTask { [self, datagramConnection] in
+                try await relayApplicationToProxy(datagramConnection)
             }
-            group.addTask { [flow] in
-                while true {
-                    try Task.checkCancellation()
-                    let packet = try await datagramConnection.receiveMessage()
-                    let (datagram, source) = try SOCKSProtocol.decodeUDPDatagram(packet)
-                    try await flow.writeDatagramAsync(datagram, from: source.networkEndpoint)
-                }
+            group.addTask { [self, datagramConnection] in
+                try await relayProxyToApplication(datagramConnection)
             }
-            group.addTask {
-                let (data, _) = try await controlConnection.receive()
+            group.addTask { [controlConnection] in
+                let (data, _) = try await controlConnection.receiveStream()
                 if data.isEmpty == false {
                     throw SOCKSError.unexpectedControlData
                 }
@@ -250,61 +240,104 @@ final class UDPFlowBridge: FlowBridge {
                 try await group.waitForAll()
             } catch {
                 group.cancelAll()
-                controlConnection.cancel()
-                datagramConnection.cancel()
-                let flowError = appProxyFlowError(from: error)
-                flow.closeReadWithError(flowError)
-                flow.closeWriteWithError(flowError)
+                await controlConnection.cancel()
+                await datagramConnection.cancel()
+                closeFlow(error: error)
                 throw error
             }
         }
     }
 
-    private func retainControlConnection(_ connection: SOCKSConnection) throws {
-        lock.lock()
-        guard isFinished == false else {
-            lock.unlock()
-            connection.cancel()
-            throw CancellationError()
+    private func relayApplicationToProxy(_ datagramConnection: SOCKSConnection) async throws {
+        while true {
+            try Task.checkCancellation()
+            let datagrams = try await readFlowDatagrams()
+            for (datagram, target) in datagrams {
+                let packet = try SOCKSProtocol.encodeUDPDatagram(
+                    data: datagram,
+                    endpoint: target
+                )
+                try await datagramConnection.sendMessage(packet)
+            }
         }
-        controlConnection = connection
-        lock.unlock()
     }
 
-    private func retainDatagramConnection(_ connection: SOCKSConnection) throws {
-        lock.lock()
-        guard isFinished == false else {
-            lock.unlock()
-            connection.cancel()
-            throw CancellationError()
+    private func relayProxyToApplication(_ datagramConnection: SOCKSConnection) async throws {
+        while true {
+            try Task.checkCancellation()
+            let packet = try await datagramConnection.receiveMessage()
+            let (datagram, source) = try SOCKSProtocol.decodeUDPDatagram(packet)
+            try await writeFlowDatagram(datagram, from: source)
         }
-        datagramConnection = connection
-        lock.unlock()
     }
 
-    private func finish(error: Error?, cancelTask: Bool) {
-        lock.lock()
+    private func finish(error: Error?) async {
         guard isFinished == false else {
-            lock.unlock()
             return
         }
         isFinished = true
-        let activeTask = task
         let activeControlConnection = controlConnection
         let activeDatagramConnection = datagramConnection
-        task = nil
         controlConnection = nil
         datagramConnection = nil
-        lock.unlock()
-
-        if cancelTask {
-            activeTask?.cancel()
+        if let activeControlConnection {
+            await activeControlConnection.cancel()
         }
-        activeControlConnection?.cancel()
-        activeDatagramConnection?.cancel()
+        if let activeDatagramConnection {
+            await activeDatagramConnection.cancel()
+        }
+        closeFlow(error: error)
+    }
+
+    private func closeFlow(error: Error?) {
         let flowError = appProxyFlowError(from: error)
-        flow.closeReadWithError(flowError)
-        flow.closeWriteWithError(flowError)
-        completion()
+        flow.value.closeReadWithError(flowError)
+        flow.value.closeWriteWithError(flowError)
+    }
+
+    private func openFlow() async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            flow.value.open(withLocalFlowEndpoint: nil) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    private func readFlowDatagrams() async throws -> [(Data, SOCKSEndpoint)] {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[(Data, SOCKSEndpoint)], Error>) in
+            flow.value.readDatagrams { datagrams, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                do {
+                    let decoded = try validatedDatagramBatch(datagrams).map { datagram, endpoint in
+                        (datagram, try SOCKSEndpoint(endpoint: endpoint))
+                    }
+                    continuation.resume(returning: decoded)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func writeFlowDatagram(_ data: Data, from source: SOCKSEndpoint) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            flow.value.writeDatagrams([(data, source.networkEndpoint)]) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
     }
 }

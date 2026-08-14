@@ -10,11 +10,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::accept_async;
 
+use crate::network::NetworkTarget;
 use crate::platform::{ShellFamily, ShellLaunch};
 use crate::socks::{
     SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
     SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksAuthentication,
-    SocksTarget, negotiate_socks5_connect,
+    negotiate_socks5_connect,
 };
 use crate::websocket_to_io;
 
@@ -271,13 +272,7 @@ async fn negotiates_socks5_domain_connect_request() {
         .unwrap();
 
     let target = server_task.await.unwrap().unwrap();
-    assert_eq!(
-        target,
-        SocksTarget {
-            host: "example.com".to_string(),
-            port: 1080,
-        }
-    );
+    assert_eq!(target, NetworkTarget::new("example.com", 1080).unwrap());
 }
 
 #[tokio::test]

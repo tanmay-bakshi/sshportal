@@ -1,0 +1,15 @@
+advapi32.dll
+api-ms-win-core-synch-l1-2-0.dll
+bcrypt.dll
+bcryptprimitives.dll
+combase.dll
+crypt32.dll
+iphlpapi.dll
+kernel32.dll
+ntdll.dll
+ole32.dll
+oleaut32.dll
+rpcrt4.dll
+shell32.dll
+wintrust.dll
+ws2_32.dll

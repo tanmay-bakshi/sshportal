@@ -1,29 +1,36 @@
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::task::ready;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
-use futures_util::{Sink, StreamExt, stream::SplitStream};
+use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
 use hyper::Uri;
 use hyper::header::HeaderValue;
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use pin_project_lite::pin_project;
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::ServerName;
+use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    tungstenite::{Error as WebSocketError, Message, handshake::client::Response},
+    tungstenite::{
+        Error as WebSocketError, Message, handshake::client::Response, protocol::WebSocketConfig,
+    },
 };
 use tokio_util::io::StreamReader;
+use tokio_util::sync::PollSender;
+use tokio_util::task::AbortOnDropHandle;
 use url::Url;
 
-use crate::{DEFAULT_CONNECT_PATH, debug::debug_log};
+use crate::DEFAULT_CONNECT_PATH;
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send {}
 
@@ -36,6 +43,27 @@ impl<T> WebSocketClientTransport for T where T: AsyncRead + AsyncWrite + Send + 
 pub type ClientWebSocketStream = WebSocketStream<MaybeTlsStream<Box<dyn WebSocketClientTransport>>>;
 
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 8192;
+const MAX_WEBSOCKET_IO_WRITE_BYTES: usize = 16 * 1024;
+const WEBSOCKET_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+const WEBSOCKET_WRITER_QUEUE_FRAMES: usize = WEBSOCKET_BUFFER_BYTES / MAX_WEBSOCKET_IO_WRITE_BYTES;
+
+#[derive(Clone, Copy)]
+struct WebSocketConnectTimeouts {
+    overall: Duration,
+    tcp: Duration,
+    proxy_tls: Duration,
+    proxy_tunnel: Duration,
+    websocket: Duration,
+}
+
+const WEBSOCKET_CONNECT_TIMEOUTS: WebSocketConnectTimeouts = WebSocketConnectTimeouts {
+    overall: Duration::from_secs(45),
+    tcp: Duration::from_secs(15),
+    proxy_tls: Duration::from_secs(15),
+    proxy_tunnel: Duration::from_secs(15),
+    websocket: Duration::from_secs(20),
+};
 
 pin_project! {
     struct DuplexIo<R, W> {
@@ -46,12 +74,30 @@ pin_project! {
     }
 }
 
-pin_project! {
-    struct WebSocketWriter<W> {
-        #[pin]
-        sink: W,
-        pending_write_len: Option<usize>,
-    }
+enum WebSocketWriteCommand {
+    Data(Bytes),
+    Flush(oneshot::Sender<()>),
+    Shutdown,
+}
+
+enum WebSocketWriterState {
+    Open,
+    Flushing(oneshot::Receiver<()>),
+    ReservingShutdown,
+    ShuttingDown,
+    Closed,
+    Failed(StoredIoError),
+}
+
+struct StoredIoError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+struct WebSocketWriter {
+    commands: PollSender<WebSocketWriteCommand>,
+    state: WebSocketWriterState,
+    pump: Option<AbortOnDropHandle<io::Result<()>>>,
 }
 
 impl<R, W> AsyncRead for DuplexIo<R, W>
@@ -88,72 +134,265 @@ where
     }
 }
 
-impl<W> AsyncWrite for WebSocketWriter<W>
-where
-    W: Sink<Message, Error = WebSocketError>,
-{
+impl AsyncWrite for WebSocketWriter {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut this = self.project();
-        if let Some(bytes_written) = *this.pending_write_len {
-            return match this.sink.as_mut().poll_flush(cx) {
-                Poll::Ready(Ok(())) => {
-                    *this.pending_write_len = None;
-                    Poll::Ready(Ok(bytes_written))
-                }
-                Poll::Ready(Err(error)) => {
-                    *this.pending_write_len = None;
-                    Poll::Ready(Err(map_websocket_error(error)))
-                }
-                Poll::Pending => Poll::Pending,
-            };
+        let this = &mut *self;
+        if matches!(this.state, WebSocketWriterState::Flushing(_)) {
+            match this.poll_flush_barrier(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        match &this.state {
+            WebSocketWriterState::Open => {}
+            WebSocketWriterState::ReservingShutdown
+            | WebSocketWriterState::ShuttingDown
+            | WebSocketWriterState::Closed => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "websocket writer is shut down",
+                )));
+            }
+            WebSocketWriterState::Failed(error) => {
+                return Poll::Ready(Err(error.to_io_error()));
+            }
+            WebSocketWriterState::Flushing(_) => {
+                unreachable!("the flush barrier was completed before writing")
+            }
         }
 
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        ready!(
-            this.sink
-                .as_mut()
-                .poll_ready(cx)
-                .map_err(map_websocket_error)
-        )?;
-        this.sink
-            .as_mut()
-            .start_send(Message::Binary(Bytes::copy_from_slice(buf)))
-            .map_err(map_websocket_error)?;
-        *this.pending_write_len = Some(buf.len());
-        match this.sink.as_mut().poll_flush(cx) {
+        match this.commands.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(_)) => return this.poll_closed_channel_for_write(cx),
+            Poll::Pending => return Poll::Pending,
+        }
+        let write_len = buf.len().min(MAX_WEBSOCKET_IO_WRITE_BYTES);
+        if this
+            .commands
+            .send_item(WebSocketWriteCommand::Data(Bytes::copy_from_slice(
+                &buf[..write_len],
+            )))
+            .is_err()
+        {
+            return this.poll_closed_channel_for_write(cx);
+        }
+        Poll::Ready(Ok(write_len))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush_inner(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown_inner(cx)
+    }
+}
+
+impl StoredIoError {
+    fn new(error: io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+impl WebSocketWriter {
+    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match self.state {
+                WebSocketWriterState::Open => {
+                    match self.commands.poll_reserve(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(_)) => return self.poll_closed_channel(cx),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                    let (completed, completion) = oneshot::channel();
+                    if self
+                        .commands
+                        .send_item(WebSocketWriteCommand::Flush(completed))
+                        .is_err()
+                    {
+                        return self.poll_closed_channel(cx);
+                    }
+                    self.state = WebSocketWriterState::Flushing(completion);
+                }
+                WebSocketWriterState::Flushing(_) => return self.poll_flush_barrier(cx),
+                WebSocketWriterState::ReservingShutdown | WebSocketWriterState::ShuttingDown => {
+                    return self.poll_shutdown_inner(cx);
+                }
+                WebSocketWriterState::Closed => return Poll::Ready(Ok(())),
+                WebSocketWriterState::Failed(ref error) => {
+                    return Poll::Ready(Err(error.to_io_error()));
+                }
+            }
+        }
+    }
+
+    fn poll_flush_barrier(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let WebSocketWriterState::Flushing(completion) = &mut self.state else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(completion).poll(cx) {
             Poll::Ready(Ok(())) => {
-                *this.pending_write_len = None;
-                Poll::Ready(Ok(buf.len()))
+                self.state = WebSocketWriterState::Open;
+                Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(error)) => {
-                *this.pending_write_len = None;
-                Poll::Ready(Err(map_websocket_error(error)))
-            }
+            Poll::Ready(Err(_)) => self.poll_closed_channel(cx),
             Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project()
-            .sink
-            .poll_flush(cx)
-            .map_err(map_websocket_error)
+    fn poll_shutdown_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match self.state {
+                WebSocketWriterState::Open => {
+                    self.state = WebSocketWriterState::ReservingShutdown;
+                }
+                WebSocketWriterState::Flushing(_) => match self.poll_flush_barrier(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    result => return result,
+                },
+                WebSocketWriterState::ReservingShutdown => {
+                    match self.commands.poll_reserve(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(_)) => return self.poll_closed_channel(cx),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                    if self
+                        .commands
+                        .send_item(WebSocketWriteCommand::Shutdown)
+                        .is_err()
+                    {
+                        return self.poll_closed_channel(cx);
+                    }
+                    self.commands.close();
+                    self.state = WebSocketWriterState::ShuttingDown;
+                }
+                WebSocketWriterState::ShuttingDown => return self.poll_pump_completion(cx),
+                WebSocketWriterState::Closed => return Poll::Ready(Ok(())),
+                WebSocketWriterState::Failed(ref error) => {
+                    return Poll::Ready(Err(error.to_io_error()));
+                }
+            }
+        }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project()
-            .sink
-            .as_mut()
-            .poll_close(cx)
-            .map_err(map_websocket_error)
+    fn poll_closed_channel(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.poll_pump_completion(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "websocket writer pump stopped unexpectedly",
+            ))),
+            result => result,
+        }
     }
+
+    fn poll_closed_channel_for_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        match self.poll_closed_channel(cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                unreachable!("a closed writer channel always reports an I/O error")
+            }
+        }
+    }
+
+    fn poll_pump_completion(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let WebSocketWriterState::Failed(error) = &self.state {
+            return Poll::Ready(Err(error.to_io_error()));
+        }
+        if matches!(self.state, WebSocketWriterState::Closed) {
+            return Poll::Ready(Ok(()));
+        }
+        let Some(pump) = &mut self.pump else {
+            return Poll::Pending;
+        };
+        let result = match Pin::new(pump).poll(cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => return Poll::Pending,
+        };
+        self.pump = None;
+        match result {
+            Ok(Ok(())) => {
+                self.state = WebSocketWriterState::Closed;
+                Poll::Ready(Ok(()))
+            }
+            Ok(Err(error)) => Poll::Ready(Err(self.fail(error))),
+            Err(error) => Poll::Ready(Err(self.fail(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("websocket writer pump failed to join: {error}"),
+            )))),
+        }
+    }
+
+    fn fail(&mut self, error: io::Error) -> io::Error {
+        let error = StoredIoError::new(error);
+        let result = error.to_io_error();
+        self.state = WebSocketWriterState::Failed(error);
+        result
+    }
+}
+
+fn start_websocket_writer<W>(sink: W) -> WebSocketWriter
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin + Send + 'static,
+{
+    start_websocket_writer_with_capacity(sink, WEBSOCKET_WRITER_QUEUE_FRAMES)
+}
+
+fn start_websocket_writer_with_capacity<W>(sink: W, capacity: usize) -> WebSocketWriter
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin + Send + 'static,
+{
+    let (commands, receiver) = mpsc::channel(capacity);
+    // A write is acknowledged only after the bounded channel owns its bytes, and
+    // this handle prevents the sink-driving task from outliving the adapter.
+    let pump = AbortOnDropHandle::new(tokio::spawn(run_websocket_writer(sink, receiver)));
+    WebSocketWriter {
+        commands: PollSender::new(commands),
+        state: WebSocketWriterState::Open,
+        pump: Some(pump),
+    }
+}
+
+async fn run_websocket_writer<W>(
+    mut sink: W,
+    mut commands: mpsc::Receiver<WebSocketWriteCommand>,
+) -> io::Result<()>
+where
+    W: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    while let Some(command) = commands.recv().await {
+        match command {
+            WebSocketWriteCommand::Data(data) => sink
+                .send(Message::Binary(data))
+                .await
+                .map_err(map_websocket_error)?,
+            WebSocketWriteCommand::Flush(completed) => {
+                sink.flush().await.map_err(map_websocket_error)?;
+                let _ = completed.send(());
+            }
+            WebSocketWriteCommand::Shutdown => {
+                sink.close().await.map_err(map_websocket_error)?;
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn connect_async_with_env_proxy(url: &Url) -> Result<(ClientWebSocketStream, Response)> {
@@ -169,10 +408,7 @@ where
     let (sink, stream) = websocket.split();
     Box::pin(DuplexIo {
         reader: StreamReader::new(websocket_reader(stream)),
-        writer: WebSocketWriter {
-            sink,
-            pending_write_len: None,
-        },
+        writer: start_websocket_writer(sink),
     })
 }
 
@@ -187,7 +423,7 @@ where
             Ok(Message::Binary(bytes)) => Some(Ok(bytes)),
             Ok(Message::Text(_)) => Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "received a websocket text frame during SSH transport",
+                "received a websocket text frame during binary transport",
             ))),
             Ok(Message::Close(_)) => None,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => None,
@@ -207,21 +443,44 @@ async fn connect_async_with_proxy_matcher(
     url: &Url,
     matcher: &Matcher,
 ) -> Result<(ClientWebSocketStream, Response)> {
+    connect_async_with_proxy_matcher_and_timeouts(url, matcher, WEBSOCKET_CONNECT_TIMEOUTS).await
+}
+
+async fn connect_async_with_proxy_matcher_and_timeouts(
+    url: &Url,
+    matcher: &Matcher,
+    timeouts: WebSocketConnectTimeouts,
+) -> Result<(ClientWebSocketStream, Response)> {
+    let overall_deadline = Instant::now() + timeouts.overall;
     let maybe_proxy = selected_proxy_for_websocket_url(matcher, url)?;
     let stream = match maybe_proxy {
-        Some(proxy) => connect_via_proxy(url, &proxy).await?,
-        None => connect_direct(url).await?,
+        Some(proxy) => connect_via_proxy(url, &proxy, overall_deadline, timeouts).await?,
+        None => connect_direct(url, overall_deadline, timeouts).await?,
     };
 
     let connector = match url.scheme() {
-        "wss" => Some(Connector::Rustls(tls_client_config())),
+        "wss" => Some(Connector::Rustls(tls_client_config()?)),
         "ws" => None,
         unsupported => bail!("unsupported websocket URL scheme `{unsupported}`"),
     };
 
-    client_async_tls_with_config(url.as_str(), stream, None, connector)
-        .await
-        .context("failed to complete websocket handshake")
+    run_connect_phase(
+        overall_deadline,
+        timeouts.websocket,
+        "websocket handshake",
+        client_async_tls_with_config(url.as_str(), stream, Some(websocket_config()), connector),
+    )
+    .await?
+    .context("failed to complete websocket handshake")
+}
+
+pub fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(WEBSOCKET_BUFFER_BYTES)
+        .write_buffer_size(WEBSOCKET_BUFFER_BYTES)
+        .max_write_buffer_size(MAX_WEBSOCKET_WRITE_BUFFER_BYTES)
+        .max_message_size(Some(WEBSOCKET_BUFFER_BYTES))
+        .max_frame_size(Some(WEBSOCKET_BUFFER_BYTES))
 }
 
 fn selected_proxy_for_websocket_url(matcher: &Matcher, url: &Url) -> Result<Option<Intercept>> {
@@ -253,21 +512,49 @@ fn websocket_destination_uri(url: &Url) -> Result<Uri> {
         .with_context(|| format!("failed to build proxy destination URI from `{destination_url}`"))
 }
 
-async fn connect_direct(url: &Url) -> Result<Box<dyn WebSocketClientTransport>> {
+async fn connect_direct(
+    url: &Url,
+    overall_deadline: Instant,
+    timeouts: WebSocketConnectTimeouts,
+) -> Result<Box<dyn WebSocketClientTransport>> {
     let (host, port) = destination_host_and_port(url)?;
-    let socket = open_tcp_stream(&host, port, "sshportal server").await?;
+    let socket = open_tcp_stream(
+        &host,
+        port,
+        "sshportal server",
+        overall_deadline,
+        timeouts.tcp,
+    )
+    .await?;
     Ok(Box::new(socket))
 }
 
 async fn connect_via_proxy(
     url: &Url,
     proxy: &Intercept,
+    overall_deadline: Instant,
+    timeouts: WebSocketConnectTimeouts,
 ) -> Result<Box<dyn WebSocketClientTransport>> {
     let (proxy_host, proxy_port, proxy_scheme) = proxy_endpoint(proxy)?;
-    let proxy_socket = open_tcp_stream(&proxy_host, proxy_port, "HTTP proxy").await?;
+    let proxy_socket = open_tcp_stream(
+        &proxy_host,
+        proxy_port,
+        "HTTP proxy",
+        overall_deadline,
+        timeouts.tcp,
+    )
+    .await?;
     let mut proxy_stream: Box<dyn WebSocketClientTransport> = match proxy_scheme.as_str() {
         "http" => Box::new(proxy_socket),
-        "https" => Box::new(connect_to_https_proxy(proxy_socket, &proxy_host).await?),
+        "https" => Box::new(
+            run_connect_phase(
+                overall_deadline,
+                timeouts.proxy_tls,
+                "HTTPS proxy TLS handshake",
+                connect_to_https_proxy(proxy_socket, &proxy_host),
+            )
+            .await??,
+        ),
         unsupported => {
             bail!(
                 "unsupported proxy scheme `{unsupported}`; only http:// and https:// proxies are supported"
@@ -276,13 +563,18 @@ async fn connect_via_proxy(
     };
 
     let (destination_host, destination_port) = destination_host_and_port(url)?;
-    establish_connect_tunnel(
-        proxy_stream.as_mut(),
-        &destination_host,
-        destination_port,
-        proxy.basic_auth(),
+    run_connect_phase(
+        overall_deadline,
+        timeouts.proxy_tunnel,
+        "HTTP proxy CONNECT handshake",
+        establish_connect_tunnel(
+            proxy_stream.as_mut(),
+            &destination_host,
+            destination_port,
+            proxy.basic_auth(),
+        ),
     )
-    .await?;
+    .await??;
 
     Ok(proxy_stream)
 }
@@ -322,15 +614,41 @@ fn proxy_endpoint(proxy: &Intercept) -> Result<(String, u16, String)> {
     Ok((proxy_host, proxy_port, proxy_scheme))
 }
 
-async fn open_tcp_stream(host: &str, port: u16, description: &str) -> Result<TcpStream> {
+async fn open_tcp_stream(
+    host: &str,
+    port: u16,
+    description: &str,
+    overall_deadline: Instant,
+    timeout: Duration,
+) -> Result<TcpStream> {
     let authority = format_authority(host, port);
-    let socket = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("failed to connect to {description} at {authority}"))?;
+    let socket = run_connect_phase(
+        overall_deadline,
+        timeout,
+        &format!("TCP connection to {description}"),
+        TcpStream::connect((host, port)),
+    )
+    .await?
+    .with_context(|| format!("failed to connect to {description} at {authority}"))?;
     socket.set_nodelay(true).with_context(|| {
         format!("failed to enable TCP_NODELAY for {description} at {authority}")
     })?;
     Ok(socket)
+}
+
+async fn run_connect_phase<F, T>(
+    overall_deadline: Instant,
+    phase_timeout: Duration,
+    description: &str,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+{
+    let phase_deadline = overall_deadline.min(Instant::now() + phase_timeout);
+    tokio::time::timeout_at(phase_deadline, future)
+        .await
+        .with_context(|| format!("{description} timed out"))
 }
 
 async fn connect_to_https_proxy(
@@ -339,57 +657,28 @@ async fn connect_to_https_proxy(
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let server_name = ServerName::try_from(proxy_host.to_string())
         .map_err(|_| anyhow!("proxy host `{proxy_host}` is not a valid TLS server name"))?;
-    let connector = TlsConnector::from(tls_client_config());
+    let connector = TlsConnector::from(tls_client_config()?);
     connector
         .connect(server_name, socket)
         .await
         .with_context(|| format!("failed to negotiate TLS with HTTPS proxy `{proxy_host}`"))
 }
 
-fn tls_client_config() -> Arc<rustls::ClientConfig> {
+fn tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
     static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
-    Arc::clone(TLS_CLIENT_CONFIG.get_or_init(|| {
-        crate::install_default_rustls_crypto_provider();
-        let rustls_native_certs::CertificateResult {
-            certs,
-            errors,
-            ..
-        } = rustls_native_certs::load_native_certs();
-        if !errors.is_empty() {
-            debug_log(format!(
-                "native root CA certificate loading errors: {errors:?}"
-            ));
-        }
+    if let Some(config) = TLS_CLIENT_CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
 
-        let native_certificate_count = certs.len();
-        let (root_store, native_certificates_added, native_certificates_ignored) =
-            build_tls_root_store(certs);
-        debug_log(format!(
-            "loaded {native_certificates_added}/{native_certificate_count} native root CA certificates (ignored {native_certificates_ignored}); using {} bundled roots",
-            webpki_roots::TLS_SERVER_ROOTS.len()
-        ));
-
-        Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        )
-    }))
-}
-
-fn build_tls_root_store(
-    native_certificates: Vec<CertificateDer<'static>>,
-) -> (RootCertStore, usize, usize) {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let (native_certificates_added, native_certificates_ignored) =
-        root_store.add_parsable_certificates(native_certificates);
-    (
-        root_store,
-        native_certificates_added,
-        native_certificates_ignored,
-    )
+    crate::install_default_rustls_crypto_provider();
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_platform_verifier()
+            .context("failed to initialize platform TLS certificate verification")?
+            .with_no_client_auth(),
+    );
+    Ok(Arc::clone(TLS_CLIENT_CONFIG.get_or_init(|| config)))
 }
 
 async fn establish_connect_tunnel(
@@ -434,7 +723,12 @@ async fn read_proxy_response_headers(stream: &mut dyn WebSocketClientTransport) 
         }
 
         response.extend_from_slice(&chunk[..bytes_read]);
-        if has_header_terminator(&response) {
+        if let Some(header_end) = header_terminator_offset(&response) {
+            if header_end + 4 > MAX_PROXY_RESPONSE_HEADER_BYTES {
+                bail!(
+                    "proxy CONNECT response headers exceeded {MAX_PROXY_RESPONSE_HEADER_BYTES} bytes"
+                );
+            }
             return Ok(response);
         }
         if response.len() >= MAX_PROXY_RESPONSE_HEADER_BYTES {
@@ -449,27 +743,34 @@ fn validate_connect_response(response: &[u8]) -> Result<()> {
     let Some(header_end) = header_terminator_offset(response) else {
         bail!("proxy CONNECT response was truncated");
     };
-    let response_text = std::str::from_utf8(&response[..header_end])
-        .context("proxy CONNECT response headers were not valid UTF-8")?;
-    let status_line = response_text
-        .lines()
+    let status_line_end = response[..header_end]
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .unwrap_or(header_end);
+    let status_line = std::str::from_utf8(&response[..status_line_end])
+        .context("proxy CONNECT status line was not valid ASCII text")?;
+    let mut fields = status_line.splitn(3, ' ');
+    let version = fields
         .next()
         .ok_or_else(|| anyhow!("proxy CONNECT response was empty"))?;
-    if status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200") {
+    let status = fields
+        .next()
+        .filter(|status| status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| anyhow!("proxy CONNECT response had an invalid status line"))?;
+    if fields.next().is_none() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        bail!("proxy CONNECT response had an invalid status line");
+    }
+    if status == "200" {
         return Ok(());
     }
-    if status_line.starts_with("HTTP/1.1 407") || status_line.starts_with("HTTP/1.0 407") {
+    if status == "407" {
         bail!("proxy authentication was rejected");
     }
-    bail!("proxy CONNECT failed: {status_line}");
+    bail!("proxy CONNECT failed with HTTP status {status}");
 }
 
 fn header_terminator_offset(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn has_header_terminator(bytes: &[u8]) -> bool {
-    header_terminator_offset(bytes).is_some()
 }
 
 fn format_authority(host: &str, port: u16) -> String {
@@ -505,40 +806,75 @@ pub fn normalize_websocket_url(raw_server: &str) -> anyhow::Result<Url> {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::{Sink, task::noop_waker};
+    use futures_util::Sink;
     use hyper_util::client::proxy::matcher::Matcher;
-    use rustls::pki_types::{CertificateDer, pem::PemObject};
     use std::io;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
     use super::{
-        WebSocketWriter, build_tls_root_store, connect_async_with_proxy_matcher,
-        normalize_websocket_url, selected_proxy_for_websocket_url,
+        WebSocketConnectTimeouts, connect_async_with_proxy_matcher,
+        connect_async_with_proxy_matcher_and_timeouts, normalize_websocket_url,
+        selected_proxy_for_websocket_url, start_websocket_writer_with_capacity, tls_client_config,
+        validate_connect_response,
     };
 
-    const TEST_NATIVE_ROOT_CERTIFICATE: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIBazCCAR2gAwIBAgIUIl6xecIvHza8CC6c3b5ZUbfFE7swBQYDK2VwMCsxKTAn
-BgNVBAMMIHNzaHBvcnRhbCBuYXRpdmUgcm9vdCBtZXJnZSB0ZXN0MB4XDTI2MDgx
-MjE2MzcxNloXDTM2MDgwOTE2MzcxNlowKzEpMCcGA1UEAwwgc3NocG9ydGFsIG5h
-dGl2ZSByb290IG1lcmdlIHRlc3QwKjAFBgMrZXADIQA8KF+Gcy+GqUpfeWjDB9D1
-hTm7PJtaT34dc/i+5F1kN6NTMFEwHQYDVR0OBBYEFHdP8oekGiEMC7BfrsMRaWk7
-ZKhZMB8GA1UdIwQYMBaAFHdP8oekGiEMC7BfrsMRaWk7ZKhZMA8GA1UdEwEB/wQF
-MAMBAf8wBQYDK2VwA0EAciJzM+9N5X1Jp3zVnaD3eBnAp7d2Yv4KrjE0eSICEQ2d
-Yj+p86hqrfFe/aJy8QnX+6Uy5sEBgCQI9BDEOJ8yDw==
------END CERTIFICATE-----"#;
-
-    struct RecordingPendingFlushSink {
-        frames: Arc<Mutex<Vec<Vec<u8>>>>,
-        pending_flushes: Arc<Mutex<usize>>,
+    struct FlushRecordingSink {
+        pending: Option<bytes::Bytes>,
+        delivered: mpsc::UnboundedSender<bytes::Bytes>,
     }
 
-    impl Sink<Message> for RecordingPendingFlushSink {
+    impl Sink<Message> for FlushRecordingSink {
+        type Error = WebSocketError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            assert!(self.pending.is_none());
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            if let Message::Binary(bytes) = item {
+                self.pending = Some(bytes);
+            }
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if let Some(frame) = self.pending.take() {
+                let _ = self.delivered.send(frame);
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.as_mut().poll_flush(cx)
+        }
+    }
+
+    struct GatedFlushSink {
+        observed: mpsc::UnboundedSender<bytes::Bytes>,
+        flush_allowed: Arc<AtomicBool>,
+        flush_waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl Sink<Message> for GatedFlushSink {
         type Error = WebSocketError;
 
         fn poll_ready(
@@ -550,28 +886,21 @@ Yj+p86hqrfFe/aJy8QnX+6Uy5sEBgCQI9BDEOJ8yDw==
 
         fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
             if let Message::Binary(bytes) = item {
-                self.frames.lock().unwrap().push(bytes.to_vec());
+                let _ = self.observed.send(bytes);
             }
             Ok(())
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            let mut pending_flushes = self.pending_flushes.lock().unwrap();
-            if *pending_flushes == 0 {
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            if self.flush_allowed.load(Ordering::SeqCst) {
                 return Poll::Ready(Ok(()));
             }
-            *pending_flushes -= 1;
+            *self.flush_waker.lock().unwrap() = Some(cx.waker().clone());
             Poll::Pending
         }
 
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.poll_flush(cx)
         }
     }
 
@@ -609,62 +938,153 @@ Yj+p86hqrfFe/aJy8QnX+6Uy5sEBgCQI9BDEOJ8yDw==
     }
 
     #[test]
-    fn retains_bundled_roots_when_no_native_roots_are_available() {
-        let (root_store, native_certificates_added, native_certificates_ignored) =
-            build_tls_root_store(Vec::new());
+    fn platform_tls_configuration_initializes_once() {
+        let first = tls_client_config().unwrap();
+        let second = tls_client_config().unwrap();
 
-        assert_eq!(root_store.len(), webpki_roots::TLS_SERVER_ROOTS.len());
-        assert_eq!(native_certificates_added, 0);
-        assert_eq!(native_certificates_ignored, 0);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
-    fn merges_parsable_native_roots_and_ignores_malformed_ones() {
-        let native_root = CertificateDer::from_pem_slice(TEST_NATIVE_ROOT_CERTIFICATE).unwrap();
-        let malformed_root = CertificateDer::from(vec![0_u8]);
-        let bundled_root_count = webpki_roots::TLS_SERVER_ROOTS.len();
+    fn proxy_connect_status_requires_an_exact_http_status_token() {
+        validate_connect_response(b"HTTP/1.1 200 Connection Established\r\nHeader: value\r\n\r\n")
+            .unwrap();
+        validate_connect_response(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
 
-        let (root_store, native_certificates_added, native_certificates_ignored) =
-            build_tls_root_store(vec![native_root, malformed_root]);
-
-        assert_eq!(root_store.len(), bundled_root_count + 1);
-        assert_eq!(native_certificates_added, 1);
-        assert_eq!(native_certificates_ignored, 1);
-    }
-
-    #[test]
-    fn websocket_writer_waits_for_flush_before_reporting_writes() {
-        let frames = Arc::new(Mutex::new(Vec::new()));
-        let pending_flushes = Arc::new(Mutex::new(1));
-        let sink = RecordingPendingFlushSink {
-            frames: Arc::clone(&frames),
-            pending_flushes,
-        };
-        let mut writer = WebSocketWriter {
-            sink,
-            pending_write_len: None,
-        };
-        let waker = noop_waker();
-        let mut context = Context::from_waker(&waker);
-
-        assert!(matches!(
-            Pin::new(&mut writer).poll_write(&mut context, b"first"),
-            Poll::Pending
-        ));
-        assert_eq!(*frames.lock().unwrap(), vec![b"first".to_vec()]);
-        assert!(matches!(
-            Pin::new(&mut writer).poll_write(&mut context, b"first"),
-            Poll::Ready(Ok(5))
-        ));
-        assert!(matches!(
-            Pin::new(&mut writer).poll_write(&mut context, b"second"),
-            Poll::Ready(Ok(6))
-        ));
-
-        assert_eq!(
-            *frames.lock().unwrap(),
-            vec![b"first".to_vec(), b"second".to_vec()]
+        for response in [
+            &b"HTTP/1.1 2000 Not A Status\r\n\r\n"[..],
+            &b"HTTP/1.1 200x Not A Status\r\n\r\n"[..],
+            &b"HTTP/2 200 Fine\r\n\r\n"[..],
+            &b"HTTP/1.1 200\r\n\r\n"[..],
+        ] {
+            assert!(validate_connect_response(response).is_err());
+        }
+        assert!(
+            validate_connect_response(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .unwrap_err()
+                .to_string()
+                .contains("authentication")
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_has_a_bounded_phase_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let url = normalize_websocket_url(&format!("ws://{address}")).unwrap();
+        let timeouts = WebSocketConnectTimeouts {
+            overall: Duration::from_secs(1),
+            tcp: Duration::from_secs(1),
+            proxy_tls: Duration::from_secs(1),
+            proxy_tunnel: Duration::from_secs(1),
+            websocket: Duration::from_millis(50),
+        };
+
+        let result = connect_async_with_proxy_matcher_and_timeouts(
+            &url,
+            &Matcher::builder().build(),
+            timeouts,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a stalled websocket handshake unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("websocket handshake timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_headers_have_a_bounded_phase_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_request_headers(&mut socket).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let matcher = Matcher::builder().http(format!("http://{address}")).build();
+        let url = normalize_websocket_url("ws://server.invalid").unwrap();
+        let timeouts = WebSocketConnectTimeouts {
+            overall: Duration::from_secs(1),
+            tcp: Duration::from_secs(1),
+            proxy_tls: Duration::from_secs(1),
+            proxy_tunnel: Duration::from_millis(50),
+            websocket: Duration::from_secs(1),
+        };
+
+        let result = connect_async_with_proxy_matcher_and_timeouts(&url, &matcher, timeouts).await;
+        let error = match result {
+            Ok(_) => panic!("a stalled proxy CONNECT handshake unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP proxy CONNECT handshake timed out")
+        );
+        proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_writer_delivers_without_a_caller_flush() {
+        let (delivered, mut deliveries) = mpsc::unbounded_channel();
+        let sink = FlushRecordingSink {
+            pending: None,
+            delivered,
+        };
+        let mut writer = start_websocket_writer_with_capacity(sink, 1);
+
+        writer
+            .write_all(b"SSH-2.0-identification\r\n")
+            .await
+            .unwrap();
+
+        let delivered = tokio::time::timeout(Duration::from_secs(1), deliveries.recv())
+            .await
+            .expect("the writer pump did not autonomously flush accepted bytes")
+            .unwrap();
+        assert_eq!(delivered, &b"SSH-2.0-identification\r\n"[..]);
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_backpressured_write_never_sends_its_buffer() {
+        let (observed, mut observations) = mpsc::unbounded_channel();
+        let flush_allowed = Arc::new(AtomicBool::new(false));
+        let flush_waker = Arc::new(Mutex::new(None));
+        let sink = GatedFlushSink {
+            observed,
+            flush_allowed: Arc::clone(&flush_allowed),
+            flush_waker: Arc::clone(&flush_waker),
+        };
+        let mut writer = start_websocket_writer_with_capacity(sink, 1);
+
+        writer.write_all(b"blocked-in-pump").await.unwrap();
+        assert_eq!(observations.recv().await.unwrap(), &b"blocked-in-pump"[..]);
+        writer.write_all(b"queued").await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), writer.write(b"cancelled"))
+                .await
+                .is_err()
+        );
+
+        flush_allowed.store(true, Ordering::SeqCst);
+        if let Some(waker) = flush_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        assert_eq!(observations.recv().await.unwrap(), &b"queued"[..]);
+
+        writer.write_all(b"survived").await.unwrap();
+        assert_eq!(observations.recv().await.unwrap(), &b"survived"[..]);
+        writer.flush().await.unwrap();
+        assert!(observations.try_recv().is_err());
+        writer.shutdown().await.unwrap();
     }
 
     #[tokio::test]

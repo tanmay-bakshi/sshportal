@@ -9,12 +9,13 @@ final class AppProxyProvider: NEAppProxyProvider {
     )
     private let networkQueue = DispatchQueue(label: "com.tanmaybakshi.sshportal.app-proxy")
     private let stateLock = NSLock()
-    private var configuration: ProxyConfiguration?
-    private var bridges: [UUID: FlowBridge] = [:]
+    private let bridgeRegistry = FlowBridgeRegistry()
+    private var activeSession: Session?
+    private var nextGeneration: UInt64 = 1
 
     override func startProxy(
         options: [String: Any]? = nil,
-        completionHandler: @escaping (Error?) -> Void
+        completionHandler: @escaping @Sendable (Error?) -> Void
     ) {
         do {
             guard let providerProtocol = protocolConfiguration as? NETunnelProviderProtocol else {
@@ -24,10 +25,22 @@ final class AppProxyProvider: NEAppProxyProvider {
                 providerConfiguration: providerProtocol.providerConfiguration
             )
             stateLock.lock()
-            self.configuration = configuration
+            guard activeSession == nil else {
+                stateLock.unlock()
+                throw AppProxyProviderError.alreadyRunning
+            }
+            let generation = nextGeneration
+            nextGeneration += 1
+            activeSession = Session(generation: generation, configuration: configuration)
             stateLock.unlock()
-            logger.log("SSHPortal per-app proxy started")
-            completionHandler(nil)
+            Task { [bridgeRegistry, logger] in
+                if await bridgeRegistry.start(generation: generation) {
+                    logger.log("SSHPortal per-app proxy started")
+                    completionHandler(nil)
+                } else {
+                    completionHandler(CancellationError())
+                }
+            }
         } catch {
             logger.error("Failed to start SSHPortal per-app proxy: \(error.localizedDescription, privacy: .public)")
             completionHandler(error)
@@ -36,66 +49,68 @@ final class AppProxyProvider: NEAppProxyProvider {
 
     override func stopProxy(
         with reason: NEProviderStopReason,
-        completionHandler: @escaping () -> Void
+        completionHandler: @escaping @Sendable () -> Void
     ) {
         stateLock.lock()
-        configuration = nil
-        let activeBridges = Array(bridges.values)
-        bridges.removeAll()
+        let generation = activeSession?.generation
+        activeSession = nil
         stateLock.unlock()
-        for bridge in activeBridges {
-            bridge.cancel()
+        guard let generation else {
+            completionHandler()
+            return
         }
-        logger.log("SSHPortal per-app proxy stopped with reason \(reason.rawValue)")
-        completionHandler()
+        Task { [bridgeRegistry, logger] in
+            await bridgeRegistry.stop(generation: generation)
+            logger.log("SSHPortal per-app proxy stopped with reason \(reason.rawValue)")
+            completionHandler()
+        }
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
         stateLock.lock()
-        guard let configuration else {
+        guard let activeSession else {
             stateLock.unlock()
             return false
         }
-        let identifier = UUID()
-        let completion: () -> Void = { [weak self] in
-            _ = self?.removeBridge(identifier)
-        }
-        let bridge: FlowBridge
+        stateLock.unlock()
+        let bridge: any FlowBridge
         if let tcpFlow = flow as? NEAppProxyTCPFlow {
             bridge = TCPFlowBridge(
-                flow: tcpFlow,
-                configuration: configuration,
-                queue: networkQueue,
-                completion: completion
+                flow: ThreadSafeAppProxyFlow(tcpFlow),
+                configuration: activeSession.configuration,
+                queue: networkQueue
             )
         } else if let udpFlow = flow as? NEAppProxyUDPFlow {
             bridge = UDPFlowBridge(
-                flow: udpFlow,
-                configuration: configuration,
-                queue: networkQueue,
-                completion: completion
+                flow: ThreadSafeAppProxyFlow(udpFlow),
+                configuration: activeSession.configuration,
+                queue: networkQueue
             )
         } else {
-            stateLock.unlock()
             return false
         }
-        bridges[identifier] = bridge
-        stateLock.unlock()
-        bridge.start()
+        Task { [bridgeRegistry] in
+            await bridgeRegistry.accept(bridge, generation: activeSession.generation)
+        }
         return true
     }
 
-    private func removeBridge(_ identifier: UUID) {
-        stateLock.lock()
-        bridges.removeValue(forKey: identifier)
-        stateLock.unlock()
+    private struct Session {
+        let generation: UInt64
+        let configuration: ProxyConfiguration
     }
 }
 
 enum AppProxyProviderError: LocalizedError {
     case missingProtocolConfiguration
+    case alreadyRunning
 
     var errorDescription: String? {
-        "The SSHPortal app proxy has no tunnel provider configuration."
+        switch self {
+        case .missingProtocolConfiguration:
+            return "The SSHPortal app proxy has no tunnel provider configuration."
+        case .alreadyRunning:
+            return "The SSHPortal app proxy is already running."
+        }
     }
 }

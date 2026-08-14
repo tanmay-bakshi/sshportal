@@ -6,7 +6,7 @@ enum SSHPortalIdentifiers {
     static let managerDescription = "SSHPortal Per-App VPN"
 }
 
-struct ProxyConfiguration {
+struct ProxyConfiguration: Sendable {
     private enum Key {
         static let socksHost = "socksHost"
         static let socksPort = "socksPort"

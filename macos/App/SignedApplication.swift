@@ -34,26 +34,34 @@ struct SignedApplication {
         var rawSigningInformation: CFDictionary?
         let informationStatus = SecCodeCopySigningInformation(
             staticCode,
-            SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSRequirementInformation),
+            SecCSFlags(rawValue: kSecCSSigningInformation),
             &rawSigningInformation
         )
         guard
             informationStatus == errSecSuccess,
             let signingInformation = rawSigningInformation as? [CFString: Any],
-            let signingIdentifier = signingInformation[kSecCodeInfoIdentifier] as? String,
-            let requirementValue = signingInformation[kSecCodeInfoDesignatedRequirement],
-            CFGetTypeID(requirementValue as CFTypeRef) == SecRequirementGetTypeID()
+            let signingIdentifier = signingInformation[kSecCodeInfoIdentifier] as? String
         else {
             throw SignedApplicationError.securityFailure("read signing information", informationStatus)
         }
-        let requirement = requirementValue as! SecRequirement
 
-        var rawRequirement: CFString?
-        let requirementStatus = SecRequirementCopyString(requirement, [], &rawRequirement)
-        guard requirementStatus == errSecSuccess, let designatedRequirement = rawRequirement as String? else {
+        var requirement: SecRequirement?
+        let requirementStatus = SecCodeCopyDesignatedRequirement(staticCode, [], &requirement)
+        guard requirementStatus == errSecSuccess, let requirement else {
             throw SignedApplicationError.securityFailure(
                 "read designated requirement",
                 requirementStatus
+            )
+        }
+        var rawRequirement: CFString?
+        let requirementStringStatus = SecRequirementCopyString(requirement, [], &rawRequirement)
+        guard
+            requirementStringStatus == errSecSuccess,
+            let designatedRequirement = rawRequirement as String?
+        else {
+            throw SignedApplicationError.securityFailure(
+                "format designated requirement",
+                requirementStringStatus
             )
         }
 

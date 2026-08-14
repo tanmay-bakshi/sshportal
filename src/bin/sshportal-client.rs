@@ -11,9 +11,9 @@ use hostname::get;
 use sshportal::{
     AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ControlPacket,
     OfferedSession, PROTOCOL_VERSION, Platform, ShellLaunch, VpnScope, authorized_key_support,
-    connect_async_with_env_proxy, install_default_rustls_crypto_provider, normalize_websocket_url,
-    parse_public_key, recv_packet, run_client_network_proxy, run_remote_shell_server, send_packet,
-    validate_protocol_version, websocket_to_io,
+    connect_async_with_env_proxy, harden_dynamic_library_search,
+    install_default_rustls_crypto_provider, normalize_websocket_url, parse_public_key, recv_packet,
+    run_client_network_proxy, run_remote_shell_server, send_packet, websocket_to_io,
 };
 
 #[derive(Parser, Debug)]
@@ -47,8 +47,16 @@ struct KeyInstallOutcome {
     note: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    harden_dynamic_library_search()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize the asynchronous runtime")?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = ClientCli::parse();
     install_default_rustls_crypto_provider();
     let client_environment = gather_client_environment()?;
@@ -68,8 +76,6 @@ async fn main() -> Result<()> {
         ControlPacket::ServerOffer(offer) => offer,
         unexpected => bail!("expected server_offer packet, received {unexpected:?}"),
     };
-    validate_protocol_version(offer.protocol_version)?;
-
     if let Some(note) = session_transport_refusal(&offer.session, &server_url) {
         let decision = ClientDecision {
             session_allowed: false,
@@ -80,15 +86,11 @@ async fn main() -> Result<()> {
         bail!("{note}");
     }
 
-    let session_description = session_description(&offer.session);
     let session_allowed = if cli.approve_session {
         true
     } else {
         prompt_yes_no(
-            &format!(
-                "Allow {} to {session_description} while this connection remains open?",
-                offer.operator_name,
-            ),
+            &session_consent_prompt(&offer.operator_name, &offer.session),
             false,
         )?
     };
@@ -132,7 +134,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        OfferedSession::Socks => {
+        approved_session @ OfferedSession::Socks {} => {
             if server_url.scheme() == "ws" {
                 eprintln!(
                     "warning: SOCKS-only traffic is using an unencrypted WebSocket; use HTTPS/WSS outside a trusted network"
@@ -145,9 +147,9 @@ async fn main() -> Result<()> {
             };
             send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
             println!("SOCKS-only support session approved (SSH disabled)");
-            run_client_network_proxy(websocket).await
+            run_client_network_proxy(websocket, approved_session).await
         }
-        OfferedSession::Vpn { .. } => {
+        approved_session @ OfferedSession::Vpn { .. } => {
             let decision = ClientDecision {
                 session_allowed: true,
                 key_installed: false,
@@ -155,27 +157,30 @@ async fn main() -> Result<()> {
             };
             send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
             println!("VPN egress session approved (SSH disabled; no local privileges required)");
-            run_client_network_proxy(websocket).await
+            run_client_network_proxy(websocket, approved_session).await
         }
     }
 }
 
-fn session_description(session: &OfferedSession) -> String {
+fn session_consent_prompt(operator_name: &str, session: &OfferedSession) -> String {
     match session {
-        OfferedSession::Ssh { .. } => "open SSH support sessions into this environment".to_string(),
-        OfferedSession::Socks => {
-            "route TCP connections through this environment using a SOCKS5 proxy".to_string()
-        }
+        OfferedSession::Ssh { .. } => format!(
+            "Allow {operator_name} to open SSH support sessions into this environment while this connection remains open?"
+        ),
+        OfferedSession::Socks {} => format!(
+            "Allow {operator_name} to route TCP connections through this environment using a SOCKS5 proxy while this connection remains open?"
+        ),
         OfferedSession::Vpn {
             scope: VpnScope::System { policy },
-        } => describe_system_vpn(policy),
+        } => format!(
+            "Allow {operator_name} to {} while this connection remains open?",
+            describe_system_vpn(policy)
+        ),
         OfferedSession::Vpn {
             scope: VpnScope::Application { application },
-        } => {
-            format!(
-                "route traffic from the operator's {application} application through this environment"
-            )
-        }
+        } => format!(
+            "macOS enforces process-level VPN scope for {application} on the operator's machine, but this client cannot attest process provenance. Approval therefore authorizes arbitrary TCP and UDP egress through this environment. Allow {operator_name} to start that application-scoped VPN session while this connection remains open?"
+        ),
     }
 }
 
@@ -326,7 +331,7 @@ mod tests {
     use sshportal::{OfferedSession, SystemVpnPolicy, VpnScope};
     use url::Url;
 
-    use super::{session_description, session_transport_refusal};
+    use super::{session_consent_prompt, session_transport_refusal};
 
     #[test]
     fn vpn_mode_rejects_plain_websocket_transport() {
@@ -366,16 +371,19 @@ mod tests {
     fn non_vpn_modes_retain_plain_websocket_support() {
         let url = Url::parse("ws://support.example/connect").unwrap();
 
-        assert!(session_transport_refusal(&OfferedSession::Socks, &url).is_none());
+        assert!(session_transport_refusal(&OfferedSession::Socks {}, &url).is_none());
     }
 
     #[test]
     fn full_vpn_consent_describes_system_wide_access() {
-        let description = session_description(&OfferedSession::Vpn {
-            scope: VpnScope::System {
-                policy: SystemVpnPolicy::default(),
+        let description = session_consent_prompt(
+            "support",
+            &OfferedSession::Vpn {
+                scope: VpnScope::System {
+                    policy: SystemVpnPolicy::default(),
+                },
             },
-        });
+        );
 
         assert!(description.contains("system-wide"));
         assert!(description.contains("TCP, UDP, and DNS"));
@@ -392,9 +400,12 @@ mod tests {
         )
         .unwrap();
 
-        let description = session_description(&OfferedSession::Vpn {
-            scope: VpnScope::System { policy },
-        });
+        let description = session_consent_prompt(
+            "support",
+            &OfferedSession::Vpn {
+                scope: VpnScope::System { policy },
+            },
+        );
 
         for selector in [
             "10.20.0.0/16",
@@ -406,5 +417,21 @@ mod tests {
         }
         assert!(description.contains("only the operator's"));
         assert!(description.contains("all subdomains"));
+    }
+
+    #[test]
+    fn application_vpn_consent_states_the_actual_client_authorization_boundary() {
+        let description = session_consent_prompt(
+            "support",
+            &OfferedSession::Vpn {
+                scope: VpnScope::Application {
+                    application: "Firefox".to_string(),
+                },
+            },
+        );
+
+        assert!(description.contains("macOS enforces process-level VPN scope for Firefox"));
+        assert!(description.contains("client cannot attest process provenance"));
+        assert!(description.contains("authorizes arbitrary TCP and UDP egress"));
     }
 }

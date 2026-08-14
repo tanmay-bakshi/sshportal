@@ -9,10 +9,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpListener;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
+use tokio_util::task::AbortOnDropHandle;
 
-use crate::proxy::run_operator_network_proxy_with_listener;
+use crate::network::run_operator_network_proxy_with_listener;
 use crate::socks::SocksAuthentication;
 
 const COMPANION_BUNDLE_NAME: &str = "SSHPortal.app";
@@ -109,28 +109,31 @@ impl MacosPerAppVpn {
             };
         }
 
-        let mut proxy_task = tokio::spawn(run_operator_network_proxy_with_listener(
-            websocket,
-            listener,
-            authentication,
-        ));
+        let mut proxy_task = Some(AbortOnDropHandle::new(tokio::spawn(
+            run_operator_network_proxy_with_listener(websocket, listener, authentication),
+        )));
         match wait_for_companion_start(&mut companion, &mut proxy_task, &mut shutdown_signals).await
         {
             Ok(CompanionStart::Active) => {}
             Ok(CompanionStart::ShutdownRequested) => {
-                proxy_task.abort();
-                let _ = proxy_task.await;
-                return companion.stop().await;
+                let proxy_result = stop_proxy_task(&mut proxy_task).await;
+                return combine_results(
+                    proxy_result,
+                    companion.stop().await,
+                    "macOS per-app VPN companion cleanup also failed",
+                );
             }
             Err(error) => {
-                proxy_task.abort();
-                let _ = proxy_task.await;
-                return match companion.stop().await {
-                    Ok(()) => Err(error),
-                    Err(stop_error) => Err(error.context(format!(
-                        "macOS per-app VPN cleanup also failed: {stop_error:#}"
-                    ))),
-                };
+                let proxy_result = stop_proxy_task(&mut proxy_task).await;
+                return combine_results(
+                    combine_results(
+                        Err(error),
+                        proxy_result,
+                        "per-app VPN network proxy cleanup also failed",
+                    ),
+                    companion.stop().await,
+                    "macOS per-app VPN companion cleanup also failed",
+                );
             }
         }
 
@@ -143,36 +146,37 @@ impl MacosPerAppVpn {
         println!("press Ctrl-C to disconnect and remove the per-app VPN configuration");
 
         let session_result = tokio::select! {
-            proxy_result = &mut proxy_task => {
-                proxy_result.context("per-app VPN network proxy task failed to join")?
+            proxy_result = proxy_task.as_mut().expect("per-app VPN proxy task is present") => {
+                proxy_task.take();
+                proxy_result
+                    .context("per-app VPN network proxy task failed to join")
+                    .and_then(|result| result)
             }
             event_result = companion.next_event() => {
-                match event_result? {
-                    Some(CompanionEvent::Error { message }) => {
+                match event_result {
+                    Ok(Some(CompanionEvent::Error { message })) => {
                         Err(anyhow!("macOS per-app VPN companion failed: {message}"))
                     }
-                    Some(event) => {
+                    Ok(Some(event)) => {
                         Err(anyhow!("macOS per-app VPN companion stopped unexpectedly: {event:?}"))
                     }
-                    None => Err(anyhow!("macOS per-app VPN companion exited unexpectedly")),
+                    Ok(None) => Err(anyhow!("macOS per-app VPN companion exited unexpectedly")),
+                    Err(error) => Err(error),
                 }
             }
             _ = shutdown_signals.recv() => Ok(()),
         };
 
-        if !proxy_task.is_finished() {
-            proxy_task.abort();
-            let _ = proxy_task.await;
-        }
-        let stop_result = companion.stop().await;
-        match (session_result, stop_result) {
-            (Err(session_error), Err(stop_error)) => Err(session_error.context(format!(
-                "macOS per-app VPN cleanup also failed: {stop_error:#}"
-            ))),
-            (Err(session_error), Ok(())) => Err(session_error),
-            (Ok(()), Err(stop_error)) => Err(stop_error),
-            (Ok(()), Ok(())) => Ok(()),
-        }
+        let proxy_result = stop_proxy_task(&mut proxy_task).await;
+        combine_results(
+            combine_results(
+                session_result,
+                proxy_result,
+                "per-app VPN network proxy cleanup also failed",
+            ),
+            companion.stop().await,
+            "macOS per-app VPN companion cleanup also failed",
+        )
     }
 }
 
@@ -407,7 +411,7 @@ impl CompanionProcess {
 
 async fn wait_for_companion_start(
     companion: &mut CompanionProcess,
-    proxy_task: &mut JoinHandle<Result<()>>,
+    proxy_task: &mut Option<AbortOnDropHandle<Result<()>>>,
     shutdown_signals: &mut ShutdownSignals,
 ) -> Result<CompanionStart> {
     let startup = async {
@@ -441,11 +445,35 @@ async fn wait_for_companion_start(
         startup_result = tokio::time::timeout(COMPANION_START_TIMEOUT, startup) => {
             startup_result.context("timed out waiting for the macOS per-app VPN to activate")?
         }
-        proxy_result = proxy_task => {
-            proxy_result.context("per-app VPN network proxy task failed during startup")??;
-            bail!("per-app VPN network proxy stopped during startup");
+        proxy_result = proxy_task.as_mut().expect("per-app VPN proxy task is present") => {
+            proxy_task.take();
+            match proxy_result.context("per-app VPN network proxy task failed during startup")? {
+                Ok(()) => bail!("per-app VPN network proxy stopped during startup"),
+                Err(error) => Err(error).context("per-app VPN network proxy failed during startup"),
+            }
         }
         _ = shutdown_signals.recv() => Ok(CompanionStart::ShutdownRequested),
+    }
+}
+
+async fn stop_proxy_task(task: &mut Option<AbortOnDropHandle<Result<()>>>) -> Result<()> {
+    let Some(task) = task.take() else {
+        return Ok(());
+    };
+    task.abort();
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(error).context("per-app VPN network proxy task failed to join"),
+    }
+}
+
+fn combine_results(primary: Result<()>, secondary: Result<()>, context: &str) -> Result<()> {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error).context(context.to_string()),
+        (Err(primary), Err(secondary)) => Err(primary).context(format!("{context}: {secondary:#}")),
     }
 }
 

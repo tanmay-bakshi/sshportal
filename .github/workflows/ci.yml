@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
 
@@ -42,7 +42,7 @@ jobs:
       - name: Install cross-compilation tools
         run: |
           brew install llvm lld jq
-          rustup toolchain install 1.90.0 \
+          rustup toolchain install 1.91.0 \
             --profile minimal \
             --target x86_64-pc-windows-msvc
           cargo install --locked --version 0.21.4 cargo-xwin
@@ -66,7 +66,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
       - if: matrix.os != 'windows-latest'
         uses: Swatinem/rust-cache@v2
       - if: matrix.os != 'windows-latest'
@@ -76,15 +78,62 @@ jobs:
       - if: matrix.os == 'windows-latest'
         run: cargo test --locked keys::tests -- --nocapture
       - if: matrix.os == 'windows-latest'
+        run: cargo test --locked control::tests -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        run: cargo test --locked socks::tests -- --nocapture
+      - if: matrix.os == 'windows-latest'
         run: cargo test --locked websocket::tests -- --nocapture
       - if: matrix.os == 'windows-latest'
-        timeout-minutes: 3
-        run: cargo test --locked proxy::tests::network_proxy_routes_tcp_and_resolves_domains_on_the_client -- --nocapture
+        timeout-minutes: 5
+        run: "cargo test --locked network:: -- --nocapture"
       - if: matrix.os == 'windows-latest'
-        timeout-minutes: 3
-        run: cargo test --locked proxy::tests::network_proxy_routes_socks5_udp_associations -- --nocapture
+        timeout-minutes: 5
+        run: "cargo test --locked vpn::packet:: -- --nocapture"
+      - if: matrix.os == 'windows-latest'
+        timeout-minutes: 5
+        run: "cargo test --locked vpn::dns:: -- --nocapture"
       - if: matrix.os == 'windows-latest'
         run: cargo test --locked vpn::routes::tests -- --nocapture
+      - if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $featureTree = cargo tree --locked `
+            --target x86_64-pc-windows-msvc `
+            --edges features `
+            --invert wintun-bindings
+          $featureTree
+          if ($featureTree -match 'verify_binary_signature') {
+              throw "wintun-bindings/verify_binary_signature executes the DLL before verification"
+          }
+
+          New-Item -ItemType Directory -Force target/windows-fixtures | Out-Null
+          cl /LD /nologo tests/fixtures/rejected_wintun.c `
+            /Fo:target/windows-fixtures/rejected-wintun.obj `
+            /link `
+            /IMPLIB:target/windows-fixtures/rejected-wintun.lib `
+            /OUT:target/windows-fixtures/rejected-wintun.dll
+          if ($LASTEXITCODE -ne 0) {
+              throw "failed to compile the rejected Wintun fixture"
+          }
+          $env:SSHPORTAL_REJECTED_WINTUN_DLL = `
+            (Resolve-Path target/windows-fixtures/rejected-wintun.dll).Path
+          $env:SSHPORTAL_REJECTED_WINTUN_MARKER = `
+            (Join-Path (Resolve-Path target/windows-fixtures).Path "dllmain-marker")
+          $metadata = cargo metadata --locked `
+            --format-version 1 `
+            --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
+          $wintunPackages = @(
+              $metadata.packages | Where-Object { $_.name -eq "wintun-bindings" }
+          )
+          if ($wintunPackages.Count -ne 1) {
+              throw "expected exactly one wintun-bindings package"
+          }
+          $wintunRoot = Split-Path $wintunPackages[0].manifest_path
+          $env:SSHPORTAL_TRUSTED_WINTUN_DLL = `
+            (Resolve-Path "$wintunRoot/wintun/bin/amd64/wintun.dll").Path
+          cargo test --locked `
+            --manifest-path crates/wintun-security/Cargo.toml `
+            -- --nocapture
       - if: matrix.os == 'windows-latest'
         run: cargo test --locked --bin sshportal-client -- --nocapture
       - if: matrix.os == 'windows-latest'
@@ -121,6 +170,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Verify generated Xcode project
+        run: |
+          gem install xcodeproj --version 1.27.0 --no-document
+          ruby macos/Support/generate_project.rb
+          git diff --exit-code -- macos/SSHPortal.xcodeproj
       - name: Test native per-app VPN targets
         run: |
           xcodebuild \
@@ -165,7 +219,7 @@ jobs:
         with:
           python-version: "3.x"
       - run: sudo apt-get update && sudo apt-get install --yes musl-tools openssl
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - run: python3 tools/docker_e2e.py
       - run: python3 tools/docker_vpn_e2e.py --skip-build

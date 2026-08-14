@@ -4,30 +4,18 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SocksTarget {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-}
-
-impl From<SocketAddr> for SocksTarget {
-    fn from(address: SocketAddr) -> Self {
-        Self {
-            host: address.ip().to_string(),
-            port: address.port(),
-        }
-    }
-}
+use crate::MAX_NETWORK_UDP_DATAGRAM_BYTES;
+use crate::network::NetworkTarget;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SocksRequest {
-    Connect(SocksTarget),
+    Connect(NetworkTarget),
     UdpAssociate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SocksUdpDatagram {
-    pub(crate) target: SocksTarget,
+    pub(crate) target: NetworkTarget,
     pub(crate) data: Bytes,
 }
 
@@ -40,6 +28,11 @@ pub(crate) const SOCKS_CMD_CONNECT: u8 = 0x01;
 pub(crate) const SOCKS_CMD_UDP_ASSOCIATE: u8 = 0x03;
 pub(crate) const SOCKS_REPLY_SUCCESS: u8 = 0x00;
 pub(crate) const SOCKS_REPLY_GENERAL_FAILURE: u8 = 0x01;
+pub(crate) const SOCKS_REPLY_CONNECTION_NOT_ALLOWED: u8 = 0x02;
+pub(crate) const SOCKS_REPLY_NETWORK_UNREACHABLE: u8 = 0x03;
+pub(crate) const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
+pub(crate) const SOCKS_REPLY_CONNECTION_REFUSED: u8 = 0x05;
+pub(crate) const SOCKS_REPLY_TTL_EXPIRED: u8 = 0x06;
 pub(crate) const SOCKS_REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 pub(crate) const SOCKS_REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 pub(crate) const SOCKS_ATYP_IPV4: u8 = 0x01;
@@ -47,7 +40,6 @@ pub(crate) const SOCKS_ATYP_DOMAIN_NAME: u8 = 0x03;
 pub(crate) const SOCKS_ATYP_IPV6: u8 = 0x04;
 
 const SOCKS_UDP_HEADER_PREFIX_BYTES: usize = 3;
-const MAX_UDP_PACKET_BYTES: usize = 65_507;
 #[cfg(any(target_os = "macos", test))]
 const USERNAME_PASSWORD_VERSION: u8 = 0x01;
 
@@ -64,7 +56,7 @@ pub(crate) enum SocksAuthentication {
 pub(crate) async fn negotiate_socks5_connect<S>(
     stream: &mut S,
     authentication: &SocksAuthentication,
-) -> Result<SocksTarget>
+) -> Result<NetworkTarget>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -117,7 +109,10 @@ where
 
     let target = read_socks_target(stream, request_header[3]).await?;
     match request_header[1] {
-        SOCKS_CMD_CONNECT => Ok(SocksRequest::Connect(target)),
+        SOCKS_CMD_CONNECT => {
+            target.validate()?;
+            Ok(SocksRequest::Connect(target))
+        }
         SOCKS_CMD_UDP_ASSOCIATE if udp_supported => Ok(SocksRequest::UdpAssociate),
         command => {
             write_socks5_response(stream, SOCKS_REPLY_COMMAND_NOT_SUPPORTED, None)
@@ -256,7 +251,7 @@ fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
     difference == 0
 }
 
-async fn read_socks_target<S>(stream: &mut S, address_type: u8) -> Result<SocksTarget>
+async fn read_socks_target<S>(stream: &mut S, address_type: u8) -> Result<NetworkTarget>
 where
     S: AsyncRead + Unpin,
 {
@@ -298,10 +293,7 @@ where
         .read_exact(&mut port_bytes)
         .await
         .context("failed to read SOCKS destination port")?;
-    Ok(SocksTarget {
-        host,
-        port: u16::from_be_bytes(port_bytes),
-    })
+    NetworkTarget::new(host, u16::from_be_bytes(port_bytes))
 }
 
 pub(crate) async fn write_socks5_response<S>(
@@ -312,12 +304,13 @@ pub(crate) async fn write_socks5_response<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let target = bound_address
-        .map(SocksTarget::from)
-        .unwrap_or_else(|| SocksTarget::from(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))));
     let mut response = Vec::with_capacity(22);
     response.extend_from_slice(&[SOCKS_VERSION, reply, 0]);
-    encode_socks_target(&target, &mut response)?;
+    if let Some(bound_address) = bound_address {
+        encode_socks_target(&NetworkTarget::from(bound_address), &mut response)?;
+    } else {
+        response.extend_from_slice(&[SOCKS_ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
+    }
     stream
         .write_all(&response)
         .await
@@ -333,13 +326,13 @@ pub(crate) fn encode_socks_udp_datagram(datagram: &SocksUdpDatagram) -> Result<B
     encoded.extend_from_slice(&[0, 0, 0]);
     encode_socks_target(&datagram.target, &mut encoded)?;
     encoded.extend_from_slice(&datagram.data);
-    if encoded.len() > MAX_UDP_PACKET_BYTES {
+    if encoded.len() > MAX_NETWORK_UDP_DATAGRAM_BYTES {
         bail!("SOCKS UDP datagram is too large");
     }
     Ok(Bytes::from(encoded))
 }
 
-pub(crate) fn decode_socks_udp_datagram(bytes: Bytes) -> Result<SocksUdpDatagram> {
+pub(crate) fn decode_socks_udp_datagram(bytes: &[u8]) -> Result<SocksUdpDatagram> {
     if bytes.len() < SOCKS_UDP_HEADER_PREFIX_BYTES {
         bail!("SOCKS UDP datagram is shorter than its header");
     }
@@ -353,11 +346,11 @@ pub(crate) fn decode_socks_udp_datagram(bytes: Bytes) -> Result<SocksUdpDatagram
     let data_offset = SOCKS_UDP_HEADER_PREFIX_BYTES + target_bytes;
     Ok(SocksUdpDatagram {
         target,
-        data: bytes.slice(data_offset..),
+        data: Bytes::copy_from_slice(&bytes[data_offset..]),
     })
 }
 
-pub(crate) fn encode_socks_target(target: &SocksTarget, output: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn encode_socks_target(target: &NetworkTarget, output: &mut Vec<u8>) -> Result<()> {
     if target.host.is_empty() {
         bail!("SOCKS destination host must not be empty");
     }
@@ -382,7 +375,7 @@ pub(crate) fn encode_socks_target(target: &SocksTarget, output: &mut Vec<u8>) ->
     Ok(())
 }
 
-pub(crate) fn decode_socks_target(bytes: &[u8]) -> Result<(SocksTarget, usize)> {
+pub(crate) fn decode_socks_target(bytes: &[u8]) -> Result<(NetworkTarget, usize)> {
     let Some(address_type) = bytes.first().copied() else {
         bail!("SOCKS destination is missing its address type");
     };
@@ -429,10 +422,7 @@ pub(crate) fn decode_socks_target(bytes: &[u8]) -> Result<(SocksTarget, usize)> 
         .try_into()
         .context("failed to decode SOCKS destination port")?;
     Ok((
-        SocksTarget {
-            host,
-            port: u16::from_be_bytes(port_bytes),
-        },
+        NetworkTarget::new(host, u16::from_be_bytes(port_bytes))?,
         port_end,
     ))
 }
@@ -442,28 +432,20 @@ mod tests {
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
+    use crate::network::NetworkTarget;
+
     use super::{
         SOCKS_ATYP_IPV4, SOCKS_AUTH_USERNAME_PASSWORD, SOCKS_CMD_CONNECT, SOCKS_VERSION,
-        SocksAuthentication, SocksTarget, SocksUdpDatagram, decode_socks_target,
-        decode_socks_udp_datagram, encode_socks_target, encode_socks_udp_datagram,
-        negotiate_socks5_connect,
+        SocksAuthentication, SocksUdpDatagram, decode_socks_target, decode_socks_udp_datagram,
+        encode_socks_target, encode_socks_udp_datagram, negotiate_socks5_connect,
     };
 
     #[test]
     fn targets_round_trip_for_every_address_type() {
         let targets = [
-            SocksTarget {
-                host: "192.0.2.7".to_string(),
-                port: 53,
-            },
-            SocksTarget {
-                host: "resolver.client.internal".to_string(),
-                port: 5353,
-            },
-            SocksTarget {
-                host: "2001:db8::7".to_string(),
-                port: 443,
-            },
+            NetworkTarget::new("192.0.2.7", 53).unwrap(),
+            NetworkTarget::new("resolver.client.internal", 5353).unwrap(),
+            NetworkTarget::new("2001:db8::7", 443).unwrap(),
         ];
 
         for expected in targets {
@@ -478,15 +460,12 @@ mod tests {
     #[test]
     fn udp_datagram_round_trips() {
         let expected = SocksUdpDatagram {
-            target: SocksTarget {
-                host: "dns.client.internal".to_string(),
-                port: 53,
-            },
+            target: NetworkTarget::new("dns.client.internal", 53).unwrap(),
             data: Bytes::from_static(b"query"),
         };
 
         let encoded = encode_socks_udp_datagram(&expected).unwrap();
-        let actual = decode_socks_udp_datagram(encoded).unwrap();
+        let actual = decode_socks_udp_datagram(&encoded).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -495,7 +474,7 @@ mod tests {
     fn udp_fragments_are_rejected() {
         let encoded = Bytes::from_static(&[0, 0, 1, 1, 127, 0, 0, 1, 0, 53]);
 
-        let error = decode_socks_udp_datagram(encoded).unwrap_err();
+        let error = decode_socks_udp_datagram(&encoded).unwrap_err();
 
         assert!(error.to_string().contains("fragmented"));
     }
@@ -503,10 +482,7 @@ mod tests {
     #[test]
     fn oversized_udp_datagrams_are_rejected_after_encapsulation() {
         let datagram = SocksUdpDatagram {
-            target: SocksTarget {
-                host: "192.0.2.7".to_string(),
-                port: 53,
-            },
+            target: NetworkTarget::new("192.0.2.7", 53).unwrap(),
             data: Bytes::from(vec![0_u8; 65_498]),
         };
 
@@ -565,13 +541,7 @@ mod tests {
             .unwrap();
 
         let target = server_task.await.unwrap().unwrap();
-        assert_eq!(
-            target,
-            SocksTarget {
-                host: "192.0.2.4".to_string(),
-                port: 443,
-            }
-        );
+        assert_eq!(target, NetworkTarget::new("192.0.2.4", 443).unwrap());
     }
 
     #[tokio::test]

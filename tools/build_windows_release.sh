@@ -3,12 +3,13 @@
 set -euo pipefail
 
 readonly target="x86_64-pc-windows-msvc"
-readonly rust_toolchain="1.90.0"
+readonly rust_toolchain="1.91.0"
 readonly cargo_xwin_version="0.21.4"
-readonly expected_wintun_sha256="e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
 
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd "$script_directory/.." && pwd)"
+readonly wintun_checksum_file="$script_directory/wintun-amd64.sha256"
+readonly windows_system_dlls_file="$script_directory/windows-system-dlls.txt"
 
 fail() {
     printf 'error: %s\n' "$*" >&2
@@ -90,6 +91,9 @@ verify_imports() {
     "$llvm_readobj" --file-headers "$binary_path" |
         grep -Fq 'Machine: IMAGE_FILE_MACHINE_AMD64' ||
         fail "$binary_path is not an x86-64 PE executable"
+    "$llvm_readobj" --coff-load-config "$binary_path" |
+        grep -Fq 'DependentLoadFlags: 0x800' ||
+        fail "$binary_path does not restrict static imports to System32"
 
     import_names="$(
         "$llvm_readobj" --coff-imports "$binary_path" |
@@ -99,25 +103,8 @@ verify_imports() {
 
     while IFS= read -r imported_dll; do
         imported_dll_lowercase="$(printf '%s' "$imported_dll" | tr '[:upper:]' '[:lower:]')"
-        case "$imported_dll_lowercase" in
-            advapi32.dll | \
-            api-ms-win-core-synch-l1-2-0.dll | \
-            bcrypt.dll | \
-            bcryptprimitives.dll | \
-            crypt32.dll | \
-            iphlpapi.dll | \
-            kernel32.dll | \
-            ntdll.dll | \
-            ole32.dll | \
-            oleaut32.dll | \
-            rpcrt4.dll | \
-            wintrust.dll | \
-            ws2_32.dll)
-                ;;
-            *)
-                fail "$binary_path unexpectedly imports non-system DLL $imported_dll"
-                ;;
-        esac
+        grep -Fxiq -- "$imported_dll_lowercase" "$windows_system_dlls_file" ||
+            fail "$binary_path unexpectedly imports non-system DLL $imported_dll"
     done <<< "$import_names"
 
     printf '%s\n' "$binary_path imports only Windows system DLLs:"
@@ -127,12 +114,27 @@ verify_imports() {
 [[ "$(uname -s)" == "Darwin" ]] || fail "this build entrypoint requires macOS"
 
 require_command cargo
+require_command cmp
+require_command grep
 require_command jq
 require_command rustup
 require_command sed
 require_command shasum
 require_command tr
 require_command zip
+
+[[ -f "$wintun_checksum_file" ]] || fail "Wintun checksum file not found: $wintun_checksum_file"
+expected_wintun_sha256="$(sed -n '1{s/[[:space:]].*$//;p;}' "$wintun_checksum_file")"
+[[ "$expected_wintun_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "invalid Wintun checksum in $wintun_checksum_file"
+readonly expected_wintun_sha256
+[[ -f "$windows_system_dlls_file" ]] ||
+    fail "Windows system DLL allowlist not found: $windows_system_dlls_file"
+grep -Eq '^[a-z0-9_.-]+\.dll$' "$windows_system_dlls_file" ||
+    fail "Windows system DLL allowlist is empty or malformed"
+if grep -Evq '^[a-z0-9_.-]+\.dll$' "$windows_system_dlls_file"; then
+    fail "Windows system DLL allowlist is malformed"
+fi
 
 llvm_readobj="$(find_llvm_readobj)"
 llvm_directory="$(dirname "$llvm_readobj")"
@@ -163,6 +165,18 @@ case "$xwin_version_output" in
 esac
 
 cd "$repository_root"
+
+feature_tree="$(
+    cargo "+$rust_toolchain" tree \
+        --locked \
+        --target "$target" \
+        --edges features \
+        --invert wintun-bindings
+)"
+printf '%s\n' "$feature_tree"
+if grep -Fq 'wintun-bindings feature "verify_binary_signature"' <<< "$feature_tree"; then
+    fail "wintun-bindings/verify_binary_signature executes the DLL before verification"
+fi
 
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/ignore:4099"
@@ -203,8 +217,12 @@ wintun_manifest="$(
     ' <<< "$metadata"
 )"
 wintun_binary="$(dirname "$wintun_manifest")/wintun/bin/amd64/wintun.dll"
+wintun_license="$(dirname "$wintun_manifest")/wintun/LICENSE.txt"
 
 [[ -f "$wintun_binary" ]] || fail "wintun-bindings did not contain $wintun_binary"
+[[ -f "$wintun_license" ]] || fail "wintun-bindings did not contain $wintun_license"
+cmp -s <(tr -d '\r' < "$wintun_license") "$repository_root/licenses/WINTUN.txt" ||
+    fail "the bundled Wintun redistribution license does not match the pinned DLL"
 actual_wintun_sha256="$(shasum -a 256 "$wintun_binary" | sed 's/[[:space:]].*$//')"
 if [[ "$actual_wintun_sha256" != "$expected_wintun_sha256" ]]; then
     fail "unexpected Wintun DLL SHA-256: $actual_wintun_sha256"
