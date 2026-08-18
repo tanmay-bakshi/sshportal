@@ -1,17 +1,19 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::fs::File;
+use std::io::{self, BufReader, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use hostname::get;
+use rustls::pki_types::CertificateDer;
 
 use sshportal::{
     AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ControlPacket,
     OfferedSession, PROTOCOL_VERSION, Platform, ShellLaunch, VpnScope, authorized_key_support,
-    connect_async_with_env_proxy, harden_dynamic_library_search,
+    connect_async_with_env_proxy_and_extra_roots, harden_dynamic_library_search,
     install_default_rustls_crypto_provider, normalize_websocket_url, parse_public_key, recv_packet,
     run_client_network_proxy, run_remote_shell_server, send_packet, websocket_to_io,
 };
@@ -30,6 +32,12 @@ struct ClientCli {
     /// explicit path, the client automatically targets /connect.
     #[arg(long)]
     server: String,
+    /// Add every PEM CA certificate in this file to platform TLS verification.
+    ///
+    /// May be repeated for private PKI roots that cannot be installed in the
+    /// operating system trust store.
+    #[arg(long = "tls-ca-certificate", value_name = "PATH")]
+    tls_ca_certificates: Vec<PathBuf>,
     /// Skip the prompt that approves the live support session.
     #[arg(long)]
     approve_session: bool,
@@ -61,11 +69,13 @@ async fn run() -> Result<()> {
     install_default_rustls_crypto_provider();
     let client_environment = gather_client_environment()?;
     let server_url = normalize_websocket_url(&cli.server)?;
+    let extra_tls_roots = load_tls_ca_certificates(&cli.tls_ca_certificates)?;
     println!("connecting to {server_url}");
 
-    let (mut websocket, _response) = connect_async_with_env_proxy(&server_url)
-        .await
-        .context("failed to connect to sshportal server")?;
+    let (mut websocket, _response) =
+        connect_async_with_env_proxy_and_extra_roots(&server_url, extra_tls_roots)
+            .await
+            .context("failed to connect to sshportal server")?;
     let hello = ClientHello {
         protocol_version: PROTOCOL_VERSION,
         metadata: client_environment.metadata.clone(),
@@ -160,6 +170,32 @@ async fn run() -> Result<()> {
             run_client_network_proxy(websocket, approved_session).await
         }
     }
+}
+
+fn load_tls_ca_certificates(paths: &[PathBuf]) -> Result<Vec<CertificateDer<'static>>> {
+    let mut roots = Vec::new();
+    for path in paths {
+        let file = File::open(path).with_context(|| {
+            format!("failed to open TLS CA certificate file {}", path.display())
+        })?;
+        let mut reader = BufReader::new(file);
+        let certificates = rustls_pemfile::certs(&mut reader)
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| {
+                format!(
+                    "failed to decode PEM certificates from TLS CA file {}",
+                    path.display()
+                )
+            })?;
+        if certificates.is_empty() {
+            bail!(
+                "TLS CA certificate file {} contains no PEM certificates",
+                path.display()
+            );
+        }
+        roots.extend(certificates);
+    }
+    Ok(roots)
 }
 
 fn session_consent_prompt(operator_name: &str, session: &OfferedSession) -> String {
@@ -328,10 +364,94 @@ fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use sshportal::{OfferedSession, SystemVpnPolicy, VpnScope};
+    use tempfile::TempDir;
     use url::Url;
 
-    use super::{session_consent_prompt, session_transport_refusal};
+    use super::{load_tls_ca_certificates, session_consent_prompt, session_transport_refusal};
+
+    const TEST_CA_CERTIFICATE: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBoTCCAUegAwIBAgIUSLG3JGtjMCN3sznKT7uznH+5py0wCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTU1NIUG9ydGFsIFRlc3QgUm9vdDAeFw0yNjA4MTQyMTMzMjVa
+Fw0zNjA4MTEyMTMzMjVaMB4xHDAaBgNVBAMME1NTSFBvcnRhbCBUZXN0IFJvb3Qw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASOPkDhAY2TD+B0D92kiBrvn6DPjmcV
+lFHE2Rku8t87xA21cICeSAFuK/o3GohR9AhGZ1TvMD967R0IYhUIk9xXo2MwYTAd
+BgNVHQ4EFgQU0rW9+CcC0ID9PldZA6iOFCZclr0wHwYDVR0jBBgwFoAU0rW9+CcC
+0ID9PldZA6iOFCZclr0wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw
+CgYIKoZIzj0EAwIDSAAwRQIhAJ8xZ7GNqZbN2R8tWREOZz6eA7V+Ztr4IrB5mD8+
+fn+7AiBo/pGqKkSraMBARq6fd2yOaFYPpg/ojDnhdejubqEvTw==
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn loads_every_certificate_from_one_pem_bundle() {
+        let temp = TempDir::new().unwrap();
+        let bundle = temp.path().join("roots.pem");
+        fs::write(
+            &bundle,
+            format!("{TEST_CA_CERTIFICATE}{TEST_CA_CERTIFICATE}"),
+        )
+        .unwrap();
+
+        let roots = load_tls_ca_certificates(&[bundle]).unwrap();
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], roots[1]);
+    }
+
+    #[test]
+    fn combines_certificates_from_repeated_ca_files() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first.pem");
+        let second = temp.path().join("second.pem");
+        fs::write(&first, TEST_CA_CERTIFICATE).unwrap();
+        fs::write(&second, TEST_CA_CERTIFICATE).unwrap();
+
+        let roots = load_tls_ca_certificates(&[first, second]).unwrap();
+
+        assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    fn rejects_ca_files_without_certificates() {
+        let temp = TempDir::new().unwrap();
+        for (name, contents) in [
+            ("empty.pem", ""),
+            (
+                "private-key.pem",
+                "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n",
+            ),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, contents).unwrap();
+
+            let error = load_tls_ca_certificates(&[path]).unwrap_err();
+
+            assert!(error.to_string().contains("contains no PEM certificates"));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_ca_pem() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("malformed.pem");
+        fs::write(
+            &path,
+            "-----BEGIN CERTIFICATE-----\nnot base64!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        let error = load_tls_ca_certificates(&[path]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode PEM certificates")
+        );
+    }
 
     #[test]
     fn vpn_mode_rejects_plain_websocket_transport() {

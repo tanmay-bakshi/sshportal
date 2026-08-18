@@ -53,6 +53,14 @@ impl SystemVpnPolicy {
         self.is_full_tunnel() || !self.include_domains.is_empty()
     }
 
+    pub(super) fn requires_ipv6_tunnel(&self) -> bool {
+        self.uses_virtual_dns()
+            || self
+                .include_cidrs
+                .iter()
+                .any(|network| network.addr().is_ipv6())
+    }
+
     pub fn matches_domain(&self, hostname: &str) -> bool {
         let Some(hostname) = normalize_candidate_domain(hostname) else {
             return false;
@@ -247,10 +255,19 @@ mod tests {
         );
         assert!(!policy.is_full_tunnel());
         assert!(!policy.uses_virtual_dns());
+        assert!(policy.requires_ipv6_tunnel());
         assert!(policy.contains_ip("10.20.255.254".parse().unwrap()));
         assert!(policy.contains_ip("2001:db8:1:ffff::1".parse().unwrap()));
         assert!(!policy.contains_ip("10.21.0.1".parse().unwrap()));
         assert!(!policy.contains_ip("2001:db8:2::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv4_only_cidr_policy_does_not_require_ipv6_interface_state() {
+        let policy =
+            SystemVpnPolicy::new(vec!["192.0.2.0/24".parse().unwrap()], Vec::new()).unwrap();
+
+        assert!(!policy.requires_ipv6_tunnel());
     }
 
     #[test]

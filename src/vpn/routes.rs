@@ -29,6 +29,9 @@ const JOURNAL_VERSION: u8 = 2;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_JOURNALED_RESOURCES: usize = 4_096;
 const ROUTE_METRIC: u32 = 4;
+// Darwin requires a host prefix when an IFF_POINTOPOINT IPv6 address has an
+// explicit destination. The /126 allocation remains the collision boundary.
+const MACOS_POINT_TO_POINT_IPV6_PREFIX: u8 = 128;
 const LINUX_TCP_PROTOCOL: u8 = 6;
 const LINUX_MAIN_ROUTE_TABLE: u32 = 254;
 const LINUX_LOCAL_ROUTE_TABLE: u32 = 255;
@@ -145,6 +148,7 @@ fn run_required<E: CommandExecutor>(executor: &E, command: &CommandSpec) -> Resu
 struct RoutePlan {
     tunnel_prefixes: Vec<IpNet>,
     dns: Option<DnsPlan>,
+    requires_ipv6: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +173,7 @@ impl RoutePlan {
                     servers: synthetic.dns_servers(),
                     match_domains: DnsMatchDomains::All,
                 }),
+                requires_ipv6: true,
             });
         }
 
@@ -199,17 +204,12 @@ impl RoutePlan {
         Ok(Self {
             tunnel_prefixes,
             dns,
+            requires_ipv6: policy.requires_ipv6_tunnel(),
         })
     }
 
     fn requires_ipv6(&self) -> bool {
-        self.tunnel_prefixes
-            .iter()
-            .any(|prefix| prefix.addr().is_ipv6())
-            || self
-                .dns
-                .as_ref()
-                .is_some_and(|dns| dns.servers.iter().any(IpAddr::is_ipv6))
+        self.requires_ipv6
     }
 }
 
@@ -887,7 +887,7 @@ fn static_resources(
                 interface: tunnel.name.clone(),
                 address: network.interface_ipv6,
                 gateway: network.gateway_ipv6,
-                prefix_len: network.point_to_point_ipv6.prefix_len(),
+                prefix_len: MACOS_POINT_TO_POINT_IPV6_PREFIX,
             },
             Platform::Windows => OwnedResource::WindowsIpv6Address {
                 interface_index: tunnel.index,
@@ -1541,37 +1541,47 @@ fn cleanup_route<E: CommandExecutor>(
                 &["No such process", "Cannot find device"],
             )
         }
-        RouteTarget::MacosInterface { interface } => run_cleanup_command(
-            executor,
-            &CommandSpec::new(
-                "route",
-                [
-                    "-n".to_string(),
-                    "delete".to_string(),
-                    macos_family_flag(prefix).to_string(),
-                    macos_route_kind(prefix).to_string(),
-                    prefix.to_string(),
-                    "-interface".to_string(),
-                    interface.clone(),
-                ],
-            ),
-            &["not in table", "No such process"],
-        ),
-        RouteTarget::MacosGateway { gateway } => run_cleanup_command(
-            executor,
-            &CommandSpec::new(
-                "route",
-                [
-                    "-n".to_string(),
-                    "delete".to_string(),
-                    macos_family_flag(prefix).to_string(),
-                    "-host".to_string(),
-                    prefix.addr().to_string(),
-                    gateway.clone(),
-                ],
-            ),
-            &["not in table", "No such process"],
-        ),
+        RouteTarget::MacosInterface { interface } => {
+            if !macos_route_matches(executor, prefix, None, Some(interface))? {
+                return Ok(());
+            }
+            run_cleanup_command(
+                executor,
+                &CommandSpec::new(
+                    "route",
+                    [
+                        "-n".to_string(),
+                        "delete".to_string(),
+                        macos_family_flag(prefix).to_string(),
+                        macos_route_kind(prefix).to_string(),
+                        prefix.to_string(),
+                        "-interface".to_string(),
+                        interface.clone(),
+                    ],
+                ),
+                &["not in table", "No such process"],
+            )
+        }
+        RouteTarget::MacosGateway { gateway } => {
+            if !macos_route_matches(executor, prefix, Some(gateway), None)? {
+                return Ok(());
+            }
+            run_cleanup_command(
+                executor,
+                &CommandSpec::new(
+                    "route",
+                    [
+                        "-n".to_string(),
+                        "delete".to_string(),
+                        macos_family_flag(prefix).to_string(),
+                        "-host".to_string(),
+                        prefix.addr().to_string(),
+                        gateway.clone(),
+                    ],
+                ),
+                &["not in table", "No such process"],
+            )
+        }
         RouteTarget::Windows {
             interface_index,
             next_hop,
@@ -1691,7 +1701,7 @@ fn validate_resource(platform: Platform, resource: &OwnedResource) -> Result<()>
             },
         ) => {
             validate_interface_name(interface)?;
-            if *prefix_len != 126 {
+            if *prefix_len != MACOS_POINT_TO_POINT_IPV6_PREFIX {
                 bail!("invalid journaled macOS IPv6 prefix length");
             }
             Ok(())
@@ -2943,7 +2953,18 @@ fn macos_route_matches<E: CommandExecutor>(
         ],
     ))?;
     if !output.success {
-        return Ok(false);
+        if ["not in table", "No such process"]
+            .iter()
+            .any(|marker| output.stderr.contains(marker) || output.stdout.contains(marker))
+        {
+            return Ok(false);
+        }
+        let detail = if output.stderr.trim().is_empty() {
+            output.stdout.trim()
+        } else {
+            output.stderr.trim()
+        };
+        bail!("failed to inspect macOS route `{prefix}`: {detail}");
     }
     if !macos_destination_matches(&output.stdout, prefix) {
         return Ok(false);
@@ -3789,6 +3810,13 @@ mod tests {
         .unwrap()
     }
 
+    fn macos_route_fixture(prefix: IpNet, gateway: &str, interface: &str) -> String {
+        format!(
+            "route to: {}\ndestination: {prefix}\ngateway: {gateway}\ninterface: {interface}\n",
+            prefix.addr()
+        )
+    }
+
     fn journal_store(temp: &TempDir) -> JournalStore {
         JournalStore {
             path: temp.path().join("state.jsonl"),
@@ -3987,6 +4015,196 @@ mod tests {
         ];
 
         cleanup_resources(Platform::Linux, &executor, &resources).unwrap();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn stale_macos_journal_recovers_after_the_tunnel_and_routes_disappear() {
+        let temp = TempDir::new().unwrap();
+        let store = journal_store(&temp);
+        let header = JournalHeader {
+            version: JOURNAL_VERSION,
+            platform: Platform::Macos,
+            owner_pid: std::process::id(),
+            owner_identity: "gone".to_string(),
+            session_id: [19; 16],
+        };
+        let resources = [
+            OwnedResource::MacosIpv6Address {
+                interface: "utun19".to_string(),
+                address: "fd00::2".parse().unwrap(),
+                gateway: "fd00::1".parse().unwrap(),
+                prefix_len: MACOS_POINT_TO_POINT_IPV6_PREFIX,
+            },
+            OwnedResource::Route {
+                prefix: "198.18.0.0/16".parse().unwrap(),
+                target: RouteTarget::MacosInterface {
+                    interface: "utun19".to_string(),
+                },
+            },
+            OwnedResource::Route {
+                prefix: "fd7f:1234::/96".parse().unwrap(),
+                target: RouteTarget::MacosInterface {
+                    interface: "utun19".to_string(),
+                },
+            },
+        ];
+        store.begin(&header).unwrap();
+        for resource in &resources {
+            store.arm(resource).unwrap();
+        }
+        let executor = MockExecutor::with_outputs([
+            Ok(CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "route: writing to routing socket: not in table".to_string(),
+            }),
+            Ok(CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "route: writing to routing socket: not in table".to_string(),
+            }),
+            Ok(CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "ifconfig: interface utun19 does not exist".to_string(),
+            }),
+        ]);
+
+        recover_stale_journal(Platform::Macos, &executor, &store).unwrap();
+
+        assert!(!store.path.exists());
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.arguments.contains(&"delete".to_string()))
+        );
+    }
+
+    #[test]
+    fn macos_cleanup_leaves_a_foreign_interface_route_untouched() {
+        let prefix = "10.20.0.0/16".parse().unwrap();
+        let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(
+            macos_route_fixture(prefix, "192.0.2.1", "en0"),
+        ))]);
+        let target = RouteTarget::MacosInterface {
+            interface: "utun19".to_string(),
+        };
+
+        cleanup_route(&executor, prefix, &target).unwrap();
+
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments[1], "get");
+    }
+
+    #[test]
+    fn macos_cleanup_leaves_a_foreign_gateway_route_untouched() {
+        let prefix = "203.0.113.8/32".parse().unwrap();
+        let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(
+            macos_route_fixture(prefix, "192.0.2.254", "en0"),
+        ))]);
+        let target = RouteTarget::MacosGateway {
+            gateway: "192.0.2.1".to_string(),
+        };
+
+        cleanup_route(&executor, prefix, &target).unwrap();
+
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments[1], "get");
+    }
+
+    #[test]
+    fn macos_cleanup_deletes_the_exact_owned_interface_route() {
+        let prefix = "fd7f:1234::/96".parse().unwrap();
+        let executor = MockExecutor::with_outputs([
+            Ok(CommandOutput::success(macos_route_fixture(
+                prefix, "utun19", "utun19",
+            ))),
+            Ok(CommandOutput::success("")),
+        ]);
+        let target = RouteTarget::MacosInterface {
+            interface: "utun19".to_string(),
+        };
+
+        cleanup_route(&executor, prefix, &target).unwrap();
+
+        assert_eq!(
+            executor.calls()[1].arguments,
+            [
+                "-n",
+                "delete",
+                "-inet6",
+                "-net",
+                "fd7f:1234::/96",
+                "-interface",
+                "utun19",
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_cleanup_deletes_the_exact_owned_gateway_route() {
+        let prefix = "203.0.113.8/32".parse().unwrap();
+        let executor = MockExecutor::with_outputs([
+            Ok(CommandOutput::success(macos_route_fixture(
+                prefix,
+                "192.0.2.1",
+                "en0",
+            ))),
+            Ok(CommandOutput::success("")),
+        ]);
+        let target = RouteTarget::MacosGateway {
+            gateway: "192.0.2.1".to_string(),
+        };
+
+        cleanup_route(&executor, prefix, &target).unwrap();
+
+        assert_eq!(
+            executor.calls()[1].arguments,
+            ["-n", "delete", "-inet", "-host", "203.0.113.8", "192.0.2.1",]
+        );
+    }
+
+    #[test]
+    fn macos_cleanup_tolerates_an_owned_route_disappearing_after_inspection() {
+        let prefix = "10.20.0.0/16".parse().unwrap();
+        let executor = MockExecutor::with_outputs([
+            Ok(CommandOutput::success(macos_route_fixture(
+                prefix, "utun19", "utun19",
+            ))),
+            Ok(CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "route: writing to routing socket: not in table".to_string(),
+            }),
+        ]);
+        let target = RouteTarget::MacosInterface {
+            interface: "utun19".to_string(),
+        };
+
+        cleanup_route(&executor, prefix, &target).unwrap();
+
+        assert_eq!(executor.calls().len(), 2);
+    }
+
+    #[test]
+    fn macos_cleanup_surfaces_route_inspection_failures() {
+        let prefix = "10.20.0.0/16".parse().unwrap();
+        let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "route: permission denied".to_string(),
+        })]);
+        let target = RouteTarget::MacosInterface {
+            interface: "utun19".to_string(),
+        };
+
+        assert!(cleanup_route(&executor, prefix, &target).is_err());
+        assert_eq!(executor.calls().len(), 1);
     }
 
     #[test]
@@ -4712,7 +4930,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(displays.iter().any(|display| {
             display.contains(&format!(
-                "ifconfig utun42 inet6 {} {} prefixlen 126 alias",
+                "ifconfig utun42 inet6 {} {} prefixlen 128 alias",
                 network.interface_ipv6, network.gateway_ipv6
             ))
         }));

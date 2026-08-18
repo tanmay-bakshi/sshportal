@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - "**"
   pull_request:
   workflow_dispatch:
 
@@ -209,6 +209,21 @@ jobs:
           lipo \
             target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/Library/SystemExtensions/SSHPortalAppProxy.systemextension/Contents/MacOS/SSHPortalAppProxy \
             -verify_arch x86_64
+
+  e2e-macos-system-vpn:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify passwordless administrative access
+        run: sudo -n true
+      - name: Test native macOS system VPN data plane
+        run: python3 tools/macos_vpn_e2e.py
 
   e2e-linux:
     runs-on: ubuntu-latest

@@ -58,7 +58,7 @@ impl VpnRuntime {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let transport = SessionPacketTransport::new(session, network.synthetic, policy)?;
+        let transport = SessionPacketTransport::new(session, network, policy)?;
         let limits = PacketEngineLimits {
             mtu: super::VPN_MTU as usize,
             ..PacketEngineLimits::default()
@@ -260,6 +260,10 @@ enum OpenRequest {
         request: UdpOpenRequest,
         output: FlowOutputStream<UdpOutput>,
     },
+    HealthUdp {
+        request: UdpOpenRequest,
+        output: FlowOutputStream<UdpOutput>,
+    },
 }
 
 enum LifecycleRuntimeEvent {
@@ -292,6 +296,10 @@ enum DataRuntimeEvent {
         data: Bytes,
         receive_bytes: usize,
     },
+    LocalUdpDatagram {
+        flow_id: FlowId,
+        data: Bytes,
+    },
     DnsResolved {
         flow_id: FlowId,
         query: DnsQuery,
@@ -305,6 +313,7 @@ impl DataRuntimeEvent {
         match self {
             Self::TcpReceived { flow_id, .. }
             | Self::UdpReceived { flow_id, .. }
+            | Self::LocalUdpDatagram { flow_id, .. }
             | Self::DnsResolved { flow_id, .. } => *flow_id,
         }
     }
@@ -398,14 +407,16 @@ struct SessionPacketTransport {
     output_ready: Arc<Notify>,
     mappings: SyntheticAddressMap,
     synthetic: Option<SyntheticNetworkConfiguration>,
+    health_servers: [SocketAddr; 2],
 }
 
 impl SessionPacketTransport {
     fn new(
         session: OperatorNetworkSession,
-        synthetic: Option<SyntheticNetworkConfiguration>,
+        network: VpnNetworkConfiguration,
         policy: SystemVpnPolicy,
     ) -> Result<Self> {
+        let synthetic = network.synthetic;
         let mappings = synthetic_address_map(synthetic)?;
         let (open_sender, open_receiver) = mpsc::channel(OPEN_REQUESTS);
         let (lifecycle_sender, lifecycle_events) = mpsc::channel(RUNTIME_EVENTS);
@@ -434,6 +445,10 @@ impl SessionPacketTransport {
             output_ready,
             mappings,
             synthetic,
+            health_servers: [
+                SocketAddr::from((network.gateway_ipv4, super::DATA_PLANE_HEALTH_PORT)),
+                SocketAddr::from((network.gateway_ipv6, super::DATA_PLANE_HEALTH_PORT)),
+            ],
         })
     }
 
@@ -447,6 +462,10 @@ impl SessionPacketTransport {
                 address.ip() == IpAddr::V4(synthetic.ipv4_dns)
                     || address.ip() == IpAddr::V6(synthetic.ipv6_dns)
             })
+    }
+
+    fn is_health_server(&self, address: SocketAddr) -> bool {
+        self.health_servers.contains(&address)
     }
 
     fn install_tcp_credit(&mut self, flow_id: FlowId, credit: TcpReceiveCredit) -> Result<()> {
@@ -714,7 +733,12 @@ impl PacketTransport for SessionPacketTransport {
             .try_reserve()
             .map_err(map_open_send_error)?;
         let (output_handle, output) = FlowOutputHandle::new(Arc::clone(&self.output_ready));
-        let open = if self.is_dns_server(request.target) {
+        let open = if self.is_health_server(request.target) {
+            OpenRequest::HealthUdp {
+                request: *request,
+                output,
+            }
+        } else if self.is_dns_server(request.target) {
             OpenRequest::DnsUdp {
                 request: *request,
                 output,
@@ -1153,6 +1177,13 @@ fn prepare_data_event(
                 receive_bytes,
             }))
         }
+        DataRuntimeEvent::LocalUdpDatagram { flow_id, data } => {
+            Ok(Some(PacketCommand::UdpDatagram {
+                flow_id,
+                data,
+                receive_bytes: 0,
+            }))
+        }
         DataRuntimeEvent::DnsResolved {
             flow_id,
             query,
@@ -1283,6 +1314,9 @@ async fn run_open_dispatcher(
                         OpenRequest::DnsUdp { request, output } => {
                             run_dns_udp_flow(session, policy, request, output, events).await
                         }
+                        OpenRequest::HealthUdp { request, output } => {
+                            run_health_udp_flow(request, output, events).await
+                        }
                     };
                     if let Err(error) = result {
                         debug_log(format!("VPN flow task ended with an error: {error:#}"));
@@ -1299,6 +1333,32 @@ async fn run_open_dispatcher(
     flows.abort_all();
     while flows.join_next().await.is_some() {}
     result
+}
+
+async fn run_health_udp_flow(
+    request: UdpOpenRequest,
+    mut output: FlowOutputStream<UdpOutput>,
+    events: RuntimeEventSenders,
+) -> Result<()> {
+    send_lifecycle_event(
+        &events,
+        LifecycleRuntimeEvent::UdpOpened {
+            flow_id: request.flow_id,
+            credit: None,
+        },
+    )
+    .await?;
+    while let FlowOutputEvent::Message(UdpOutput::Datagram(data)) = output.receive().await {
+        send_data_event(
+            &events,
+            DataRuntimeEvent::LocalUdpDatagram {
+                flow_id: request.flow_id,
+                data: data.data.clone(),
+            },
+        )
+        .await?;
+    }
+    send_lifecycle_event(&events, LifecycleRuntimeEvent::UdpStopped(request.flow_id)).await
 }
 
 async fn run_network_tcp_flow(
@@ -1957,14 +2017,15 @@ mod tests {
 
     use super::{
         BufferedBytes, CreditEntry, DataRuntimeEvent, DnsQuery, DnsTransport, FLOW_OUTPUT_MESSAGES,
-        FlowOutputEvent, FlowOutputHandle, NetworkError, NetworkErrorKind, PacketCommand,
-        ReceiveCredit, Resolution, ResolutionFamily, ResolveOutcome, RuntimeEventSenders,
-        SyntheticAddressMap, SyntheticNetworkConfiguration, SystemVpnPolicy, TcpFlowOutput,
-        TcpOutput, TransportSendError, VpnRuntime, dns_query_allowed, emit_dns_refused,
-        flow_output, network_target_for, synthesize_dns_command, take_dns_tcp_frame,
+        FlowOutputEvent, FlowOutputHandle, LifecycleRuntimeEvent, NetworkError, NetworkErrorKind,
+        PacketCommand, ReceiveCredit, Resolution, ResolutionFamily, ResolveOutcome,
+        RuntimeEventSenders, SyntheticAddressMap, SyntheticNetworkConfiguration, SystemVpnPolicy,
+        TcpFlowOutput, TcpOutput, TransportSendError, UdpOutput, VpnRuntime, dns_query_allowed,
+        emit_dns_refused, flow_output, network_target_for, run_health_udp_flow,
+        synthesize_dns_command, take_dns_tcp_frame,
     };
     use crate::vpn::dns::{DnsName, Ipv4Pool, Ipv6Pool};
-    use crate::vpn::packet::FlowId;
+    use crate::vpn::packet::{FlowId, UdpOpenRequest};
 
     #[derive(Clone)]
     struct TestCredit {
@@ -2135,6 +2196,64 @@ mod tests {
 
         runtime.wait().await.unwrap();
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_echo_emits_uncredited_local_datagrams() {
+        let flow_id = FlowId::from_test_value(93);
+        let request = UdpOpenRequest {
+            flow_id,
+            operator: "192.0.2.2:49153".parse().unwrap(),
+            target: "192.0.2.1:49152".parse().unwrap(),
+        };
+        let (lifecycle, mut lifecycle_events) = mpsc::channel(2);
+        let (data, mut data_events) = mpsc::channel(1);
+        let events = RuntimeEventSenders { lifecycle, data };
+        let output_ready = Arc::new(Notify::new());
+        let (handle, output) = FlowOutputHandle::new(Arc::clone(&output_ready));
+        let task = tokio::spawn(run_health_udp_flow(request, output, events));
+
+        let opened = lifecycle_events.recv().await.unwrap();
+        assert!(matches!(
+            opened.event,
+            LifecycleRuntimeEvent::UdpOpened {
+                flow_id: opened_flow,
+                credit: None,
+            } if opened_flow == flow_id
+        ));
+        let _ = opened.acknowledgement.send(());
+
+        let payload = bytes::Bytes::from_static(b"health");
+        let permit = Arc::new(Semaphore::new(payload.len()))
+            .try_acquire_many_owned(payload.len() as u32)
+            .unwrap();
+        handle
+            .messages
+            .send(UdpOutput::Datagram(BufferedBytes::new(
+                payload.clone(),
+                permit,
+                output_ready,
+            )))
+            .await
+            .unwrap();
+        let echoed = data_events.recv().await.unwrap();
+        assert!(matches!(
+            echoed.event,
+            DataRuntimeEvent::LocalUdpDatagram {
+                flow_id: echoed_flow,
+                data,
+            } if echoed_flow == flow_id && data == payload
+        ));
+        let _ = echoed.acknowledgement.send(());
+
+        handle.abort();
+        let stopped = lifecycle_events.recv().await.unwrap();
+        assert!(matches!(
+            stopped.event,
+            LifecycleRuntimeEvent::UdpStopped(stopped_flow) if stopped_flow == flow_id
+        ));
+        let _ = stopped.acknowledgement.send(());
+        task.await.unwrap().unwrap();
     }
 
     #[test]

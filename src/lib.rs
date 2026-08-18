@@ -28,7 +28,8 @@ pub use shell::{run_client_session_proxy, run_remote_shell_server};
 pub use vpn::{SystemVpnPolicy, run_operator_vpn};
 pub use websocket::{
     AsyncStream, ClientWebSocketStream, WebSocketClientTransport, connect_async_with_env_proxy,
-    normalize_websocket_url, websocket_config, websocket_to_io,
+    connect_async_with_env_proxy_and_extra_roots, normalize_websocket_url, websocket_config,
+    websocket_to_io,
 };
 
 pub fn install_default_rustls_crypto_provider() {

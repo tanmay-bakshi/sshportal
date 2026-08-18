@@ -110,6 +110,12 @@ RFC 9297/9298 capsules. All network streams share one bounded HTTP/2 connection 
 already-approved WebSocket. The client opens ordinary outbound sockets and requires no
 administrator privileges, kernel extension, TUN driver, or route changes.
 
+The server reports a VPN as active only after dual-stack UDP health probes have completed a full
+kernel-to-TUN round trip. Sessions with virtual DNS also complete a resolver query through the
+WebSocket and the client's native resolver before startup succeeds. A platform framing mismatch,
+an unusable IPv4 or IPv6 interface, or a broken resolver path therefore fails startup and restores
+the host network state instead of leaving a connected-looking but inert VPN.
+
 Start the server as root on Linux or macOS, or from an elevated terminal on Windows:
 
 ```bash
@@ -189,6 +195,20 @@ The client refuses a VPN offer received through `http://` or `ws://`, including 
 trust policy. On Windows and macOS, that includes locally installed enterprise roots and
 operating-system distrust decisions; copying the same executable to another machine does not carry
 a private bundled CA snapshot with it.
+
+For a private CA that cannot or should not be installed into the operating-system trust store, add
+its PEM certificate directly to this client process:
+
+```bash
+sshportal-client \
+  --server "https://support.example?token=<printed-token>" \
+  --tls-ca-certificate /path/to/private-root.pem
+```
+
+The option may be repeated, and each file may contain a PEM certificate bundle. These roots augment
+rather than replace platform verification for both the WSS server and an HTTPS proxy. Hostname,
+validity-period, signature, and chain validation remain mandatory. No certificate is installed into
+an operating-system keychain or trust store.
 
 The approved capability is enforced again for every client-side network stream before DNS or
 socket creation. SOCKS and macOS per-app sessions permit arbitrary TCP and UDP destinations but no
@@ -329,7 +349,8 @@ The Rust client and the SOCKS and system-VPN server modes build natively on Linu
 Windows. The macOS 15-or-later per-app mode additionally needs the Swift companion and system
 extension. CI compiles and tests the Rust code on all three operating systems, builds both
 architectures of the macOS companion without signing, cross-builds the static-CRT Windows package
-from macOS, and runs the privileged system-VPN end-to-end path in Linux containers.
+from macOS, and runs privileged system-VPN end-to-end paths in Linux containers and on a native
+macOS host.
 
 ```bash
 cargo build --bins
@@ -403,6 +424,18 @@ checks full-tunnel, CIDR-selective, and domain-selective routing. Its `echo.test
 on the client network, so the domain case verifies resolver suffix routing, synthetic-address
 hostname reversal, and both TCP and UDP client-side name resolution.
 
+[`tools/macos_vpn_e2e.py`](tools/macos_vpn_e2e.py) runs the release server against a real native
+`utun` and the release client over a locally terminated WSS connection. It verifies macOS
+SystemConfiguration split DNS, UDP and TCP DNS over IPv4 and IPv6, stable synthetic A and AAAA
+answers, dual-stack TCP and UDP egress, CIDR-only readiness, unmatched-route preservation, and
+cleanup after both Ctrl-C and transport failure. The fixture requires passwordless `sudo` because
+the server owns routes. Its short-lived localhost root is passed only to the fixture client through
+`--tls-ca-certificate`; the fixture never reads or mutates a keychain or system trust store.
+
+```bash
+python3 tools/macos_vpn_e2e.py
+```
+
 ### Static Linux binaries
 
 Build fully static musl binaries for x86-64:
@@ -462,7 +495,13 @@ To run VPN mode in a container, also pass `/dev/net/tun` and `CAP_NET_ADMIN`.
 
 ## Releases
 
-Pushing a `vX.Y.Z` tag publishes archives for static x86-64 and ARM64 Linux binaries plus static-CRT x86-64 Windows binaries. The Windows archive also contains the signed Wintun DLL and [`WINTUN-LICENSE.txt`](licenses/WINTUN.txt). Every archive has a SHA-256 checksum file.
+Pushing a `vX.Y.Z` tag publishes archives for static x86-64 and ARM64 Linux binaries plus
+static-CRT x86-64 Windows binaries. A `vX.Y.Z-windows-x86_64` tag deliberately publishes only the
+Windows archive. Other `v*` tag shapes fail validation rather than producing an empty successful
+workflow. Every release tag must match the Cargo package version, and publication waits for source
+validation plus the native macOS system-VPN test on that exact tagged commit. The Windows archive
+also contains the signed Wintun DLL and [`WINTUN-LICENSE.txt`](licenses/WINTUN.txt). Every archive
+has a SHA-256 checksum file.
 
 The tagged workflow does not publish an unsigned macOS per-app companion as though it were usable.
 Build the universal macOS package with the signing and optional notarization procedure above; the

@@ -12,8 +12,8 @@ use hyper::Uri;
 use hyper::header::HeaderValue;
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use pin_project_lite::pin_project;
-use rustls::pki_types::ServerName;
-use rustls_platform_verifier::BuilderVerifierExt;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls_platform_verifier::Verifier;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -396,9 +396,23 @@ where
 }
 
 pub async fn connect_async_with_env_proxy(url: &Url) -> Result<(ClientWebSocketStream, Response)> {
+    connect_async_with_env_proxy_and_extra_roots(url, Vec::new()).await
+}
+
+pub async fn connect_async_with_env_proxy_and_extra_roots(
+    url: &Url,
+    extra_roots: Vec<CertificateDer<'static>>,
+) -> Result<(ClientWebSocketStream, Response)> {
     crate::install_default_rustls_crypto_provider();
     let matcher = Matcher::from_env();
-    connect_async_with_proxy_matcher(url, &matcher).await
+    let tls_config = tls_client_config(extra_roots)?;
+    connect_async_with_proxy_matcher_and_timeouts_with_tls(
+        url,
+        &matcher,
+        WEBSOCKET_CONNECT_TIMEOUTS,
+        tls_config,
+    )
+    .await
 }
 
 pub fn websocket_to_io<S>(websocket: WebSocketStream<S>) -> Pin<Box<dyn AsyncStream + 'static>>
@@ -439,6 +453,7 @@ fn map_websocket_error(error: WebSocketError) -> io::Error {
     )
 }
 
+#[cfg(test)]
 async fn connect_async_with_proxy_matcher(
     url: &Url,
     matcher: &Matcher,
@@ -446,20 +461,45 @@ async fn connect_async_with_proxy_matcher(
     connect_async_with_proxy_matcher_and_timeouts(url, matcher, WEBSOCKET_CONNECT_TIMEOUTS).await
 }
 
+#[cfg(test)]
 async fn connect_async_with_proxy_matcher_and_timeouts(
     url: &Url,
     matcher: &Matcher,
     timeouts: WebSocketConnectTimeouts,
 ) -> Result<(ClientWebSocketStream, Response)> {
+    connect_async_with_proxy_matcher_and_timeouts_with_tls(
+        url,
+        matcher,
+        timeouts,
+        tls_client_config(Vec::new())?,
+    )
+    .await
+}
+
+async fn connect_async_with_proxy_matcher_and_timeouts_with_tls(
+    url: &Url,
+    matcher: &Matcher,
+    timeouts: WebSocketConnectTimeouts,
+    tls_config: Arc<rustls::ClientConfig>,
+) -> Result<(ClientWebSocketStream, Response)> {
     let overall_deadline = Instant::now() + timeouts.overall;
     let maybe_proxy = selected_proxy_for_websocket_url(matcher, url)?;
     let stream = match maybe_proxy {
-        Some(proxy) => connect_via_proxy(url, &proxy, overall_deadline, timeouts).await?,
+        Some(proxy) => {
+            connect_via_proxy(
+                url,
+                &proxy,
+                overall_deadline,
+                timeouts,
+                Arc::clone(&tls_config),
+            )
+            .await?
+        }
         None => connect_direct(url, overall_deadline, timeouts).await?,
     };
 
     let connector = match url.scheme() {
-        "wss" => Some(Connector::Rustls(tls_client_config()?)),
+        "wss" => Some(Connector::Rustls(tls_config)),
         "ws" => None,
         unsupported => bail!("unsupported websocket URL scheme `{unsupported}`"),
     };
@@ -534,6 +574,7 @@ async fn connect_via_proxy(
     proxy: &Intercept,
     overall_deadline: Instant,
     timeouts: WebSocketConnectTimeouts,
+    tls_config: Arc<rustls::ClientConfig>,
 ) -> Result<Box<dyn WebSocketClientTransport>> {
     let (proxy_host, proxy_port, proxy_scheme) = proxy_endpoint(proxy)?;
     let proxy_socket = open_tcp_stream(
@@ -551,7 +592,7 @@ async fn connect_via_proxy(
                 overall_deadline,
                 timeouts.proxy_tls,
                 "HTTPS proxy TLS handshake",
-                connect_to_https_proxy(proxy_socket, &proxy_host),
+                connect_to_https_proxy(proxy_socket, &proxy_host, tls_config),
             )
             .await??,
         ),
@@ -654,31 +695,50 @@ where
 async fn connect_to_https_proxy(
     socket: TcpStream,
     proxy_host: &str,
+    tls_config: Arc<rustls::ClientConfig>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let server_name = ServerName::try_from(proxy_host.to_string())
         .map_err(|_| anyhow!("proxy host `{proxy_host}` is not a valid TLS server name"))?;
-    let connector = TlsConnector::from(tls_client_config()?);
+    let connector = TlsConnector::from(tls_config);
     connector
         .connect(server_name, socket)
         .await
         .with_context(|| format!("failed to negotiate TLS with HTTPS proxy `{proxy_host}`"))
 }
 
-fn tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
+fn tls_client_config(
+    extra_roots: Vec<CertificateDer<'static>>,
+) -> Result<Arc<rustls::ClientConfig>> {
     static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
-    if let Some(config) = TLS_CLIENT_CONFIG.get() {
-        return Ok(Arc::clone(config));
+    if extra_roots.is_empty() {
+        if let Some(config) = TLS_CLIENT_CONFIG.get() {
+            return Ok(Arc::clone(config));
+        }
+        let config = build_tls_client_config(extra_roots)?;
+        return Ok(Arc::clone(TLS_CLIENT_CONFIG.get_or_init(|| config)));
     }
 
+    build_tls_client_config(extra_roots)
+}
+
+fn build_tls_client_config(
+    extra_roots: Vec<CertificateDer<'static>>,
+) -> Result<Arc<rustls::ClientConfig>> {
     crate::install_default_rustls_crypto_provider();
-    let config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_platform_verifier()
-            .context("failed to initialize platform TLS certificate verification")?
+    let builder = rustls::ClientConfig::builder();
+    let verifier = if extra_roots.is_empty() {
+        Verifier::new(builder.crypto_provider().clone())
+    } else {
+        Verifier::new_with_extra_roots(extra_roots, builder.crypto_provider().clone())
+    }
+    .context("failed to initialize platform TLS certificate verification")?;
+    Ok(Arc::new(
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth(),
-    );
-    Ok(Arc::clone(TLS_CLIENT_CONFIG.get_or_init(|| config)))
+    ))
 }
 
 async fn establish_connect_tunnel(
@@ -939,8 +999,8 @@ mod tests {
 
     #[test]
     fn platform_tls_configuration_initializes_once() {
-        let first = tls_client_config().unwrap();
-        let second = tls_client_config().unwrap();
+        let first = tls_client_config(Vec::new()).unwrap();
+        let second = tls_client_config(Vec::new()).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
     }

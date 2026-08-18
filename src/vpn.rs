@@ -1,7 +1,9 @@
 mod configuration;
+mod device;
 mod dns;
 mod packet;
 mod policy;
+mod probe;
 mod routes;
 mod runtime;
 
@@ -9,31 +11,16 @@ pub use policy::SystemVpnPolicy;
 
 use std::net::{IpAddr, SocketAddr};
 
-#[cfg(target_os = "windows")]
-use std::path::PathBuf;
-
-#[cfg(target_os = "windows")]
-use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::task::AbortOnDropHandle;
-use tun::AbstractDevice;
-#[cfg(target_os = "windows")]
-use wintun_security::VerifiedWintun;
 
 use crate::network::start_operator_network_session;
 
 pub(super) const VPN_MTU: u16 = 1_500;
+pub(super) const DATA_PLANE_HEALTH_PORT: u16 = 49_152;
 const NETWORK_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-struct TunDevice {
-    device: tun::AsyncDevice,
-    name: String,
-    index: i32,
-    #[cfg(target_os = "windows")]
-    _verified_wintun: VerifiedWintun,
-}
 
 #[cfg(unix)]
 struct ShutdownSignals {
@@ -123,21 +110,18 @@ where
         result = start_operator_network_session(websocket) => result?,
         _ = shutdown_signals.recv() => return Ok(()),
     };
-    let tun = create_tun_device(network).context(
+    let mut tun = device::SystemTun::create(network).context(
         "failed to create the VPN interface; run sshportal-server with administrator/root privileges",
     )?;
     let mut network_guard = prepared_network
         .install(&tun.name, tun.index, transport_local, transport_peer)
         .with_context(|| {
             format!(
-                "failed to configure VPN routes on interface {}; administrator/root privileges are required",
+                "failed to configure VPN host-network state on interface {}",
                 tun.name
             )
         })?;
-    let (tun_writer, tun_reader) = tun
-        .device
-        .split()
-        .context("failed to split the VPN interface for asynchronous I/O")?;
+    let (tun_reader, tun_writer) = tun.split()?;
     let mut packet_runtime =
         runtime::VpnRuntime::start(tun_reader, tun_writer, session, network, policy.clone())?;
     let mut session_runtime = AbortOnDropHandle::new(tokio::spawn(session_runtime.wait()));
@@ -145,16 +129,27 @@ where
     network_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     network_reconcile.tick().await;
 
-    if policy.is_full_tunnel() {
-        println!("full-tunnel VPN active on interface {}", tun.name);
-    } else {
-        println!("selective VPN active on interface {}", tun.name);
-    }
-    println!("press Ctrl-C to disconnect and restore the original routes");
-
     let mut session_runtime_finished = false;
+    let mut readiness = Box::pin(probe::verify_data_plane(network, &policy));
+    let mut ready = false;
     let operation_result = loop {
         tokio::select! {
+            result = &mut readiness, if !ready => {
+                match result {
+                    Ok(()) => {
+                        ready = true;
+                        if policy.is_full_tunnel() {
+                            println!("full-tunnel VPN active on interface {}", tun.name);
+                        } else {
+                            println!("selective VPN active on interface {}", tun.name);
+                        }
+                        println!("press Ctrl-C to disconnect and restore the original routes");
+                    }
+                    Err(error) => break Err(error).context(
+                        "VPN data plane did not become ready after host-network installation",
+                    ),
+                }
+            }
             result = packet_runtime.wait() => break result,
             result = &mut session_runtime => {
                 session_runtime_finished = true;
@@ -207,65 +202,6 @@ fn combine_results(primary: Result<()>, secondary: Result<()>, context: &str) ->
         (Ok(()), Err(error)) => Err(error).context(context.to_string()),
         (Err(primary), Err(secondary)) => Err(primary).context(format!("{context}: {secondary:#}")),
     }
-}
-
-fn create_tun_device(network: configuration::VpnNetworkConfiguration) -> Result<TunDevice> {
-    let mut configuration = tun::Configuration::default();
-    configuration
-        .address(network.interface_ipv4)
-        .destination(network.gateway_ipv4)
-        .netmask(network.point_to_point_ipv4.netmask())
-        .mtu(VPN_MTU)
-        .up();
-
-    #[cfg(target_os = "macos")]
-    configuration.platform_config(|platform| {
-        platform.packet_information(false);
-    });
-
-    #[cfg(target_os = "windows")]
-    let verified_wintun = {
-        configuration.tun_name("sshportal");
-        let bundled_wintun = wintun_path()?;
-        let verified_wintun = VerifiedWintun::prepare(&bundled_wintun)
-            .context("failed to stage and verify the bundled Wintun DLL")?;
-        configuration.platform_config(|platform| {
-            platform.device_guid(0x8973_6870_6f72_7461_6c00_0000_0000_0001);
-            platform.wintun_file(verified_wintun.path());
-        });
-        verified_wintun
-    };
-
-    let device = tun::create_as_async(&configuration).context("TUN device creation failed")?;
-    let name = device
-        .tun_name()
-        .context("failed to read TUN interface name")?;
-    let index = device
-        .tun_index()
-        .context("failed to read TUN interface index")?;
-    Ok(TunDevice {
-        device,
-        name,
-        index,
-        #[cfg(target_os = "windows")]
-        _verified_wintun: verified_wintun,
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn wintun_path() -> Result<PathBuf> {
-    let executable = std::env::current_exe().context("failed to locate sshportal-server.exe")?;
-    let directory = executable
-        .parent()
-        .context("sshportal-server.exe has no parent directory")?;
-    let path = directory.join("wintun.dll");
-    if !path.is_file() {
-        return Err(anyhow!(
-            "{} is missing; place the signed Wintun DLL beside sshportal-server.exe",
-            path.display()
-        ));
-    }
-    Ok(path)
 }
 
 fn validate_transport_peer(policy: &SystemVpnPolicy, peer: IpAddr) -> Result<()> {
