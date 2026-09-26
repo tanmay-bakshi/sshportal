@@ -1857,7 +1857,7 @@ async fn run_dns_tcp_flow(
                     if !buffer.is_empty() {
                         bail!("TCP DNS flow ended in the middle of a framed query");
                     }
-                    loop {
+                    while !queries.is_empty() {
                         tokio::select! {
                             biased;
                             _ = cancellation.cancelled() => {
@@ -1865,13 +1865,12 @@ async fn run_dns_tcp_flow(
                                 while queries.join_next().await.is_some() {}
                                 return Ok(());
                             }
-                            result = queries.join_next(), if !queries.is_empty() => {
+                            result = queries.join_next() => {
                                 let Some(result) = result else {
                                     break;
                                 };
                                 result.context("TCP DNS resolver task panicked")??;
                             }
-                            else => break,
                         }
                     }
                     send_lifecycle_event(
@@ -1926,13 +1925,17 @@ async fn resolve_dns_query(
     transport: DnsTransport,
     events: RuntimeEventSenders,
 ) -> Result<()> {
-    let request = ResolveRequest::new(
-        query.question().name().to_ascii()?,
-        query.question().record_type().to_u16(),
-        query.question().record_class().to_u16(),
-        DNS_TIMEOUT_MILLIS,
-    )?;
-    let outcome = match session.resolve(request).await {
+    let resolution = async {
+        let request = ResolveRequest::new(
+            query.question().name().to_ascii()?,
+            query.question().record_type().to_u16(),
+            query.question().record_class().to_u16(),
+            DNS_TIMEOUT_MILLIS,
+        )?;
+        session.resolve(request).await.map_err(anyhow::Error::from)
+    }
+    .await;
+    let outcome = match resolution {
         Ok(outcome) => outcome,
         Err(error) => {
             debug_log(format!("client-side DNS resolution failed: {error}"));
@@ -2009,10 +2012,12 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use bytes::BytesMut;
     use ipnet::{Ipv4Net, Ipv6Net};
     use tokio::sync::{Notify, Semaphore, mpsc};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
     use tokio_util::task::AbortOnDropHandle;
 
     use super::{
@@ -2021,11 +2026,13 @@ mod tests {
         PacketCommand, ReceiveCredit, Resolution, ResolutionFamily, ResolveOutcome,
         RuntimeEventSenders, SyntheticAddressMap, SyntheticNetworkConfiguration, SystemVpnPolicy,
         TcpFlowOutput, TcpOutput, TransportSendError, UdpOutput, VpnRuntime, dns_query_allowed,
-        emit_dns_refused, flow_output, network_target_for, run_health_udp_flow,
+        emit_dns_refused, flow_output, network_target_for, run_dns_tcp_flow, run_health_udp_flow,
         synthesize_dns_command, take_dns_tcp_frame,
     };
+    use crate::control::{OfferedSession, VpnScope};
+    use crate::network::{run_client_network_proxy, start_operator_network_session};
     use crate::vpn::dns::{DnsName, Ipv4Pool, Ipv6Pool};
-    use crate::vpn::packet::{FlowId, UdpOpenRequest};
+    use crate::vpn::packet::{FlowId, TcpOpenRequest, UdpOpenRequest};
 
     #[derive(Clone)]
     struct TestCredit {
@@ -2048,6 +2055,10 @@ mod tests {
     }
 
     fn dns_query(id: u16, name: &str, record_type: u16) -> DnsQuery {
+        DnsQuery::parse_udp(&dns_query_message(id, name, record_type)).unwrap()
+    }
+
+    fn dns_query_message(id: u16, name: &str, record_type: u16) -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice(&id.to_be_bytes());
         message.extend_from_slice(&0x0100_u16.to_be_bytes());
@@ -2062,7 +2073,7 @@ mod tests {
         message.push(0);
         message.extend_from_slice(&record_type.to_be_bytes());
         message.extend_from_slice(&1_u16.to_be_bytes());
-        DnsQuery::parse_udp(&message).unwrap()
+        message
     }
 
     fn synthetic_configuration() -> SyntheticNetworkConfiguration {
@@ -2410,6 +2421,136 @@ mod tests {
                 assert_eq!(target.resolution_family, resolution_family);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_dns_queries_do_not_abort_a_pipelined_tcp_flow() {
+        let scenario = async {
+            let (left, right) = tokio::io::duplex(64 * 1024);
+            let (operator, client) = tokio::join!(
+                WebSocketStream::from_raw_socket(left, Role::Client, None),
+                WebSocketStream::from_raw_socket(right, Role::Server, None),
+            );
+            let policy = SystemVpnPolicy::full_tunnel();
+            let _client = AbortOnDropHandle::new(tokio::spawn(run_client_network_proxy(
+                client,
+                OfferedSession::Vpn {
+                    scope: VpnScope::System {
+                        policy: policy.clone(),
+                    },
+                },
+            )));
+            let (session, _runtime) = start_operator_network_session(operator).await.unwrap();
+            let flow_id = FlowId::from_test_value(94);
+            let (lifecycle, mut lifecycle_events) = mpsc::channel(2);
+            let (data, mut data_events) = mpsc::channel(4);
+            let events = RuntimeEventSenders { lifecycle, data };
+            let output_ready = Arc::new(Notify::new());
+            let (handle, output) = FlowOutputHandle::new(Arc::clone(&output_ready));
+            let task = AbortOnDropHandle::new(tokio::spawn(run_dns_tcp_flow(
+                session,
+                policy,
+                TcpOpenRequest {
+                    flow_id,
+                    operator: "192.0.2.2:40000".parse().unwrap(),
+                    target: "198.18.0.1:53".parse().unwrap(),
+                },
+                output,
+                events,
+            )));
+            let opened = lifecycle_events.recv().await.unwrap();
+            assert!(matches!(
+                opened.event,
+                LifecycleRuntimeEvent::TcpOpened { .. }
+            ));
+            opened.acknowledgement.send(()).unwrap();
+
+            let mut frames = BytesMut::new();
+            for (id, name, record_type) in [
+                (1, "binary\u{80}.example", 1),
+                (2, "back\\slash.example", 1),
+                (3, "localhost", 0),
+                (4, "localhost", 5),
+            ] {
+                let message = dns_query_message(id, name, record_type);
+                DnsQuery::parse_udp(&message).unwrap();
+                frames.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                frames.extend_from_slice(&message);
+            }
+            let permit = Arc::new(Semaphore::new(frames.len()))
+                .try_acquire_many_owned(frames.len() as u32)
+                .unwrap();
+            handle
+                .messages
+                .send(TcpOutput::Data(BufferedBytes::new(
+                    frames.freeze(),
+                    permit,
+                    output_ready,
+                )))
+                .await
+                .unwrap();
+            handle.messages.send(TcpOutput::HalfClose).await.unwrap();
+
+            let mut responses = HashMap::new();
+            for _ in 0..4 {
+                let envelope = tokio::select! {
+                    envelope = data_events.recv() => envelope.unwrap(),
+                    _ = lifecycle_events.recv() => panic!("DNS flow closed before answering every query"),
+                };
+                let DataRuntimeEvent::DnsResolved {
+                    query,
+                    outcome,
+                    transport: DnsTransport::Tcp,
+                    ..
+                } = envelope.event
+                else {
+                    panic!("expected a TCP DNS response");
+                };
+                let id = query.id();
+                assert!(responses.insert(id, outcome.clone()).is_none());
+                let command = synthesize_dns_command(
+                    flow_id,
+                    query,
+                    outcome,
+                    DnsTransport::Tcp,
+                    &mut SyntheticAddressMap::new(None, None),
+                )
+                .unwrap();
+                let PacketCommand::TcpData { data, .. } = command else {
+                    panic!("expected a framed DNS answer");
+                };
+                assert_eq!(u16::from_be_bytes([data[2], data[3]]), id);
+                assert_eq!(data[5] & 0x0f, if id == 4 { 0 } else { 2 });
+                envelope.acknowledgement.send(()).unwrap();
+            }
+            for id in 1..=3 {
+                assert_eq!(responses[&id], ResolveOutcome::Failure { response_code: 2 });
+            }
+            assert_eq!(responses[&4], ResolveOutcome::NoData);
+            let half_closed = tokio::time::timeout(Duration::from_secs(2), lifecycle_events.recv())
+                .await
+                .expect("TCP DNS did not finish its half-close after answering every query")
+                .unwrap();
+            assert!(matches!(
+                half_closed.event,
+                LifecycleRuntimeEvent::TcpHalfClosed(_)
+            ));
+            half_closed.acknowledgement.send(()).unwrap();
+            handle.messages.send(TcpOutput::Close).await.unwrap();
+            let stopped = lifecycle_events.recv().await.unwrap();
+            assert!(matches!(
+                stopped.event,
+                LifecycleRuntimeEvent::TcpStopped {
+                    reset_operator: false,
+                    ..
+                }
+            ));
+            stopped.acknowledgement.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), scenario)
+            .await
+            .expect("DNS flow did not complete");
     }
 
     #[tokio::test]
