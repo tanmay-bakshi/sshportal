@@ -1199,9 +1199,10 @@ impl PacketEngine {
                 if !data.is_empty() {
                     match transport.try_send_tcp(flow_id, data) {
                         Ok(()) => {
-                            let mut consumed = vec![0_u8; data.len()];
-                            let read = socket.recv_slice(&mut consumed).unwrap_or(0);
-                            debug_assert_eq!(read, consumed.len());
+                            let accepted_bytes = data.len();
+                            socket
+                                .recv(|_| (accepted_bytes, ()))
+                                .expect("TCP bytes accepted by the transport must remain readable");
                             flow.idle_deadline = now.saturating_add(self.limits.tcp_idle_timeout);
                         }
                         Err(TransportSendError::Full) => {}
@@ -2179,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn full_transport_does_not_consume_tcp_receive_bytes() {
+    fn full_transport_defers_tcp_open() {
         let limits = PacketEngineLimits {
             max_tcp_data_event_bytes: 4,
             ..PacketEngineLimits::default()
@@ -2196,6 +2197,65 @@ mod tests {
         engine.poll(Duration::ZERO, &mut transport).unwrap();
         assert!(engine.pop_egress().is_none());
         assert_eq!(engine.tcp_by_id.len(), 1);
+    }
+
+    #[test]
+    fn full_transport_does_not_consume_tcp_receive_bytes() {
+        let limits = PacketEngineLimits {
+            max_tcp_data_event_bytes: 4,
+            ..PacketEngineLimits::default()
+        };
+        let mut engine = PacketEngine::new(limits, 31);
+        let mut transport = TestTransport::with_capacity(16);
+        let operator = "10.0.0.2:50145".parse().unwrap();
+        let target = "203.0.113.45:443".parse().unwrap();
+        let (flow_id, server_sequence) =
+            establish_tcp(&mut engine, &mut transport, operator, target, 3_000);
+        transport.capacity = 0;
+        engine
+            .push_ingress(tcp_segment(
+                operator,
+                target,
+                3_001,
+                server_sequence + 1,
+                0x19,
+                b"12345678",
+            ))
+            .unwrap();
+        engine
+            .poll(Duration::from_millis(3), &mut transport)
+            .unwrap();
+        let socket = engine.tcp_by_id[&flow_id].socket;
+        assert_eq!(engine.sockets.get::<TcpSocket>(socket).recv_queue(), 8);
+        assert!(transport.events.is_empty());
+
+        transport.capacity = 1;
+        for (time, expected, remaining) in [(4, b"1234", 4), (5, b"5678", 0)] {
+            engine
+                .poll(Duration::from_millis(time), &mut transport)
+                .unwrap();
+            assert_eq!(
+                engine.sockets.get::<TcpSocket>(socket).recv_queue(),
+                remaining
+            );
+            assert_eq!(
+                transport.events.pop_front(),
+                Some(Event::Tcp(flow_id, Bytes::copy_from_slice(expected)))
+            );
+            assert!(transport.events.is_empty());
+        }
+        engine
+            .poll(Duration::from_millis(6), &mut transport)
+            .unwrap();
+        assert_eq!(
+            transport.events.pop_front(),
+            Some(Event::TcpHalfClose(flow_id))
+        );
+        assert!(transport.events.is_empty());
+        engine
+            .poll(Duration::from_millis(7), &mut transport)
+            .unwrap();
+        assert!(transport.events.is_empty());
     }
 
     #[test]
