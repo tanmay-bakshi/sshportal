@@ -179,13 +179,18 @@ impl Eq for DnsName {}
 
 impl Hash for DnsName {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.labels.len().hash(state);
+        // A complete, ASCII-folded wire name keeps label boundaries significant.
+        let mut canonical = [0_u8; MAX_WIRE_NAME_LENGTH];
+        let mut wire_len = 0;
         for label in &self.labels {
-            label.len().hash(state);
-            for &byte in label {
-                byte.to_ascii_lowercase().hash(state);
-            }
+            canonical[wire_len] = label.len() as u8;
+            wire_len += 1;
+            let end = wire_len + label.len();
+            canonical[wire_len..end].copy_from_slice(label);
+            canonical[wire_len..end].make_ascii_lowercase();
+            wire_len = end;
         }
+        canonical[..wire_len + 1].hash(state);
     }
 }
 
@@ -277,6 +282,36 @@ mod tests {
         map.insert(upper, 7);
 
         assert_eq!(map.get(&lower), Some(&7));
+    }
+
+    #[test]
+    fn binary_names_keep_case_insensitive_hash_identity_at_label_limits() {
+        let labels = [63, 63, 63, 61]
+            .into_iter()
+            .map(|length| {
+                [b'A', b'Z', 0, 0xff, b'.']
+                    .into_iter()
+                    .cycle()
+                    .take(length)
+                    .collect()
+            })
+            .collect::<Vec<Vec<u8>>>();
+        let original = DnsName::from_wire_labels(labels.clone()).unwrap();
+        let lowercase = DnsName::from_wire_labels(
+            labels
+                .into_iter()
+                .map(|mut label| {
+                    label.make_ascii_lowercase();
+                    label
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(original, 7);
+
+        assert_eq!(map.get(&lowercase), Some(&7));
+        assert_eq!(lowercase.wire_len(), 255);
     }
 
     #[test]
