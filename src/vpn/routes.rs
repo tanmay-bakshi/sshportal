@@ -1288,7 +1288,7 @@ fn apply_route<E: CommandExecutor>(
             {
                 return Ok(());
             }
-            run_required(
+            run_required_macos_route(
                 executor,
                 &CommandSpec::new(
                     "route",
@@ -1311,7 +1311,7 @@ fn apply_route<E: CommandExecutor>(
             {
                 return Ok(());
             }
-            run_required(
+            run_required_macos_route(
                 executor,
                 &CommandSpec::new(
                     "route",
@@ -1394,7 +1394,7 @@ fn replace_bypass_resource<E: CommandExecutor>(
                 target: RouteTarget::MacosGateway { gateway },
             },
         ) if old_prefix == new_prefix => {
-            run_required(
+            run_required_macos_route(
                 executor,
                 &CommandSpec::new(
                     "route",
@@ -1638,7 +1638,7 @@ fn cleanup_route<E: CommandExecutor>(
             if !macos_route_matches(executor, prefix, None, Some(interface))? {
                 return Ok(());
             }
-            run_cleanup_command(
+            run_macos_route_command(
                 executor,
                 &CommandSpec::new(
                     "route",
@@ -1652,14 +1652,14 @@ fn cleanup_route<E: CommandExecutor>(
                         interface.clone(),
                     ],
                 ),
-                &["not in table", "No such process"],
-            )
+            )?;
+            Ok(())
         }
         RouteTarget::MacosGateway { gateway } => {
             if !macos_route_matches(executor, prefix, Some(gateway), None)? {
                 return Ok(());
             }
-            run_cleanup_command(
+            run_macos_route_command(
                 executor,
                 &CommandSpec::new(
                     "route",
@@ -1672,8 +1672,8 @@ fn cleanup_route<E: CommandExecutor>(
                         gateway.clone(),
                     ],
                 ),
-                &["not in table", "No such process"],
-            )
+            )?;
+            Ok(())
         }
         RouteTarget::Windows {
             interface_index,
@@ -2363,9 +2363,9 @@ fn path_is_available<E: CommandExecutor>(
     executor: &E,
     path: &PeerPath,
 ) -> Result<bool> {
-    let command = match (platform, path) {
+    match (platform, path) {
         (Platform::Linux, PeerPath::Linux(path)) => {
-            return linux_parent_route_is_present(executor, &path.parent);
+            linux_parent_route_is_present(executor, &path.parent)
         }
         (
             Platform::Macos,
@@ -2373,38 +2373,44 @@ fn path_is_available<E: CommandExecutor>(
                 interface: Some(interface),
                 ..
             },
-        ) => CommandSpec::new("ifconfig", [interface]),
+        ) => {
+            let command = CommandSpec::new("ifconfig", [interface]);
+            let output = executor.execute(&command)?;
+            if output.exit_code == Some(1)
+                && output.stdout.trim().is_empty()
+                && output.stderr.trim() == format!("ifconfig: interface {interface} does not exist")
+            {
+                return Ok(false);
+            }
+            Ok(output.require_success(&command)?.contains("status: active"))
+        }
         (
             Platform::Macos,
             PeerPath::Macos {
                 interface: None, ..
             },
-        ) => return Ok(false),
+        ) => Ok(false),
         (
             Platform::Windows,
             PeerPath::Windows {
                 interface_index, ..
             },
-        ) => powershell(format!(
-            "$adapter = Get-NetAdapter -InterfaceIndex {interface_index} \
-                 -ErrorAction SilentlyContinue; \
-             if ($null -ne $adapter -and $adapter.Status -eq 'Up') {{ 'available' }}"
-        )),
+        ) => {
+            let output = run_required(
+                executor,
+                &powershell(format!(
+                    "$adapter = Get-NetAdapter -ErrorAction Stop \
+                     | Where-Object {{ $_.InterfaceIndex -eq {interface_index} -and $_.Status -eq 'Up' }}; \
+                 if ($null -ne $adapter) {{ 'available' }} else {{ 'unavailable' }}"
+                )),
+            )?;
+            match output.trim() {
+                "available" => Ok(true),
+                "unavailable" => Ok(false),
+                _ => bail!("Windows returned an invalid adapter availability result"),
+            }
+        }
         _ => bail!("peer path does not belong to {platform:?}"),
-    };
-    let output = executor.execute(&command)?;
-    if output.exit_code != Some(0) {
-        return Ok(false);
-    }
-    match platform {
-        Platform::Linux => Ok(output.stdout.contains("state UP")
-            || output
-                .stdout
-                .lines()
-                .next()
-                .is_some_and(|line| line.contains("<") && line.contains("UP"))),
-        Platform::Macos => Ok(output.stdout.contains("status: active")),
-        Platform::Windows => Ok(output.stdout.trim() == "available"),
     }
 }
 
@@ -2585,7 +2591,7 @@ fn lookup_peer_path<E: CommandExecutor>(
     match platform {
         Platform::Linux => lookup_linux_peer_path(executor, transport).map(PeerPath::Linux),
         Platform::Macos => {
-            let output = run_required(
+            let output = run_macos_route_lookup(
                 executor,
                 &CommandSpec::new(
                     "route",
@@ -2596,7 +2602,8 @@ fn lookup_peer_path<E: CommandExecutor>(
                         &peer.to_string(),
                     ],
                 ),
-            )?;
+            )?
+            .context("macOS found no route to the WebSocket peer")?;
             parse_macos_peer_path(&output)
         }
         Platform::Windows => {
@@ -2624,17 +2631,17 @@ fn lookup_default_path<E: CommandExecutor>(
         ),
         Platform::Windows => find_windows_default_route(ipv6),
     };
-    let output = executor.execute(&command)?;
-    if output.exit_code != Some(0) {
-        return Ok(None);
-    }
-    if output.stdout.trim().is_empty() {
-        return Ok(None);
-    }
     match platform {
         Platform::Linux => unreachable!("Linux returned before executing a default-route probe"),
-        Platform::Macos => parse_macos_peer_path(&output.stdout).map(Some),
-        Platform::Windows => parse_windows_peer_path(&output.stdout).map(Some),
+        Platform::Macos => run_macos_route_lookup(executor, &command)?
+            .map(|output| parse_macos_peer_path(&output))
+            .transpose(),
+        Platform::Windows => {
+            let output = run_required(executor, &command)?;
+            let route: Option<WindowsRoutePath> = serde_json::from_str(output.trim())
+                .context("failed to decode Windows default route lookup")?;
+            route.map(WindowsRoutePath::into_peer_path).transpose()
+        }
     }
 }
 
@@ -2650,15 +2657,7 @@ fn parse_macos_peer_path(output: &str) -> Result<PeerPath> {
 fn parse_windows_peer_path(output: &str) -> Result<PeerPath> {
     let route: WindowsRoutePath =
         serde_json::from_str(output.trim()).context("failed to decode Windows route lookup")?;
-    Ok(PeerPath::Windows {
-        next_hop: normalize_ip(
-            route
-                .next_hop
-                .parse()
-                .context("Windows returned an invalid route next hop")?,
-        ),
-        interface_index: route.interface_index,
-    })
+    route.into_peer_path()
 }
 
 #[derive(Deserialize)]
@@ -2666,6 +2665,19 @@ fn parse_windows_peer_path(output: &str) -> Result<PeerPath> {
 struct WindowsRoutePath {
     interface_index: u32,
     next_hop: String,
+}
+
+impl WindowsRoutePath {
+    fn into_peer_path(self) -> Result<PeerPath> {
+        Ok(PeerPath::Windows {
+            next_hop: normalize_ip(
+                self.next_hop
+                    .parse()
+                    .context("Windows returned an invalid route next hop")?,
+            ),
+            interface_index: self.interface_index,
+        })
+    }
 }
 
 fn inventory_routes<E: CommandExecutor>(platform: Platform, executor: &E) -> Result<Vec<IpNet>> {
@@ -3036,37 +3048,72 @@ fn macos_route_matches<E: CommandExecutor>(
     gateway: Option<&str>,
     interface: Option<&str>,
 ) -> Result<bool> {
-    let output = executor.execute(&CommandSpec::new(
-        "route",
-        [
-            "-n",
-            "get",
-            macos_family_flag(prefix),
-            &prefix.addr().to_string(),
-        ],
-    ))?;
-    if output.exit_code != Some(0) {
-        if ["not in table", "No such process"]
-            .iter()
-            .any(|marker| output.stderr.contains(marker) || output.stdout.contains(marker))
-        {
-            return Ok(false);
-        }
-        let detail = if output.stderr.trim().is_empty() {
-            output.stdout.trim()
-        } else {
-            output.stderr.trim()
-        };
-        bail!("failed to inspect macOS route `{prefix}`: {detail}");
-    }
-    if !macos_destination_matches(&output.stdout, prefix) {
+    let Some(output) = run_macos_route_lookup(
+        executor,
+        &CommandSpec::new(
+            "route",
+            [
+                "-n",
+                "get",
+                macos_family_flag(prefix),
+                &prefix.addr().to_string(),
+            ],
+        ),
+    )?
+    else {
+        return Ok(false);
+    };
+    if !macos_destination_matches(&output, prefix) {
         return Ok(false);
     }
-    let gateway_matches = gateway
-        .is_none_or(|expected| macos_route_value(&output.stdout, "gateway") == Some(expected));
-    let interface_matches = interface
-        .is_none_or(|expected| macos_route_value(&output.stdout, "interface") == Some(expected));
+    let gateway_matches =
+        gateway.is_none_or(|expected| macos_route_value(&output, "gateway") == Some(expected));
+    let interface_matches =
+        interface.is_none_or(|expected| macos_route_value(&output, "interface") == Some(expected));
     Ok(gateway_matches && interface_matches)
+}
+
+fn run_macos_route_lookup<E: CommandExecutor>(
+    executor: &E,
+    command: &CommandSpec,
+) -> Result<Option<String>> {
+    let Some(output) = run_macos_route_command(executor, command)? else {
+        return Ok(None);
+    };
+    if macos_route_value(&output, "destination").is_none() {
+        bail!("`{}` returned no route destination", command.display());
+    }
+    Ok(Some(output))
+}
+
+fn run_required_macos_route<E: CommandExecutor>(
+    executor: &E,
+    command: &CommandSpec,
+) -> Result<String> {
+    run_macos_route_command(executor, command)?
+        .with_context(|| format!("`{}` failed: route not found", command.display()))
+}
+
+fn run_macos_route_command<E: CommandExecutor>(
+    executor: &E,
+    command: &CommandSpec,
+) -> Result<Option<String>> {
+    let output = executor.execute(command)?;
+    // Darwin route can exit successfully after a routing-socket error. Only
+    // ESRCH establishes absence; other diagnostics indicate an operation failure.
+    if matches!(output.exit_code, Some(0 | 1))
+        && matches!(
+            output.stderr.trim(),
+            "route: writing to routing socket: not in table"
+                | "route: message indicates error 3: No such process"
+        )
+    {
+        return Ok(None);
+    }
+    if !output.stderr.trim().is_empty() {
+        bail!("`{}` failed: {}", command.display(), output.stderr.trim());
+    }
+    output.require_success(command).map(Some)
 }
 
 fn macos_destination_matches(output: &str, prefix: IpNet) -> bool {
@@ -3194,11 +3241,11 @@ fn find_windows_default_route(ipv6: bool) -> CommandSpec {
     let family = if ipv6 { "IPv6" } else { "IPv4" };
     let prefix = if ipv6 { "::/0" } else { "0.0.0.0/0" };
     powershell(format!(
-        "$route = Get-NetRoute -AddressFamily {family} -DestinationPrefix '{prefix}' \
-             -PolicyStore ActiveStore -ErrorAction Stop \
+        "$route = Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop \
+             | Where-Object {{ $_.AddressFamily -eq '{family}' -and $_.DestinationPrefix -eq '{prefix}' }} \
              | Sort-Object @{{Expression={{$_.RouteMetric + $_.InterfaceMetric}}}} \
              | Select-Object -First 1; \
-         if ($null -eq $route) {{ throw 'No default route found' }}; \
+         if ($null -eq $route) {{ 'null'; return }}; \
          [pscustomobject]@{{InterfaceIndex=$route.InterfaceIndex;NextHop=$route.NextHop}} \
          | ConvertTo-Json -Compress"
     ))
@@ -4319,6 +4366,213 @@ mod tests {
     }
 
     #[test]
+    fn macos_route_write_diagnostics_invalidate_successful_exit() {
+        let prefix = "203.0.113.8/32".parse().unwrap();
+        for target in [
+            RouteTarget::MacosInterface {
+                interface: "utun42".to_string(),
+            },
+            RouteTarget::MacosGateway {
+                gateway: "192.0.2.1".to_string(),
+            },
+        ] {
+            let failure = CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: "route: writing to routing socket: Permission denied".to_string(),
+            };
+            let executor = MockExecutor::with_outputs([Ok(failure.clone())]);
+            assert!(apply_route(&executor, prefix, &target, ApplyMode::Initial).is_err());
+            let executor = MockExecutor::with_outputs([
+                Ok(CommandOutput::success(macos_route_fixture(
+                    prefix,
+                    "192.0.2.1",
+                    "utun42",
+                ))),
+                Ok(failure),
+            ]);
+            assert!(cleanup_route(&executor, prefix, &target).is_err());
+            assert_eq!(executor.calls().len(), 2);
+        }
+        let old = OwnedResource::Route {
+            prefix,
+            target: RouteTarget::MacosGateway {
+                gateway: "192.0.2.1".to_string(),
+            },
+        };
+        let new = OwnedResource::Route {
+            prefix,
+            target: RouteTarget::MacosGateway {
+                gateway: "192.0.2.2".to_string(),
+            },
+        };
+        let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+            exit_code: Some(0),
+            stdout: "change host 203.0.113.8: gateway 192.0.2.2: not in table\n".to_string(),
+            stderr: "route: writing to routing socket: not in table\n".to_string(),
+        })]);
+        assert!(replace_bypass_resource(Platform::Macos, &executor, &old, &new).is_err());
+    }
+
+    #[test]
+    fn failed_default_route_inspection_is_not_absence() {
+        for platform in [Platform::Macos, Platform::Windows] {
+            for exit_code in [Some(1), None] {
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: "route inspection failed".to_string(),
+                })]);
+                assert!(lookup_default_path(platform, &executor, false).is_err());
+            }
+            let empty = MockExecutor::with_outputs([Ok(CommandOutput::success(""))]);
+            assert!(lookup_default_path(platform, &empty, false).is_err());
+        }
+    }
+
+    #[test]
+    fn macos_route_diagnostics_are_checked_even_after_successful_exit() {
+        for exit_code in [Some(0), Some(1), None] {
+            let failure = CommandOutput {
+                exit_code,
+                stdout: String::new(),
+                stderr: "route: writing to routing socket: Permission denied".to_string(),
+            };
+            let executor = MockExecutor::with_outputs([Ok(failure.clone())]);
+            let resource = OwnedResource::Route {
+                prefix: "10.20.0.0/16".parse().unwrap(),
+                target: RouteTarget::MacosInterface {
+                    interface: "utun42".to_string(),
+                },
+            };
+            assert!(ensure_resource_present(Platform::Macos, &executor, &resource).is_err());
+            assert_eq!(executor.calls().len(), 1);
+            let executor = MockExecutor::with_outputs([Ok(failure)]);
+            assert!(lookup_default_path(Platform::Macos, &executor, true).is_err());
+        }
+    }
+
+    #[test]
+    fn default_route_absence_requires_a_successful_inspection() {
+        for exit_code in [Some(0), Some(1)] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                exit_code,
+                stdout: String::new(),
+                stderr: "route: writing to routing socket: not in table\n".to_string(),
+            })]);
+            assert_eq!(
+                lookup_default_path(Platform::Macos, &executor, true).unwrap(),
+                None
+            );
+        }
+        let executor = MockExecutor::with_outputs([Ok(CommandOutput::success("null"))]);
+        assert_eq!(
+            lookup_default_path(Platform::Windows, &executor, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_egress_interface_inspection_is_not_unavailability() {
+        for (platform, path) in [
+            (
+                Platform::Macos,
+                PeerPath::Macos {
+                    gateway: "192.0.2.1".to_string(),
+                    interface: Some("en0".to_string()),
+                },
+            ),
+            (
+                Platform::Windows,
+                PeerPath::Windows {
+                    next_hop: "192.0.2.1".parse().unwrap(),
+                    interface_index: 4,
+                },
+            ),
+        ] {
+            for exit_code in [Some(1), None] {
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: "interface inspection failed".to_string(),
+                })]);
+                assert!(path_is_available(platform, &executor, &path).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn successful_egress_inspection_preserves_available_and_missing_states() {
+        let macos_path = PeerPath::Macos {
+            gateway: "192.0.2.1".to_string(),
+            interface: Some("en0".to_string()),
+        };
+        for (status, expected) in [("active", true), ("inactive", false)] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(format!(
+                "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tstatus: {status}\n"
+            )))]);
+            assert_eq!(
+                path_is_available(Platform::Macos, &executor, &macos_path).unwrap(),
+                expected
+            );
+        }
+        for exit_code in [Some(1), None] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                exit_code,
+                stdout: String::new(),
+                stderr: "ifconfig: interface en0 does not exist\n".to_string(),
+            })]);
+            let result = path_is_available(Platform::Macos, &executor, &macos_path);
+            if exit_code.is_some() {
+                assert!(!result.unwrap());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let windows_path = PeerPath::Windows {
+            next_hop: "192.0.2.1".parse().unwrap(),
+            interface_index: 4,
+        };
+        for (output, expected) in [
+            ("available", Some(true)),
+            ("unavailable", Some(false)),
+            ("", None),
+            ("unexpected", None),
+        ] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(output))]);
+            let result = path_is_available(Platform::Windows, &executor, &windows_path);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected),
+                None => assert!(result.is_err()),
+            }
+        }
+    }
+
+    #[test]
+    fn successful_default_route_inspection_preserves_selected_egress() {
+        let macos = MockExecutor::with_outputs([Ok(CommandOutput::success(
+            "route to: default\ndestination: default\ngateway: 192.0.2.1\ninterface: en0\n",
+        ))]);
+        assert_eq!(
+            lookup_default_path(Platform::Macos, &macos, false).unwrap(),
+            Some(PeerPath::Macos {
+                gateway: "192.0.2.1".to_string(),
+                interface: Some("en0".to_string()),
+            })
+        );
+        let windows = MockExecutor::with_outputs([Ok(CommandOutput::success(
+            r#"{"InterfaceIndex":4,"NextHop":"2001:db8::1"}"#,
+        ))]);
+        assert_eq!(
+            lookup_default_path(Platform::Windows, &windows, true).unwrap(),
+            Some(PeerPath::Windows {
+                next_hop: "2001:db8::1".parse().unwrap(),
+                interface_index: 4,
+            })
+        );
+    }
+
+    #[test]
     fn stale_journal_is_reconciled_before_it_is_removed() {
         let temp = TempDir::new().unwrap();
         let store = journal_store(&temp);
@@ -5251,7 +5505,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires root; creates a temporary utun interface"]
-    fn macos_ipv6_address_lifecycle_matches_the_kernel() {
+    fn macos_address_and_route_lifecycle_matches_the_kernel() {
         let network = VpnNetworkConfiguration::select(
             &inventory_routes(Platform::Macos, &SystemCommandExecutor).unwrap(),
             rand::random(),
@@ -5269,6 +5523,16 @@ mod tests {
         assert!(!resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
         apply_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
         assert!(resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
+        let route = OwnedResource::Route {
+            prefix: IpNet::V6(network.point_to_point_ipv6),
+            target: RouteTarget::MacosInterface {
+                interface: tun::AbstractDevice::tun_name(&device).unwrap(),
+            },
+        };
+        apply_resource(Platform::Macos, &SystemCommandExecutor, &route).unwrap();
+        assert!(apply_resource(Platform::Macos, &SystemCommandExecutor, &route).is_err());
+        assert!(resource_is_present(Platform::Macos, &SystemCommandExecutor, &route).unwrap());
+        cleanup_resource(Platform::Macos, &SystemCommandExecutor, &route).unwrap();
         cleanup_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
         assert!(!resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
         cleanup_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
