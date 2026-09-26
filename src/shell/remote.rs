@@ -192,6 +192,7 @@ impl RemoteShellHandler {
                             break;
                         }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -815,12 +816,47 @@ impl server::Handler for RemoteShellHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, ErrorKind, Read};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use portable_pty::{ChildKiller, ExitStatus as PtyExitStatus};
 
-    use super::{PtyChild, PtyChildState};
+    use super::{PtyChild, PtyChildState, RemoteShellHandler};
+
+    struct InterruptedOutput {
+        interrupted: bool,
+        data: Cursor<&'static [u8]>,
+    }
+
+    impl Read for InterruptedOutput {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(ErrorKind::Interrupted.into());
+            }
+            self.data.read(buffer)
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_output_reads_preserve_the_following_bytes() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        RemoteShellHandler::read_process_output(
+            InterruptedOutput {
+                interrupted: false,
+                data: Cursor::new(b"output after interruption"),
+            },
+            sender,
+        );
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .expect("interruption was treated as end of output");
+        assert_eq!(output, b"output after interruption");
+        assert!(receiver.recv().await.is_none());
+    }
 
     #[derive(Debug)]
     struct FakePtyChild {

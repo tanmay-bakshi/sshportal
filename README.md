@@ -287,7 +287,8 @@ Hostname selection necessarily has a few edges:
   DNS to the normal resolver when they are unavailable.
 - macOS needs root privileges to configure the `utun` routes. Full tunnel and domain-selective
   policies use a process-session-scoped resolver in the SystemConfiguration dynamic store.
-- Windows requires Windows 10 version 1607 or later. System VPN mode needs an elevated terminal
+- Windows requires Windows 10 version 1607 or later. Interactive SSH shells additionally require
+  version 1809 or later for ConPTY support. System VPN mode needs an elevated terminal
   and the signed `wintun.dll` beside `sshportal-server.exe`.
   Full tunnel and domain-selective policies use a session-unique local NRPT rule. Official Windows
   release archives include the DLL and its redistribution license. Before loading Wintun,
