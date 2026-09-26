@@ -128,27 +128,29 @@ fn normalize_cidrs(include_cidrs: Vec<IpNet>) -> Vec<IpNet> {
 
 fn normalize_domains(include_domains: Vec<String>) -> Result<Vec<String>> {
     let mut candidates = include_domains
-        .iter()
-        .map(|domain| normalize_domain(domain))
+        .into_iter()
+        .map(|domain| normalize_domain(&domain))
         .collect::<Result<Vec<_>>>()?;
-    candidates.sort_by(|left, right| {
-        left.split('.')
-            .count()
-            .cmp(&right.split('.').count())
-            .then_with(|| left.cmp(right))
-    });
-    candidates.dedup();
+    candidates.sort_unstable_by(|left, right| left.rsplit('.').cmp(right.rsplit('.')));
 
     let mut normalized: Vec<String> = Vec::new();
     for candidate in candidates {
+        // Sorting from the root label keeps each suffix before its descendants.
+        // Only the last retained suffix can cover the next name.
         if normalized
-            .iter()
-            .any(|existing| domain_matches_suffix(&candidate, existing))
+            .last()
+            .is_some_and(|existing| domain_matches_suffix(&candidate, existing))
         {
             continue;
         }
         normalized.push(candidate);
     }
+    normalized.sort_unstable_by(|left, right| {
+        left.split('.')
+            .count()
+            .cmp(&right.split('.').count())
+            .then_with(|| left.cmp(right))
+    });
     Ok(normalized)
 }
 
@@ -334,6 +336,41 @@ mod tests {
         assert!(policy.matches_domain("xn--bcher-kva.example"));
         assert!(policy.matches_domain("login.bücher.example."));
         assert!(!policy.matches_domain("notbÜcher.example"));
+    }
+
+    #[test]
+    fn domain_normalization_preserves_label_boundaries_and_presentation_order() {
+        let policy = SystemVpnPolicy::new(
+            Vec::new(),
+            [
+                "deep.a.b.example",
+                "login.BÜCHER.example",
+                "x.ab.example",
+                "ORG.",
+                "ab.example",
+                "x.a.example",
+                "a.b.example",
+                "a.example",
+                "xn--bcher-kva.example",
+                "b.a-example",
+                "a.example.org",
+                "org",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.include_domains(),
+            [
+                "org",
+                "a.example",
+                "ab.example",
+                "b.a-example",
+                "xn--bcher-kva.example",
+                "a.b.example",
+            ]
+        );
     }
 
     #[test]
