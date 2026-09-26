@@ -296,6 +296,9 @@ async fn run() -> Result<()> {
     let listener = TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("failed to bind HTTP server to {}", cli.listen))?;
+    let bound_address = listener
+        .local_addr()
+        .context("failed to read HTTP server address")?;
     let (session_sender, session_receiver) = oneshot::channel();
     let (rendezvous_state, _) = watch::channel(RendezvousState::Accepting);
     let state = Arc::new(AppState {
@@ -308,11 +311,11 @@ async fn run() -> Result<()> {
         session_mode,
     });
 
-    println!("sshportal server listening on http://{}", cli.listen);
-    println!("status endpoint: http://{}", cli.listen);
+    println!("sshportal server listening on http://{bound_address}");
+    println!("status endpoint: http://{bound_address}");
     println!(
-        "support websocket endpoint: ws://{}{}?token={}",
-        cli.listen, DEFAULT_CONNECT_PATH, join_token
+        "support websocket endpoint: {}",
+        support_websocket_endpoint(bound_address, &join_token)
     );
     println!(
         "handshake timeout: {}",
@@ -784,6 +787,13 @@ fn resolve_session_mode(cli: &ServerCli) -> Result<ServerSessionMode> {
     })
 }
 
+fn support_websocket_endpoint(listen: SocketAddr, join_token: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("token", join_token)
+        .finish();
+    format!("ws://{listen}{DEFAULT_CONNECT_PATH}?{query}")
+}
+
 fn resolve_join_token(join_token: Option<String>) -> Result<String> {
     if let Some(join_token) = join_token {
         let trimmed = join_token.trim();
@@ -859,7 +869,8 @@ mod tests {
     use super::{
         AppState, EstablishedSession, RendezvousLimits, RendezvousState, ServerCli,
         ServerSessionMode, SessionSummary, render_status_body, request_matches_join_token,
-        resolve_join_token, resolve_session_mode, run_http_server, wait_for_established_session,
+        resolve_join_token, resolve_session_mode, run_http_server, support_websocket_endpoint,
+        wait_for_established_session,
     };
     use sshportal::{
         ClientDecision, ClientHello, ClientMetadata, ControlPacket, DEFAULT_CONNECT_PATH,
@@ -871,6 +882,35 @@ mod tests {
         let token = resolve_join_token(Some("  shared-secret  ".to_string())).unwrap();
 
         assert_eq!(token, "shared-secret");
+    }
+
+    #[test]
+    fn printed_websocket_endpoint_preserves_the_complete_join_token() {
+        for address in ["127.0.0.1:8080", "[::1]:8080"] {
+            for token in [
+                "shared-secret",
+                "a+b",
+                "a&b",
+                "a#b",
+                "%41",
+                "a=b",
+                "雪 /?&+#%",
+                "x\u{001b}[2J",
+            ] {
+                let endpoint = support_websocket_endpoint(address.parse().unwrap(), token);
+                let normalized = sshportal::normalize_websocket_url(&endpoint).unwrap();
+                let request = Request::builder()
+                    .uri(normalized.as_str())
+                    .body(())
+                    .unwrap();
+                assert!(
+                    request_matches_join_token(&request, token),
+                    "token {token:?}: {endpoint:?}"
+                );
+                assert!(endpoint.is_ascii());
+                assert!(!endpoint.chars().any(char::is_control));
+            }
+        }
     }
 
     #[test]
