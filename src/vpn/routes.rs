@@ -1006,9 +1006,10 @@ fn apply_resource<E: CommandExecutor>(
             address,
             prefix_len,
         } => {
+            let query = windows_ipv6_address_inspection(*interface_index, *address, *prefix_len);
             let script = format!(
-                "$existing = Get-NetIPAddress -InterfaceIndex {interface_index} -IPAddress '{address}' -AddressFamily IPv6 -ErrorAction SilentlyContinue; \
-                 if ($null -eq $existing) {{ \
+                "$existing = @({query}); \
+                 if ($existing.Count -eq 0) {{ \
                      New-NetIPAddress -InterfaceIndex {interface_index} -IPAddress '{address}' \
                          -PrefixLength {prefix_len} -AddressFamily IPv6 -PolicyStore ActiveStore \
                          -ErrorAction Stop | Out-Null \
@@ -1175,18 +1176,11 @@ fn resource_is_present<E: CommandExecutor>(
         OwnedResource::WindowsIpv6Address {
             interface_index,
             address,
-            ..
-        } => {
-            let output = run_required(
-                executor,
-                &powershell(format!(
-                    "$address = Get-NetIPAddress -InterfaceIndex {interface_index} \
-                         -IPAddress '{address}' -AddressFamily IPv6 -ErrorAction SilentlyContinue; \
-                     if ($null -ne $address) {{ 'present' }}"
-                )),
-            )?;
-            Ok(output.trim() == "present")
-        }
+            prefix_len,
+        } => windows_resource_is_present(
+            executor,
+            &windows_ipv6_address_inspection(*interface_index, *address, *prefix_len),
+        ),
         OwnedResource::LinuxResolved { .. }
         | OwnedResource::MacosDns { .. }
         | OwnedResource::WindowsNrpt { .. } => Ok(false),
@@ -1235,19 +1229,10 @@ fn route_is_present<E: CommandExecutor>(
             interface_index,
             next_hop,
             metric,
-        } => {
-            let output = run_required(
-                executor,
-                &powershell(format!(
-                    "$route = Get-NetRoute -DestinationPrefix '{prefix}' \
-                         -InterfaceIndex {interface_index} -NextHop '{next_hop}' \
-                         -PolicyStore ActiveStore -ErrorAction SilentlyContinue \
-                         | Where-Object {{ $_.RouteMetric -eq {metric} }}; \
-                     if ($null -ne $route) {{ 'present' }}"
-                )),
-            )?;
-            Ok(output.trim() == "present")
-        }
+        } => windows_resource_is_present(
+            executor,
+            &windows_route_query(prefix, *interface_index, *next_hop, *metric),
+        ),
     }
 }
 
@@ -1332,11 +1317,10 @@ fn apply_route<E: CommandExecutor>(
             next_hop,
             metric,
         } => {
+            let query = windows_route_query(prefix, *interface_index, *next_hop, *metric);
             let script = format!(
-                "$existing = Get-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex {interface_index} \
-                     -NextHop '{next_hop}' -PolicyStore ActiveStore -ErrorAction SilentlyContinue \
-                     | Where-Object {{ $_.RouteMetric -eq {metric} }}; \
-                 if ($null -eq $existing) {{ \
+                "$existing = @({query}); \
+                 if ($existing.Count -eq 0) {{ \
                      New-NetRoute -DestinationPrefix '{prefix}' -InterfaceIndex {interface_index} \
                          -NextHop '{next_hop}' -RouteMetric {metric} -PolicyStore ActiveStore \
                          -ErrorAction Stop | Out-Null \
@@ -1572,20 +1556,13 @@ fn cleanup_resource<E: CommandExecutor>(
         OwnedResource::WindowsIpv6Address {
             interface_index,
             address,
-            ..
+            prefix_len,
         } => {
+            let query = windows_ipv6_address_query(*interface_index, *address);
             let script = format!(
-                "$lookupErrors = @(); \
-                 $address = Get-NetIPAddress -InterfaceIndex {interface_index} \
-                     -IPAddress '{address}' -AddressFamily IPv6 \
-                     -ErrorAction SilentlyContinue -ErrorVariable +lookupErrors; \
-                 $unexpected = @($lookupErrors | Where-Object {{ \
-                     $_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound \
-                 }}); \
-                 if ($unexpected.Count -gt 0) {{ throw $unexpected[0] }}; \
-                 if ($null -ne $address) {{ \
-                     $address | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop \
-                 }}"
+                "$addresses = @({query}); \
+                 $addresses | Where-Object {{ $_.PrefixLength -eq {prefix_len} }} \
+                     | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop"
             );
             run_required(executor, &powershell(script))?;
             Ok(())
@@ -1680,17 +1657,9 @@ fn cleanup_route<E: CommandExecutor>(
             next_hop,
             metric,
         } => {
+            let query = windows_route_query(prefix, *interface_index, *next_hop, *metric);
             let script = format!(
-                "$lookupErrors = @(); \
-                 $routes = @(Get-NetRoute -DestinationPrefix '{prefix}' \
-                     -InterfaceIndex {interface_index} -NextHop '{next_hop}' \
-                     -PolicyStore ActiveStore -ErrorAction SilentlyContinue \
-                     -ErrorVariable +lookupErrors \
-                     | Where-Object {{ $_.RouteMetric -eq {metric} }}); \
-                 $unexpected = @($lookupErrors | Where-Object {{ \
-                     $_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound \
-                 }}); \
-                 if ($unexpected.Count -gt 0) {{ throw $unexpected[0] }}; \
+                "$routes = @({query}); \
                  $routes | Remove-NetRoute -Confirm:$false -ErrorAction Stop"
             );
             run_required(executor, &powershell(script))?;
@@ -3213,7 +3182,8 @@ fn macos_route_kind(prefix: IpNet) -> &'static str {
 
 fn powershell(script: impl Into<String>) -> CommandSpec {
     let script = format!(
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}",
+        "$ErrorActionPreference = 'Stop'; \
+         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}",
         script.into()
     );
     CommandSpec::new(
@@ -3226,6 +3196,60 @@ fn powershell(script: impl Into<String>) -> CommandSpec {
             script,
         ],
     )
+}
+
+fn windows_ipv6_address_query(interface_index: u32, address: Ipv6Addr) -> String {
+    format!(
+        "Get-NetIPAddress -PolicyStore ActiveStore -ErrorAction Stop \
+         | Where-Object -ErrorAction Stop {{ $_.InterfaceIndex -eq {interface_index} \
+             -and $_.AddressFamily -eq 'IPv6' \
+             -and [System.Net.IPAddress]$_.IPAddress -eq [System.Net.IPAddress]'{address}' }}"
+    )
+}
+
+fn windows_ipv6_address_inspection(
+    interface_index: u32,
+    address: Ipv6Addr,
+    prefix_len: u8,
+) -> String {
+    let query = windows_ipv6_address_query(interface_index, address);
+    format!(
+        "{query} | ForEach-Object -ErrorAction Stop {{ \
+             if ($_.PrefixLength -ne {prefix_len}) {{ \
+                 throw 'IPv6 address {address} already exists with a different prefix length' \
+             }}; $_ \
+         }}"
+    )
+}
+
+fn windows_route_query(
+    prefix: IpNet,
+    interface_index: u32,
+    next_hop: IpAddr,
+    metric: u32,
+) -> String {
+    format!(
+        "Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop \
+         | Where-Object -ErrorAction Stop {{ $_.DestinationPrefix -eq '{prefix}' \
+             -and $_.InterfaceIndex -eq {interface_index} \
+             -and [System.Net.IPAddress]$_.NextHop -eq [System.Net.IPAddress]'{next_hop}' \
+             -and $_.RouteMetric -eq {metric} }}"
+    )
+}
+
+fn windows_resource_is_present<E: CommandExecutor>(executor: &E, query: &str) -> Result<bool> {
+    let output = run_required(
+        executor,
+        &powershell(format!(
+            "$resources = @({query}); \
+         if ($resources.Count -gt 0) {{ 'present' }} else {{ 'absent' }}"
+        )),
+    )?;
+    match output.trim() {
+        "present" => Ok(true),
+        "absent" => Ok(false),
+        _ => bail!("Windows returned an invalid resource presence result"),
+    }
 }
 
 fn find_windows_route(peer: IpAddr) -> CommandSpec {
@@ -3727,8 +3751,7 @@ fn process_identity<E: CommandExecutor>(
         Platform::Windows => run_required(
             executor,
             &powershell(format!(
-                "$ErrorActionPreference = 'Stop'; \
-                 $process = $null; \
+                "$process = $null; \
                  try {{ $process = Get-Process -Id {pid} -ErrorAction Stop }} \
                  catch {{ \
                      if ($_.FullyQualifiedErrorId -ne \
@@ -5675,6 +5698,185 @@ mod tests {
     }
 
     #[test]
+    fn windows_resource_inspection_requires_an_explicit_presence_result() {
+        let resources = [
+            OwnedResource::WindowsIpv6Address {
+                interface_index: 42,
+                address: "fd00::2".parse().unwrap(),
+                prefix_len: 126,
+            },
+            OwnedResource::Route {
+                prefix: "10.20.0.0/16".parse().unwrap(),
+                target: RouteTarget::Windows {
+                    interface_index: 42,
+                    next_hop: "192.0.2.1".parse().unwrap(),
+                    metric: ROUTE_METRIC,
+                },
+            },
+        ];
+        for resource in resources {
+            for output in ["", "unexpected"] {
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(output))]);
+                assert!(ensure_resource_present(Platform::Windows, &executor, &resource).is_err());
+                assert_eq!(executor.calls().len(), 1);
+            }
+            for (output, expected) in [("present", true), ("absent", false)] {
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(output))]);
+                assert_eq!(
+                    resource_is_present(Platform::Windows, &executor, &resource).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "windows"), ignore = "requires pwsh on PATH")]
+    fn windows_powershell_stops_when_a_command_cannot_be_resolved() {
+        let mut command = powershell(
+            "Get-SSHPortalMissingCommand; [Console]::Out.Write('continued after failure')",
+        );
+        if !cfg!(target_os = "windows") {
+            command.program = "pwsh".to_string();
+        }
+        let output = SystemCommandExecutor.execute(&command).unwrap();
+        assert_ne!(output.exit_code, Some(0));
+        assert!(output.stdout.is_empty(), "{}", output.stdout);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "windows"), ignore = "requires pwsh on PATH")]
+    fn windows_resource_scripts_preserve_inventory_and_mutation_boundaries() {
+        let resources = [
+            (
+                OwnedResource::WindowsIpv6Address {
+                    interface_index: 42,
+                    address: "fd00::2".parse().unwrap(),
+                    prefix_len: 126,
+                },
+                serde_json::json!({
+                    "Id": "owned", "InterfaceIndex": 42, "AddressFamily": "IPv6",
+                    "IPAddress": "fd00:0:0:0:0:0:0:2", "PrefixLength": 126,
+                }),
+                "PrefixLength",
+            ),
+            (
+                OwnedResource::Route {
+                    prefix: "10.20.0.0/16".parse().unwrap(),
+                    target: RouteTarget::Windows {
+                        interface_index: 42,
+                        next_hop: "192.0.2.1".parse().unwrap(),
+                        metric: ROUTE_METRIC,
+                    },
+                },
+                serde_json::json!({
+                    "Id": "owned", "InterfaceIndex": 42, "DestinationPrefix": "10.20.0.0/16",
+                    "NextHop": "192.0.2.1", "RouteMetric": 4,
+                }),
+                "RouteMetric",
+            ),
+        ];
+        let mut cases = Vec::new();
+        let mut expected = Vec::new();
+        for (resource, row, identity_field) in resources {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success("absent"))]);
+            assert!(!resource_is_present(Platform::Windows, &executor, &resource).unwrap());
+            apply_resource(Platform::Windows, &executor, &resource).unwrap();
+            cleanup_resource(Platform::Windows, &executor, &resource).unwrap();
+            for (operation, command) in executor.calls().iter().enumerate() {
+                for mode in ["None", "ObjectNotFound", "Partial"] {
+                    cases.push(serde_json::json!({
+                        "Command": command.arguments.last().unwrap(), "Rows": [&row], "FailureMode": mode,
+                    }));
+                    expected.push(serde_json::json!({
+                        "Failed": mode != "None",
+                        "Output": if operation == 0 && mode == "None" { vec!["present"] } else { vec![] },
+                        "Mutations": if operation == 2 && mode == "None" { vec!["remove:owned"] } else { vec![] },
+                    }));
+                }
+                cases.push(serde_json::json!({
+                    "Command": command.arguments.last().unwrap(), "Rows": [], "FailureMode": "None",
+                }));
+                expected.push(serde_json::json!({
+                    "Failed": false,
+                    "Output": if operation == 0 { vec!["absent"] } else { vec![] },
+                    "Mutations": if operation == 1 { vec!["create"] } else { vec![] },
+                }));
+            }
+            let mut foreign = row.clone();
+            foreign[identity_field] = serde_json::json!(64);
+            foreign["Id"] = serde_json::json!("foreign");
+            cases.push(serde_json::json!({
+                "Command": executor.calls()[2].arguments.last().unwrap(),
+                "Rows": [&foreign], "FailureMode": "None",
+            }));
+            expected.push(serde_json::json!({ "Failed": false, "Output": [], "Mutations": [] }));
+            cases.push(serde_json::json!({
+                "Command": executor.calls()[2].arguments.last().unwrap(),
+                "Rows": [row, &foreign], "FailureMode": "None",
+            }));
+            expected.push(
+                serde_json::json!({ "Failed": false, "Output": [], "Mutations": ["remove:owned"] }),
+            );
+            if matches!(resource, OwnedResource::WindowsIpv6Address { .. }) {
+                for command in executor.calls().iter().take(2) {
+                    cases.push(serde_json::json!({
+                        "Command": command.arguments.last().unwrap(), "Rows": [&foreign], "FailureMode": "None",
+                    }));
+                    expected
+                        .push(serde_json::json!({ "Failed": true, "Output": [], "Mutations": [] }));
+                }
+            }
+        }
+
+        let mut script = tempfile::Builder::new().suffix(".ps1").tempfile().unwrap();
+        script
+            .write_all(include_bytes!("windows_resource_test.ps1"))
+            .unwrap();
+        let program = if cfg!(target_os = "windows") {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        };
+        let mut child = Command::new(program)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&cases).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual, expected,
+                "PowerShell case {index}: {}",
+                cases[index]
+            );
+        }
+    }
+
+    #[test]
     fn linux_command_plan_uses_runtime_interface_gateway_and_synthetic_addresses() {
         let network = selected_network(true);
         let plan = RoutePlan::for_policy(&SystemVpnPolicy::full_tunnel(), network).unwrap();
@@ -5807,7 +6009,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_cleanup_ignores_only_absence_and_surfaces_removal_failures() {
+    fn windows_cleanup_surfaces_command_failures() {
         let route = OwnedResource::Route {
             prefix: "10.20.0.0/16".parse().unwrap(),
             target: RouteTarget::Windows {
@@ -5816,13 +6018,6 @@ mod tests {
                 metric: ROUTE_METRIC,
             },
         };
-        let executor = MockExecutor::default();
-        cleanup_resource(Platform::Windows, &executor, &route).unwrap();
-        let script = executor.calls()[0].arguments.last().unwrap().clone();
-        assert!(script.contains("ErrorVariable +lookupErrors"));
-        assert!(script.contains("ErrorCategory]::ObjectNotFound"));
-        assert!(script.contains("Remove-NetRoute -Confirm:$false -ErrorAction Stop"));
-
         let failing = MockExecutor::with_outputs([Ok(CommandOutput {
             exit_code: Some(1),
             stdout: String::new(),
