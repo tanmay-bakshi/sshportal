@@ -988,19 +988,7 @@ fn apply_resource<E: CommandExecutor>(
             };
             run_required(
                 executor,
-                &CommandSpec::new(
-                    "ip",
-                    [
-                        "-6".to_string(),
-                        "address".to_string(),
-                        verb.to_string(),
-                        format!("{address}/{prefix_len}"),
-                        "peer".to_string(),
-                        gateway.to_string(),
-                        "dev".to_string(),
-                        interface.clone(),
-                    ],
-                ),
+                &linux_ipv6_address_command(verb, interface, *address, *gateway, *prefix_len),
             )?;
             Ok(())
         }
@@ -1055,6 +1043,29 @@ fn apply_resource<E: CommandExecutor>(
             bail!("DNS resources must be applied with their desired DNS policy")
         }
     }
+}
+
+fn linux_ipv6_address_command(
+    verb: &str,
+    interface: &str,
+    address: Ipv6Addr,
+    gateway: Ipv6Addr,
+    prefix_len: u8,
+) -> CommandSpec {
+    // With an explicit peer, Linux takes the prefix length from the peer address.
+    CommandSpec::new(
+        "ip",
+        [
+            "-6".to_string(),
+            "address".to_string(),
+            verb.to_string(),
+            address.to_string(),
+            "peer".to_string(),
+            format!("{gateway}/{prefix_len}"),
+            "dev".to_string(),
+            interface.to_string(),
+        ],
+    )
 }
 
 fn resource_is_present<E: CommandExecutor>(
@@ -1450,22 +1461,16 @@ fn cleanup_resource<E: CommandExecutor>(
         OwnedResource::LinuxIpv6Address {
             interface,
             address,
-            gateway: _,
+            gateway,
             prefix_len,
         } => run_cleanup_command(
             executor,
-            &CommandSpec::new(
-                "ip",
-                [
-                    "-6",
-                    "address",
-                    "del",
-                    &format!("{address}/{prefix_len}"),
-                    "dev",
-                    interface,
-                ],
-            ),
-            &["Cannot find device", "Cannot assign requested address"],
+            &linux_ipv6_address_command("del", interface, *address, *gateway, *prefix_len),
+            &[
+                "Cannot find device",
+                "Cannot assign requested address",
+                "ipv6: address not found",
+            ],
         ),
         OwnedResource::LinuxResolved { interface } => run_cleanup_command(
             executor,
@@ -5102,6 +5107,69 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN, iproute2, and /dev/net/tun in an isolated network namespace"]
+    fn linux_ipv6_address_lifecycle_matches_the_kernel() {
+        struct TestInterface(String);
+
+        impl Drop for TestInterface {
+            fn drop(&mut self) {
+                if let Err(error) = run_required(
+                    &SystemCommandExecutor,
+                    &CommandSpec::new("ip", ["link", "del", &self.0]),
+                ) {
+                    eprintln!("failed to remove test interface {}: {error:#}", self.0);
+                }
+            }
+        }
+
+        let name = format!("spaddr{}", std::process::id());
+        run_required(
+            &SystemCommandExecutor,
+            &CommandSpec::new("ip", ["tuntap", "add", "dev", &name, "mode", "tun"]),
+        )
+        .unwrap();
+        let interface = TestInterface(name);
+        let resource = OwnedResource::LinuxIpv6Address {
+            interface: interface.0.clone(),
+            address: "fd00::2".parse().unwrap(),
+            gateway: "fd00::1".parse().unwrap(),
+            prefix_len: 126,
+        };
+
+        apply_resource(
+            Platform::Linux,
+            &SystemCommandExecutor,
+            &resource,
+            ApplyMode::Initial,
+        )
+        .unwrap();
+        let inspect = CommandSpec::new("ip", ["-j", "-6", "address", "show", "dev", &interface.0]);
+        let output = run_required(&SystemCommandExecutor, &inspect).unwrap();
+        let inventory: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let addresses = inventory[0]["addr_info"].as_array().unwrap();
+        let address = addresses
+            .iter()
+            .find(|entry| entry["local"] == "fd00::2")
+            .unwrap();
+        assert_eq!(address["address"], "fd00::1");
+        assert_eq!(address["prefixlen"], 126);
+
+        cleanup_resource(Platform::Linux, &SystemCommandExecutor, &resource).unwrap();
+        let output = run_required(&SystemCommandExecutor, &inspect).unwrap();
+        let inventory: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(
+            inventory
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|interface| interface["addr_info"].as_array().unwrap())
+                .all(|entry| entry["local"] != "fd00::2")
+        );
+        cleanup_resource(Platform::Linux, &SystemCommandExecutor, &resource).unwrap();
+    }
+
     #[test]
     fn linux_command_plan_uses_runtime_interface_gateway_and_synthetic_addresses() {
         let network = selected_network(true);
@@ -5135,7 +5203,7 @@ mod tests {
         );
         assert!(displays.iter().any(|display| {
             display.contains(&format!(
-                "ip -6 address add {}/126 peer {} dev tun42",
+                "ip -6 address add {} peer {}/126 dev tun42",
                 network.interface_ipv6, network.gateway_ipv6
             ))
         }));
