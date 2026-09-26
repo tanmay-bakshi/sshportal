@@ -673,14 +673,29 @@ mod tests {
         assert_eq!(method, [SOCKS_VERSION, SOCKS_AUTH_NONE]);
     }
 
-    async fn request_socks_command(
-        stream: &mut TcpStream,
-        command: u8,
-        target: &NetworkTarget,
-    ) -> SocksReply {
-        let mut request = vec![SOCKS_VERSION, command, 0];
+    async fn request_socks_connect(stream: &mut TcpStream, target: &NetworkTarget) -> SocksReply {
+        let mut request = vec![SOCKS_VERSION, SOCKS_CMD_CONNECT, 0];
         encode_socks_target(target, &mut request).unwrap();
         stream.write_all(&request).await.unwrap();
+        read_socks_reply(stream).await
+    }
+
+    async fn request_socks_udp_association(stream: &mut TcpStream) -> SocksReply {
+        stream
+            .write_all(&[
+                SOCKS_VERSION,
+                SOCKS_CMD_UDP_ASSOCIATE,
+                0,
+                SOCKS_ATYP_IPV4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])
+            .await
+            .unwrap();
         read_socks_reply(stream).await
     }
 
@@ -734,7 +749,7 @@ mod tests {
         let mut stream = TcpStream::connect(socks_address).await.unwrap();
         authenticate_without_credentials(&mut stream).await;
         let target = NetworkTarget::new("localhost", destination_port).unwrap();
-        let reply = request_socks_command(&mut stream, SOCKS_CMD_CONNECT, &target).await;
+        let reply = request_socks_connect(&mut stream, &target).await;
         assert_eq!(reply.status, SOCKS_REPLY_SUCCESS);
         stream
     }
@@ -950,11 +965,7 @@ mod tests {
             let proxy = start_network_proxy().await;
             let mut control = TcpStream::connect(proxy.socks_address).await.unwrap();
             authenticate_without_credentials(&mut control).await;
-            let unspecified_target =
-                NetworkTarget::new(Ipv4Addr::UNSPECIFIED.to_string(), 1).unwrap();
-            let reply =
-                request_socks_command(&mut control, SOCKS_CMD_UDP_ASSOCIATE, &unspecified_target)
-                    .await;
+            let reply = request_socks_udp_association(&mut control).await;
             assert_eq!(reply.status, SOCKS_REPLY_SUCCESS);
             let bound_target = reply.bound_target.unwrap();
             let relay_address = SocketAddr::new(
@@ -1001,11 +1012,7 @@ mod tests {
             let proxy = start_network_proxy().await;
             let mut control = TcpStream::connect(proxy.socks_address).await.unwrap();
             authenticate_without_credentials(&mut control).await;
-            let unspecified_target =
-                NetworkTarget::new(Ipv4Addr::UNSPECIFIED.to_string(), 1).unwrap();
-            let reply =
-                request_socks_command(&mut control, SOCKS_CMD_UDP_ASSOCIATE, &unspecified_target)
-                    .await;
+            let reply = request_socks_udp_association(&mut control).await;
             assert_eq!(reply.status, SOCKS_REPLY_SUCCESS);
             let bound_target = reply.bound_target.unwrap();
             let relay_address = SocketAddr::new(

@@ -82,12 +82,10 @@ where
         bail!("unsupported SOCKS address type {}", request_header[3]);
     }
 
-    let target = read_socks_target(stream, request_header[3]).await?;
+    let (host, port) = read_socks_address(stream, request_header[3]).await?;
     match request_header[1] {
-        SOCKS_CMD_CONNECT => {
-            target.validate()?;
-            Ok(SocksRequest::Connect(target))
-        }
+        SOCKS_CMD_CONNECT => Ok(SocksRequest::Connect(NetworkTarget::new(host, port)?)),
+        // RFC 1928 permits an unspecified source endpoint, including port zero.
         SOCKS_CMD_UDP_ASSOCIATE if udp_supported => Ok(SocksRequest::UdpAssociate),
         command => {
             write_socks5_response(stream, SOCKS_REPLY_COMMAND_NOT_SUPPORTED, None)
@@ -139,7 +137,7 @@ where
         .context("failed to flush SOCKS authentication response")
 }
 
-async fn read_socks_target<S>(stream: &mut S, address_type: u8) -> Result<NetworkTarget>
+async fn read_socks_address<S>(stream: &mut S, address_type: u8) -> Result<(String, u16)>
 where
     S: AsyncRead + Unpin,
 {
@@ -158,6 +156,9 @@ where
                 .read_exact(&mut name_length)
                 .await
                 .context("failed to read SOCKS domain length")?;
+            if name_length[0] == 0 {
+                bail!("SOCKS domain name must not be empty");
+            }
             let mut name_bytes = vec![0_u8; usize::from(name_length[0])];
             stream
                 .read_exact(&mut name_bytes)
@@ -181,7 +182,7 @@ where
         .read_exact(&mut port_bytes)
         .await
         .context("failed to read SOCKS destination port")?;
-    NetworkTarget::new(host, u16::from_be_bytes(port_bytes))
+    Ok((host, u16::from_be_bytes(port_bytes)))
 }
 
 pub(crate) async fn write_socks5_response<S>(
@@ -323,9 +324,10 @@ mod tests {
     use crate::network::NetworkTarget;
 
     use super::{
-        SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT, SOCKS_NO_ACCEPTABLE_METHODS,
-        SOCKS_VERSION, SocksUdpDatagram, decode_socks_target, decode_socks_udp_datagram,
-        encode_socks_target, encode_socks_udp_datagram, negotiate_socks5_connect,
+        SOCKS_ATYP_IPV4, SOCKS_ATYP_IPV6, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
+        SOCKS_CMD_UDP_ASSOCIATE, SOCKS_NO_ACCEPTABLE_METHODS, SOCKS_VERSION, SocksRequest,
+        SocksUdpDatagram, decode_socks_target, decode_socks_udp_datagram, encode_socks_target,
+        encode_socks_udp_datagram, negotiate_socks5_connect, negotiate_socks5_network,
     };
 
     #[test]
@@ -410,6 +412,33 @@ mod tests {
 
         let target = server_task.await.unwrap().unwrap();
         assert_eq!(target, NetworkTarget::new("192.0.2.4", 443).unwrap());
+    }
+
+    #[tokio::test]
+    async fn udp_associate_accepts_unspecified_endpoints_without_allowing_zero_port_connects() {
+        for (address_type, address_bytes) in [(SOCKS_ATYP_IPV4, 4), (SOCKS_ATYP_IPV6, 16)] {
+            for command in [SOCKS_CMD_UDP_ASSOCIATE, SOCKS_CMD_CONNECT] {
+                let (mut client, mut server) = duplex(1024);
+                let server_task =
+                    tokio::spawn(async move { negotiate_socks5_network(&mut server).await });
+                client
+                    .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_NONE])
+                    .await
+                    .unwrap();
+                let mut method = [0_u8; 2];
+                client.read_exact(&mut method).await.unwrap();
+                assert_eq!(method, [SOCKS_VERSION, SOCKS_AUTH_NONE]);
+                let mut request = vec![SOCKS_VERSION, command, 0, address_type];
+                request.resize(request.len() + address_bytes + 2, 0);
+                client.write_all(&request).await.unwrap();
+                let result = server_task.await.unwrap();
+                if command == SOCKS_CMD_UDP_ASSOCIATE {
+                    assert_eq!(result.unwrap(), SocksRequest::UdpAssociate);
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
     }
 
     #[tokio::test]
