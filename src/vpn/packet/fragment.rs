@@ -190,8 +190,8 @@ impl FragmentReassembler {
             return AddResult::Reject(FragmentDropReason::ConflictingFinalLength);
         }
         if !fragment.more {
-            if let Some(known_total) = *total_size
-                && known_total != end
+            if total_size.is_some_and(|known_total| known_total != end)
+                || pieces.iter().any(|piece| piece.end() > end)
             {
                 return AddResult::Reject(FragmentDropReason::ConflictingFinalLength);
             }
@@ -416,6 +416,71 @@ mod tests {
         };
         assert_eq!(&packet[20..], b"abcdefghijkl");
         assert_eq!(reassembler.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn contradictory_final_lengths_release_bytes_and_poison_both_arrival_orders() {
+        for (identity, template) in [
+            (key(40), FragmentTemplate::Ipv4(ipv4_header())),
+            (ipv6_key(40), ipv6_header(17)),
+        ] {
+            for final_first in [false, true] {
+                let mut reassembler = FragmentReassembler::new(limits());
+                let final_fragment = IpFragment {
+                    key: identity.clone(),
+                    protocol: 17,
+                    offset: 8,
+                    more: false,
+                    data: Bytes::from_static(b"ijklmnop"),
+                    template: None,
+                };
+                let past_end = IpFragment {
+                    offset: 24,
+                    more: true,
+                    ..final_fragment.clone()
+                };
+                let (first, second) = if final_first {
+                    (final_fragment.clone(), past_end)
+                } else {
+                    (past_end, final_fragment.clone())
+                };
+                assert!(matches!(
+                    reassembler.ingest(Duration::ZERO, first),
+                    ReassemblyResult::Pending
+                ));
+                assert_eq!(reassembler.buffered_bytes(), 8);
+                assert!(matches!(
+                    reassembler.ingest(Duration::ZERO, second),
+                    ReassemblyResult::Dropped(FragmentDropReason::ConflictingFinalLength)
+                ));
+                assert_eq!(reassembler.buffered_bytes(), 0);
+
+                let first_fragment = IpFragment {
+                    key: identity.clone(),
+                    protocol: 17,
+                    offset: 0,
+                    more: true,
+                    data: Bytes::from_static(b"abcdefgh"),
+                    template: Some(template.clone()),
+                };
+                for fragment in [first_fragment.clone(), final_fragment.clone()] {
+                    assert!(matches!(
+                        reassembler.ingest(Duration::from_secs(1), fragment),
+                        ReassemblyResult::Pending
+                    ));
+                }
+                assert_eq!(reassembler.buffered_bytes(), 0);
+                assert!(matches!(
+                    reassembler.ingest(Duration::from_secs(31), first_fragment),
+                    ReassemblyResult::Pending
+                ));
+                assert!(matches!(
+                    reassembler.ingest(Duration::from_secs(31), final_fragment),
+                    ReassemblyResult::Complete(_)
+                ));
+                assert_eq!(reassembler.buffered_bytes(), 0);
+            }
+        }
     }
 
     #[test]
