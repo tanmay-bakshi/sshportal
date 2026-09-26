@@ -8,7 +8,7 @@ use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketS
 use smoltcp::socket::tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::HardwareAddress;
-use smoltcp::wire::{IpCidr, Ipv4Cidr, Ipv6Cidr};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 
 use super::device::{QueueDevice, QueueError};
 use super::fragment::{FragmentDropReason, FragmentLimits, FragmentReassembler, ReassemblyResult};
@@ -686,6 +686,14 @@ impl PacketEngine {
         };
 
         if packet.protocol == IP_PROTOCOL_TCP {
+            // RFC 9293 requires invalid TCP endpoints to be discarded before
+            // creating connection state or generating replies.
+            if !IpAddress::from(packet.source).is_unicast()
+                || !IpAddress::from(packet.target).is_unicast()
+            {
+                self.stats.malformed_packets += 1;
+                return Ok(());
+            }
             if self.ensure_tcp_listener(now, &packet, transport)? == TcpIngressDisposition::Drop {
                 return Ok(());
             }
@@ -1901,6 +1909,64 @@ mod tests {
         }
         pseudo.extend_from_slice(tcp);
         checksum(&pseudo)
+    }
+
+    #[test]
+    fn tcp_rejects_non_unicast_endpoints_without_state_or_replies() {
+        for (operator, target) in [
+            ("0.0.0.0:40000", "198.51.100.10:443"),
+            ("224.0.0.1:40000", "198.51.100.10:443"),
+            ("255.255.255.255:40000", "198.51.100.10:443"),
+            ("192.0.2.2:40000", "0.0.0.0:443"),
+            ("192.0.2.2:40000", "224.0.0.1:443"),
+            ("192.0.2.2:40000", "255.255.255.255:443"),
+            ("[::]:40000", "[fd00::10]:443"),
+            ("[ff02::1]:40000", "[fd00::10]:443"),
+            ("[fd00::2]:40000", "[::]:443"),
+            ("[fd00::2]:40000", "[ff02::1]:443"),
+        ] {
+            let operator: SocketAddr = operator.parse().unwrap();
+            let target: SocketAddr = target.parse().unwrap();
+            for flags in [0x02, 0x10] {
+                let mut engine = PacketEngine::new(PacketEngineLimits::default(), 7);
+                let mut transport = TestTransport::with_capacity(16);
+                engine
+                    .push_ingress(tcp_segment(operator, target, 1_000, 0, flags, &[]))
+                    .unwrap();
+                engine.poll(Duration::ZERO, &mut transport).unwrap();
+
+                assert!(
+                    transport.events.is_empty(),
+                    "{operator} -> {target}, flags {flags}"
+                );
+                assert!(engine.tcp_by_id.is_empty());
+                assert_eq!(engine.sockets.iter().count(), 0);
+                assert!(engine.pop_egress().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unicast_tcp_endpoints_preserve_local_and_private_address_scopes() {
+        for (operator, target) in [
+            ("127.0.0.1:40000", "127.0.0.1:443"),
+            ("10.0.0.2:40000", "10.0.0.10:443"),
+            ("169.254.1.2:40000", "169.254.1.10:443"),
+            ("192.0.2.255:40000", "198.51.100.255:443"),
+            ("[::1]:40000", "[::1]:443"),
+            ("[fd00::2]:40000", "[fd00::10]:443"),
+            ("[fe80::2]:40000", "[fe80::10]:443"),
+        ] {
+            let mut engine = PacketEngine::new(PacketEngineLimits::default(), 7);
+            let mut transport = TestTransport::with_capacity(16);
+            establish_tcp(
+                &mut engine,
+                &mut transport,
+                operator.parse().unwrap(),
+                target.parse().unwrap(),
+                1_000,
+            );
+        }
     }
 
     #[test]
