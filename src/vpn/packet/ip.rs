@@ -222,12 +222,11 @@ fn parse_ipv6(packet: Bytes) -> Result<ParsedIpPacket, ParseError> {
     let target =
         Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).map_err(|_| ParseError::Malformed)?);
 
-    let protocol = packet[6];
-    match protocol {
+    let (protocol, transport) = match packet[6] {
         IP_PROTOCOL_HOP_BY_HOP
         | IP_PROTOCOL_ROUTING
         | IP_PROTOCOL_AUTHENTICATION
-        | IP_PROTOCOL_DESTINATION_OPTIONS => Err(ParseError::UnsupportedExtension),
+        | IP_PROTOCOL_DESTINATION_OPTIONS => return Err(ParseError::UnsupportedExtension),
         IP_PROTOCOL_FRAGMENT => {
             let offset = IPV6_HEADER_BYTES;
             let fragment = packet
@@ -239,22 +238,14 @@ fn parse_ipv6(packet: Bytes) -> Result<ParsedIpPacket, ParseError> {
             }
             let fragment_offset = usize::from(fragment_field & 0xfff8);
             let more_fragments = fragment_field & 1 != 0;
-            // Fragment state is length-accounted, so own only the exact bytes
-            // that reassembly retains.
-            let data =
-                Bytes::copy_from_slice(&packet[offset + IPV6_FRAGMENT_HEADER_BYTES..total_bytes]);
-            if more_fragments && (data.is_empty() || !data.len().is_multiple_of(8)) {
+            let transport = &packet[offset + IPV6_FRAGMENT_HEADER_BYTES..];
+            if more_fragments && (transport.is_empty() || !transport.len().is_multiple_of(8)) {
                 return Err(ParseError::Malformed);
             }
             let end = fragment_offset
-                .checked_add(data.len())
+                .checked_add(transport.len())
                 .ok_or(ParseError::Malformed)?;
-            let unfragmentable_payload = offset - IPV6_HEADER_BYTES;
-            if unfragmentable_payload
-                .checked_add(end)
-                .ok_or(ParseError::Malformed)?
-                > u16::MAX as usize
-            {
+            if end > u16::MAX as usize {
                 return Err(ParseError::Malformed);
             }
             let fragment_protocol = fragment[0];
@@ -268,43 +259,47 @@ fn parse_ipv6(packet: Bytes) -> Result<ParsedIpPacket, ParseError> {
             ) {
                 return Err(ParseError::UnsupportedExtension);
             }
-            Ok(ParsedIpPacket::Fragment(IpFragment {
-                key: FragmentKey::Ipv6 {
-                    source,
-                    target,
-                    identification: u32::from_be_bytes([
-                        fragment[4],
-                        fragment[5],
-                        fragment[6],
-                        fragment[7],
-                    ]),
-                },
-                protocol: fragment_protocol,
-                offset: fragment_offset,
-                more: more_fragments,
-                data,
-                template: if fragment_offset == 0 {
-                    Some(FragmentTemplate::Ipv6 {
-                        header: Bytes::copy_from_slice(&packet[..IPV6_HEADER_BYTES]),
-                        protocol: fragment_protocol,
-                    })
-                } else {
-                    None
-                },
-            }))
+            if fragment_offset != 0 || more_fragments {
+                return Ok(ParsedIpPacket::Fragment(IpFragment {
+                    key: FragmentKey::Ipv6 {
+                        source,
+                        target,
+                        identification: u32::from_be_bytes([
+                            fragment[4],
+                            fragment[5],
+                            fragment[6],
+                            fragment[7],
+                        ]),
+                    },
+                    protocol: fragment_protocol,
+                    offset: fragment_offset,
+                    more: more_fragments,
+                    // Reassembly accounts retained lengths, not backing allocations.
+                    data: Bytes::copy_from_slice(transport),
+                    template: if fragment_offset == 0 {
+                        Some(FragmentTemplate::Ipv6 {
+                            header: Bytes::copy_from_slice(&packet[..IPV6_HEADER_BYTES]),
+                            protocol: fragment_protocol,
+                        })
+                    } else {
+                        None
+                    },
+                }));
+            }
+            // RFC 8200 atomic fragments are complete packets and must not share
+            // reassembly state with other fragments carrying the same identity.
+            (fragment_protocol, transport)
         }
-        _ => {
-            let transport = &packet[IPV6_HEADER_BYTES..total_bytes];
-            let raw = normalize_ipv6(&packet[..IPV6_HEADER_BYTES], protocol, transport)?;
-            Ok(ParsedIpPacket::Complete(CompleteIpPacket {
-                transport: IPV6_HEADER_BYTES..raw.len(),
-                raw,
-                source: IpAddr::V6(source),
-                target: IpAddr::V6(target),
-                protocol,
-            }))
-        }
-    }
+        protocol => (protocol, &packet[IPV6_HEADER_BYTES..]),
+    };
+    let raw = normalize_ipv6(&packet[..IPV6_HEADER_BYTES], protocol, transport)?;
+    Ok(ParsedIpPacket::Complete(CompleteIpPacket {
+        transport: IPV6_HEADER_BYTES..raw.len(),
+        raw,
+        source: IpAddr::V6(source),
+        target: IpAddr::V6(target),
+        protocol,
+    }))
 }
 
 fn normalize_ipv6(header: &[u8], protocol: u8, transport: &[u8]) -> Result<Bytes, ParseError> {

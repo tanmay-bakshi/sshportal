@@ -1730,6 +1730,21 @@ mod tests {
         tcp_segment(source, target, sequence, 0, 0x02, &[])
     }
 
+    fn ipv6_atomic_udp(source: SocketAddr, target: SocketAddr, payload: &[u8], id: u32) -> Bytes {
+        let packet = synthesize_udp_response(source, target, payload, 1500, 0, id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut atomic = BytesMut::with_capacity(packet.len() + 8);
+        atomic.extend_from_slice(&packet[..40]);
+        atomic[4..6].copy_from_slice(&((packet.len() - 40 + 8) as u16).to_be_bytes());
+        atomic[6] = 44;
+        atomic.extend_from_slice(&[packet[6], 0, 0, 0]);
+        atomic.extend_from_slice(&id.to_be_bytes());
+        atomic.extend_from_slice(&packet[40..]);
+        atomic.freeze()
+    }
+
     fn tcp_segment(
         source: SocketAddr,
         target: SocketAddr,
@@ -2149,6 +2164,103 @@ mod tests {
             .unwrap();
         assert!(transport.events.is_empty());
         assert_eq!(engine.stats().oversized_udp_drops, 1);
+    }
+
+    #[test]
+    fn ipv6_atomic_datagrams_do_not_use_reassembly_capacity() {
+        let mut limits = PacketEngineLimits::default();
+        limits.fragments.max_datagrams = 0;
+        limits.fragments.max_buffered_bytes = 0;
+        let mut engine = PacketEngine::new(limits, 32);
+        let mut transport = TestTransport::with_capacity(16);
+        engine
+            .push_ingress(ipv6_atomic_udp(
+                "[fd00::2]:53000".parse().unwrap(),
+                "[2001:db8::1]:53".parse().unwrap(),
+                b"atomic",
+                99,
+            ))
+            .unwrap();
+        engine.poll(Duration::ZERO, &mut transport).unwrap();
+        let Event::OpenUdp(request) = transport.events.pop_front().unwrap() else {
+            panic!("expected an atomic datagram to open a UDP flow");
+        };
+        engine
+            .push_command(PacketCommand::UdpOpened {
+                flow_id: request.flow_id,
+            })
+            .unwrap();
+        engine
+            .poll(Duration::from_millis(1), &mut transport)
+            .unwrap();
+        assert_eq!(
+            transport.events.pop_front(),
+            Some(Event::Udp(request.flow_id, Bytes::from_static(b"atomic")))
+        );
+        assert_eq!(engine.fragments.buffered_bytes(), 0);
+        assert_eq!(engine.stats.fragment_drops, 0);
+    }
+
+    #[test]
+    fn ipv6_atomic_datagrams_leave_matching_fragment_assemblies_untouched() {
+        for poisoned in [false, true] {
+            let mut engine = PacketEngine::new(PacketEngineLimits::default(), 33);
+            let mut transport = TestTransport::with_capacity(16);
+            let operator = "[fd00::2]:53000".parse().unwrap();
+            let target = "[2001:db8::1]:53".parse().unwrap();
+            let fragments =
+                synthesize_udp_response(operator, target, b"fragmented", 56, 0, 99).unwrap();
+            engine.push_ingress(fragments[0].clone()).unwrap();
+            if poisoned {
+                engine.push_ingress(fragments[0].clone()).unwrap();
+            }
+            engine.poll(Duration::ZERO, &mut transport).unwrap();
+            assert!(transport.events.is_empty());
+            let buffered = engine.fragments.buffered_bytes();
+            let drops = engine.stats.fragment_drops;
+
+            engine
+                .push_ingress(ipv6_atomic_udp(operator, target, b"atomic", 99))
+                .unwrap();
+            engine
+                .poll(Duration::from_millis(1), &mut transport)
+                .unwrap();
+            assert_eq!(engine.fragments.buffered_bytes(), buffered);
+            assert_eq!(engine.stats.fragment_drops, drops);
+            let Event::OpenUdp(request) = transport.events.pop_front().unwrap() else {
+                panic!("expected independent atomic datagram delivery");
+            };
+            engine
+                .push_command(PacketCommand::UdpOpened {
+                    flow_id: request.flow_id,
+                })
+                .unwrap();
+            engine
+                .poll(Duration::from_millis(2), &mut transport)
+                .unwrap();
+            assert_eq!(
+                transport.events.pop_front(),
+                Some(Event::Udp(request.flow_id, Bytes::from_static(b"atomic")))
+            );
+
+            for fragment in fragments.into_iter().skip(1) {
+                engine.push_ingress(fragment).unwrap();
+            }
+            engine
+                .poll(Duration::from_millis(3), &mut transport)
+                .unwrap();
+            if !poisoned {
+                assert_eq!(
+                    transport.events.pop_front(),
+                    Some(Event::Udp(
+                        request.flow_id,
+                        Bytes::from_static(b"fragmented")
+                    ))
+                );
+            }
+            assert!(transport.events.is_empty());
+            assert_eq!(engine.fragments.buffered_bytes(), 0);
+        }
     }
 
     #[test]
