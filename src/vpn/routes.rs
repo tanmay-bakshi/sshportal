@@ -93,16 +93,32 @@ impl CommandSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CommandOutput {
-    success: bool,
+    exit_code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
 impl CommandOutput {
+    fn require_success(self, command: &CommandSpec) -> Result<String> {
+        if self.exit_code == Some(0) {
+            return Ok(self.stdout);
+        }
+        let status = match self.exit_code {
+            Some(code) => format!("exit code {code}"),
+            None => "terminated without an exit code".to_string(),
+        };
+        let detail = if self.stderr.trim().is_empty() {
+            self.stdout.trim()
+        } else {
+            self.stderr.trim()
+        };
+        bail!("`{}` failed ({status}): {detail}", command.display())
+    }
+
     #[cfg(test)]
     fn success(stdout: impl Into<String>) -> Self {
         Self {
-            success: true,
+            exit_code: Some(0),
             stdout: stdout.into(),
             stderr: String::new(),
         }
@@ -123,7 +139,7 @@ impl CommandExecutor for SystemCommandExecutor {
             .output()
             .with_context(|| format!("failed to start `{}`", command.display()))?;
         Ok(CommandOutput {
-            success: output.status.success(),
+            exit_code: output.status.code(),
             stdout: String::from_utf8(output.stdout)
                 .with_context(|| format!("`{}` returned non-UTF-8 output", command.display()))?,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -132,16 +148,7 @@ impl CommandExecutor for SystemCommandExecutor {
 }
 
 fn run_required<E: CommandExecutor>(executor: &E, command: &CommandSpec) -> Result<String> {
-    let output = executor.execute(command)?;
-    if output.success {
-        return Ok(output.stdout);
-    }
-    let detail = if output.stderr.trim().is_empty() {
-        output.stdout.trim()
-    } else {
-        output.stderr.trim()
-    };
-    bail!("`{}` failed: {detail}", command.display())
+    executor.execute(command)?.require_success(command)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1065,13 +1072,13 @@ fn resource_is_present<E: CommandExecutor>(
                 "ip",
                 ["-6", "address", "show", "dev", interface],
             ))?;
-            Ok(output.success && output.stdout.contains(&address.to_string()))
+            Ok(output.exit_code == Some(0) && output.stdout.contains(&address.to_string()))
         }
         OwnedResource::MacosIpv6Address {
             interface, address, ..
         } => {
             let output = executor.execute(&CommandSpec::new("ifconfig", [interface]))?;
-            Ok(output.success && output.stdout.contains(&address.to_string()))
+            Ok(output.exit_code == Some(0) && output.stdout.contains(&address.to_string()))
         }
         OwnedResource::WindowsIpv6Address {
             interface_index,
@@ -1612,7 +1619,7 @@ fn run_cleanup_command<E: CommandExecutor>(
     absent_markers: &[&str],
 ) -> Result<()> {
     let output = executor.execute(command)?;
-    if output.success
+    if output.exit_code == Some(0)
         || absent_markers
             .iter()
             .any(|marker| output.stderr.contains(marker) || output.stdout.contains(marker))
@@ -1928,7 +1935,7 @@ fn linux_routes_for_exact_prefix<E: CommandExecutor>(
             prefix.to_string(),
         ],
     ))?;
-    if !output.success {
+    if output.exit_code != Some(0) {
         return Ok(Vec::new());
     }
     parse_linux_route_records(&output.stdout, prefix.addr().is_ipv6(), Some(table))
@@ -2300,7 +2307,7 @@ fn path_is_available<E: CommandExecutor>(
         _ => bail!("peer path does not belong to {platform:?}"),
     };
     let output = executor.execute(&command)?;
-    if !output.success {
+    if output.exit_code != Some(0) {
         return Ok(false);
     }
     match platform {
@@ -2532,7 +2539,7 @@ fn lookup_default_path<E: CommandExecutor>(
         Platform::Windows => find_windows_default_route(ipv6),
     };
     let output = executor.execute(&command)?;
-    if !output.success {
+    if output.exit_code != Some(0) {
         return Ok(None);
     }
     if output.stdout.trim().is_empty() {
@@ -2952,7 +2959,7 @@ fn macos_route_matches<E: CommandExecutor>(
             &prefix.addr().to_string(),
         ],
     ))?;
-    if !output.success {
+    if output.exit_code != Some(0) {
         if ["not in table", "No such process"]
             .iter()
             .any(|marker| output.stderr.contains(marker) || output.stdout.contains(marker))
@@ -3569,20 +3576,51 @@ fn process_identity<E: CommandExecutor>(
     executor: &E,
     pid: u32,
 ) -> Result<Option<String>> {
-    match platform {
-        Platform::Linux => linux_process_identity(pid),
-        Platform::Macos => command_process_identity(
+    let identity = match platform {
+        Platform::Linux => return linux_process_identity(pid),
+        Platform::Macos => {
+            let command = CommandSpec::new("ps", ["-p", &pid.to_string(), "-o", "lstart="]);
+            let output = executor.execute(&command)?;
+            // macOS ps reports an absent PID with exit 1 and no output. A signal
+            // or any other failure does not establish that journal ownership ended.
+            if output.exit_code == Some(1)
+                && output.stdout.trim().is_empty()
+                && output.stderr.trim().is_empty()
+            {
+                return Ok(None);
+            }
+            output.require_success(&command)?
+        }
+        Platform::Windows => run_required(
             executor,
-            CommandSpec::new("ps", ["-p", &pid.to_string(), "-o", "lstart="]),
-        ),
-        Platform::Windows => command_process_identity(
-            executor,
-            powershell(format!(
-                "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
-             if ($null -ne $process) {{ $process.StartTime.ToUniversalTime().Ticks }}"
+            &powershell(format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 $process = $null; \
+                 try {{ $process = Get-Process -Id {pid} -ErrorAction Stop }} \
+                 catch {{ \
+                     if ($_.FullyQualifiedErrorId -ne \
+                         'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.GetProcessCommand') {{ \
+                         throw \
+                     }}; \
+                     'absent'; return \
+                 }}; \
+                 $process.StartTime.ToUniversalTime().Ticks"
             )),
-        ),
+        )?,
+    };
+    let identity = identity.trim();
+    if platform == Platform::Windows {
+        if identity == "absent" {
+            return Ok(None);
+        }
+        identity
+            .parse::<u64>()
+            .context("Windows returned an invalid process start time")?;
     }
+    if identity.is_empty() {
+        bail!("process inspection returned an empty owner identity");
+    }
+    Ok(Some(identity.to_string()))
 }
 
 fn linux_process_identity(pid: u32) -> Result<Option<String>> {
@@ -3605,33 +3643,6 @@ fn linux_process_identity(pid: u32) -> Result<Option<String>> {
         .get(19)
         .context("Linux process stat has no start time")?;
     Ok(Some((*start_time).to_string()))
-}
-
-fn command_process_identity<E: CommandExecutor>(
-    executor: &E,
-    command: CommandSpec,
-) -> Result<Option<String>> {
-    let output = executor.execute(&command)?;
-    if output.success {
-        let identity = output.stdout.trim();
-        return if identity.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(identity.to_string()))
-        };
-    }
-    if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() {
-        return Ok(None);
-    }
-    let detail = if output.stderr.trim().is_empty() {
-        output.stdout.trim()
-    } else {
-        output.stderr.trim()
-    };
-    bail!(
-        "`{}` failed while inspecting a process: {detail}",
-        command.display()
-    )
 }
 
 fn session_name(session_id: [u8; 16]) -> String {
@@ -4001,12 +4012,12 @@ mod tests {
     fn cleanup_is_idempotent_when_routes_and_interfaces_already_disappeared() {
         let executor = MockExecutor::with_outputs([
             Ok(CommandOutput {
-                success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "RTNETLINK answers: No such process".to_string(),
             }),
             Ok(CommandOutput {
-                success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "Cannot find device tun7".to_string(),
             }),
@@ -4065,17 +4076,17 @@ mod tests {
         let executor = MockExecutor::with_outputs([
             Ok(CommandOutput::success("current process identity")),
             Ok(CommandOutput {
-                success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "route: writing to routing socket: not in table".to_string(),
             }),
             Ok(CommandOutput {
-                success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "route: writing to routing socket: not in table".to_string(),
             }),
             Ok(CommandOutput {
-                success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "ifconfig: interface utun19 does not exist".to_string(),
             }),
@@ -4191,7 +4202,7 @@ mod tests {
                 prefix, "utun19", "utun19",
             ))),
             Ok(CommandOutput {
-                success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "route: writing to routing socket: not in table".to_string(),
             }),
@@ -4209,7 +4220,7 @@ mod tests {
     fn macos_cleanup_surfaces_route_inspection_failures() {
         let prefix = "10.20.0.0/16".parse().unwrap();
         let executor = MockExecutor::with_outputs([Ok(CommandOutput {
-            success: false,
+            exit_code: Some(1),
             stdout: String::new(),
             stderr: "route: permission denied".to_string(),
         })]);
@@ -4264,7 +4275,7 @@ mod tests {
         store.begin(&header).unwrap();
         store.arm(&resource).unwrap();
         let executor = MockExecutor::with_outputs([Ok(CommandOutput {
-            success: false,
+            exit_code: Some(1),
             stdout: String::new(),
             stderr: "permission denied".to_string(),
         })]);
@@ -4283,7 +4294,7 @@ mod tests {
                 version: JOURNAL_VERSION,
                 platform,
                 owner_pid: 123,
-                owner_identity: "active process identity".to_string(),
+                owner_identity: "638012345678900000".to_string(),
                 session_id: [4; 16],
             };
             store.begin(&header).unwrap();
@@ -4327,6 +4338,107 @@ mod tests {
             assert!(store.path.exists());
             assert_eq!(executor.calls().len(), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_process_inspection_is_not_process_absence() {
+        let command = CommandSpec::new("sh", ["-c", "kill -TERM $$"]);
+        let output = SystemCommandExecutor.execute(&command).unwrap();
+        assert_eq!(output.exit_code, None);
+        let executor = MockExecutor::with_outputs([Ok(output)]);
+
+        assert!(process_identity(Platform::Macos, &executor, 123).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_owner_inspection_distinguishes_running_and_exited_processes() {
+        let platform = Platform::current().unwrap();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "read marker"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+
+        assert!(
+            process_identity(platform, &SystemCommandExecutor, pid)
+                .unwrap()
+                .is_some()
+        );
+        child.kill().await.unwrap();
+        assert_eq!(
+            process_identity(platform, &SystemCommandExecutor, pid).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unsuccessful_owner_checks_never_release_the_recovery_journal() {
+        for platform in [Platform::Macos, Platform::Windows] {
+            for exit_code in [None, Some(2), Some(127)] {
+                let temp = TempDir::new().unwrap();
+                let store = journal_store(&temp);
+                store
+                    .begin(&JournalHeader {
+                        version: JOURNAL_VERSION,
+                        platform,
+                        owner_pid: 123,
+                        owner_identity: "638012345678900000".to_string(),
+                        session_id: [4; 16],
+                    })
+                    .unwrap();
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })]);
+
+                assert!(recover_stale_journal(platform, &executor, &store).is_err());
+
+                assert!(store.path.exists());
+                assert_eq!(executor.calls().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn process_absence_requires_the_platform_specific_result() {
+        let absent = MockExecutor::with_outputs([Ok(CommandOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+        })]);
+        assert_eq!(
+            process_identity(Platform::Macos, &absent, 123).unwrap(),
+            None
+        );
+
+        let absent = MockExecutor::with_outputs([Ok(CommandOutput::success("absent\r\n"))]);
+        assert_eq!(
+            process_identity(Platform::Windows, &absent, 123).unwrap(),
+            None
+        );
+
+        for platform in [Platform::Macos, Platform::Windows] {
+            let empty = MockExecutor::with_outputs([Ok(CommandOutput::success(""))]);
+            assert!(process_identity(platform, &empty, 123).is_err());
+            let denied = MockExecutor::with_outputs([Ok(CommandOutput {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "access denied".to_string(),
+            })]);
+            assert!(process_identity(platform, &denied, 123).is_err());
+        }
+
+        let failure = MockExecutor::with_outputs([Ok(CommandOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+        })]);
+        assert!(process_identity(Platform::Windows, &failure, 123).is_err());
     }
 
     #[test]
@@ -5081,7 +5193,7 @@ mod tests {
         assert!(script.contains("Remove-NetRoute -Confirm:$false -ErrorAction Stop"));
 
         let failing = MockExecutor::with_outputs([Ok(CommandOutput {
-            success: false,
+            exit_code: Some(1),
             stdout: String::new(),
             stderr: "Access is denied".to_string(),
         })]);
