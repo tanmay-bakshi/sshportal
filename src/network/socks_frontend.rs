@@ -593,7 +593,7 @@ fn socks_reply_for_error(error: &NetworkError) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -777,25 +777,32 @@ mod tests {
         (address, task)
     }
 
-    async fn spawn_localhost_udp_echo_endpoint() -> (SocketAddr, JoinHandle<()>) {
-        let socket = UdpSocket::bind(("localhost", 0)).await.unwrap();
-        let address = socket.local_addr().unwrap();
+    async fn spawn_localhost_udp_echo_endpoint() -> (u16, JoinHandle<SocketAddr>) {
+        let ipv4 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = ipv4.local_addr().unwrap().port();
+        let ipv6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).await.unwrap();
         let task = tokio::spawn(async move {
-            let mut packet = [0_u8; 4096];
-            let (received, peer) = socket.recv_from(&mut packet).await.unwrap();
+            // A hostname service must listen on either family the client can select.
+            let mut ipv4_packet = [0_u8; 4096];
+            let mut ipv6_packet = [0_u8; 4096];
+            let (socket, packet, result) = tokio::select! {
+                result = ipv4.recv_from(&mut ipv4_packet) => (&ipv4, &ipv4_packet, result),
+                result = ipv6.recv_from(&mut ipv6_packet) => (&ipv6, &ipv6_packet, result),
+            };
+            let (received, peer) = result.unwrap();
             let sent = socket.send_to(&packet[..received], peer).await.unwrap();
             assert_eq!(sent, received);
+            socket.local_addr().unwrap()
         });
-        (address, task)
+        (port, task)
     }
 
     async fn send_and_receive_udp(
         socket: &UdpSocket,
         relay_address: SocketAddr,
         request_target: NetworkTarget,
-        response_peer: SocketAddr,
         payload: &'static [u8],
-    ) {
+    ) -> NetworkTarget {
         let request = encode_socks_udp_datagram(&SocksUdpDatagram {
             target: request_target,
             data: Bytes::from_static(payload),
@@ -808,8 +815,8 @@ mod tests {
         let (received, source) = socket.recv_from(&mut response).await.unwrap();
         assert_eq!(source, relay_address);
         let response = decode_socks_udp_datagram(&response[..received]).unwrap();
-        assert_eq!(response.target, NetworkTarget::from(response_peer));
         assert_eq!(response.data, Bytes::from_static(payload));
+        response.target
     }
 
     async fn wait_for_udp_relay_release(address: SocketAddr) -> UdpSocket {
@@ -828,11 +835,11 @@ mod tests {
         .expect("SOCKS UDP relay remained bound after its control connection closed")
     }
 
-    async fn join_endpoint(task: JoinHandle<()>) {
+    async fn join_endpoint<T>(task: JoinHandle<T>) -> T {
         tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, task)
             .await
             .expect("egress endpoint did not finish")
-            .unwrap();
+            .unwrap()
     }
 
     #[tokio::test]
@@ -938,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn udp_associate_round_trips_each_target_and_ends_with_its_control_connection() {
         tokio::time::timeout(TEST_TIMEOUT, async {
-            let (first_endpoint, first_endpoint_task) = spawn_localhost_udp_echo_endpoint().await;
+            let (first_port, first_endpoint_task) = spawn_localhost_udp_echo_endpoint().await;
             let (second_endpoint, second_endpoint_task) = spawn_udp_echo_endpoint().await;
             let proxy = start_network_proxy().await;
             let mut control = TcpStream::connect(proxy.socks_address).await.unwrap();
@@ -956,23 +963,23 @@ mod tests {
             );
             let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 
-            send_and_receive_udp(
+            let first_response_peer = send_and_receive_udp(
                 &udp_client,
                 relay_address,
-                NetworkTarget::new("localhost", first_endpoint.port()).unwrap(),
-                first_endpoint,
+                NetworkTarget::new("localhost", first_port).unwrap(),
                 b"first-datagram",
             )
             .await;
-            send_and_receive_udp(
+            let second_response_peer = send_and_receive_udp(
                 &udp_client,
                 relay_address,
                 NetworkTarget::from(second_endpoint),
-                second_endpoint,
                 b"second-datagram",
             )
             .await;
-            join_endpoint(first_endpoint_task).await;
+            let first_endpoint = join_endpoint(first_endpoint_task).await;
+            assert_eq!(first_response_peer, NetworkTarget::from(first_endpoint));
+            assert_eq!(second_response_peer, NetworkTarget::from(second_endpoint));
             join_endpoint(second_endpoint_task).await;
 
             drop(control);
