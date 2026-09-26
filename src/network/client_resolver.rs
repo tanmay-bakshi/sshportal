@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -176,39 +176,17 @@ fn lookup_socket_addresses(
     let hints = socket_address_hints(resolution_family);
     let addresses = getaddrinfo(Some(hostname), None, Some(hints))
         .map_err(|error| map_lookup_error(hostname, error))?;
-    let mut seen = HashSet::new();
-    let mut ipv4 = Vec::new();
-    let mut ipv6 = Vec::new();
-    let mut first_is_ipv6 = None;
-    for result in addresses {
-        let mut address = result
-            .map_err(|error| {
-                NetworkError::new(
-                    NetworkErrorKind::from_io(&error),
-                    format!("failed to read an address for {hostname}: {error}"),
-                )
-            })?
-            .sockaddr;
-        address.set_port(port);
-        if !resolution_family.allows(address.ip()) {
-            continue;
-        }
-        if !seen.insert(address) {
-            continue;
-        }
-        if first_is_ipv6.is_none() {
-            first_is_ipv6 = Some(address.is_ipv6());
-        }
-        if address.is_ipv4() {
-            ipv4.push(address);
-        } else {
-            ipv6.push(address);
-        }
-        if ipv4.len() + ipv6.len() == MAX_RESOLVED_ADDRESSES {
-            break;
-        }
-    }
-    let addresses = interleave_address_families(ipv4, ipv6, first_is_ipv6.unwrap_or(false));
+    let addresses = select_socket_addresses(
+        addresses.map(|result| result.map(|address| address.sockaddr)),
+        port,
+        resolution_family,
+    )
+    .map_err(|error| {
+        NetworkError::new(
+            NetworkErrorKind::from_io(&error),
+            format!("failed to read an address for {hostname}: {error}"),
+        )
+    })?;
     if addresses.is_empty() {
         return Err(NetworkError::new(
             NetworkErrorKind::NameNotFound,
@@ -216,6 +194,43 @@ fn lookup_socket_addresses(
         ));
     }
     Ok(addresses)
+}
+
+fn select_socket_addresses(
+    addresses: impl Iterator<Item = io::Result<SocketAddr>>,
+    port: u16,
+    resolution_family: ResolutionFamily,
+) -> io::Result<Vec<SocketAddr>> {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    let mut first_is_ipv6 = None;
+    for result in addresses {
+        let mut address = result?;
+        address.set_port(port);
+        if !resolution_family.allows(address.ip()) {
+            continue;
+        }
+        let family = if address.is_ipv4() {
+            &mut ipv4
+        } else {
+            &mut ipv6
+        };
+        if family.len() == MAX_RESOLVED_ADDRESSES || family.contains(&address) {
+            continue;
+        }
+        if first_is_ipv6.is_none() {
+            first_is_ipv6 = Some(address.is_ipv6());
+        }
+        family.push(address);
+        // Native resolvers may group every address of one family first. Bound
+        // each family separately so the final limit cannot hide the fallback.
+        if ipv4.len() == MAX_RESOLVED_ADDRESSES && ipv6.len() == MAX_RESOLVED_ADDRESSES {
+            break;
+        }
+    }
+    let mut ordered = interleave_address_families(ipv4, ipv6, first_is_ipv6.unwrap_or(false));
+    ordered.truncate(MAX_RESOLVED_ADDRESSES);
+    Ok(ordered)
 }
 
 fn socket_address_hints(resolution_family: ResolutionFamily) -> AddrInfoHints {
@@ -304,8 +319,9 @@ mod tests {
 
     use super::{
         ClientResolver, DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_CNAME, DNS_TYPE_HTTPS, DNS_TYPE_SVCB,
-        NativeLookupAdmissionError, NativeLookupClass, NativeLookupOutcome, fully_qualified_name,
-        interleave_address_families, lookup_address_family, socket_address_hints,
+        MAX_RESOLVED_ADDRESSES, NativeLookupAdmissionError, NativeLookupClass, NativeLookupOutcome,
+        fully_qualified_name, interleave_address_families, lookup_address_family,
+        select_socket_addresses, socket_address_hints,
     };
     use crate::network::protocol::ResolutionFamily;
     use crate::network::resolver_protocol::{ResolveOutcome, ResolveRequest};
@@ -373,6 +389,64 @@ mod tests {
         assert!(ordered[1].is_ipv4());
         assert!(ordered[2].is_ipv6());
         assert!(ordered[3].is_ipv4());
+    }
+
+    #[test]
+    fn candidate_limit_preserves_a_family_after_a_long_preferred_family_list() {
+        let ipv4 = (1..=MAX_RESOLVED_ADDRESSES + 4)
+            .map(|index| format!("192.0.2.{index}:0").parse::<SocketAddr>().unwrap())
+            .collect::<Vec<_>>();
+        let ipv6 = (1..=MAX_RESOLVED_ADDRESSES + 4)
+            .map(|index| {
+                format!("[2001:db8::{index}]:0")
+                    .parse::<SocketAddr>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (preferred, fallback) in [(&ipv4, &ipv6), (&ipv6, &ipv4)] {
+            let addresses = preferred.iter().chain(fallback).copied().map(Ok);
+            let selected = select_socket_addresses(addresses, 443, ResolutionFamily::Any).unwrap();
+
+            assert_eq!(selected.len(), MAX_RESOLVED_ADDRESSES);
+            for (index, address) in selected.iter().enumerate() {
+                let family = if index % 2 == 0 { preferred } else { fallback };
+                assert_eq!(address.ip(), family[index / 2].ip());
+                assert_eq!(address.port(), 443);
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_selection_deduplicates_and_honors_family_constraints() {
+        let addresses = [
+            "[2001:db8::1]:0",
+            "192.0.2.1:0",
+            "192.0.2.1:80",
+            "192.0.2.2:0",
+        ]
+        .map(|address| address.parse::<SocketAddr>().unwrap());
+        for family in [
+            ResolutionFamily::Any,
+            ResolutionFamily::Ipv4,
+            ResolutionFamily::Ipv6,
+        ] {
+            let selected =
+                select_socket_addresses(addresses.into_iter().map(Ok), 443, family).unwrap();
+            let expected = match family {
+                ResolutionFamily::Any => {
+                    vec!["[2001:db8::1]:443", "192.0.2.1:443", "192.0.2.2:443"]
+                }
+                ResolutionFamily::Ipv4 => vec!["192.0.2.1:443", "192.0.2.2:443"],
+                ResolutionFamily::Ipv6 => vec!["[2001:db8::1]:443"],
+            };
+            assert_eq!(
+                selected,
+                expected
+                    .into_iter()
+                    .map(|address| address.parse().unwrap())
+                    .collect::<Vec<SocketAddr>>()
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
