@@ -1713,6 +1713,17 @@ mod tests {
         tcp_segment(source, target, sequence, 0, 0x02, &[])
     }
 
+    fn tcp_syn_with_options(source: SocketAddr, target: SocketAddr, options: &[u8]) -> Bytes {
+        assert!(options.len().is_multiple_of(4) && options.len() <= 40);
+        let mut packet = tcp_segment(source, target, 1_000, 0, 0x02, options).to_vec();
+        let ip_header_bytes = if source.is_ipv4() { 20 } else { 40 };
+        packet[ip_header_bytes + 12] = (((20 + options.len()) / 4) as u8) << 4;
+        packet[ip_header_bytes + 16..ip_header_bytes + 18].fill(0);
+        let checksum = tcp_checksum(source.ip(), target.ip(), &packet[ip_header_bytes..]);
+        packet[ip_header_bytes + 16..ip_header_bytes + 18].copy_from_slice(&checksum.to_be_bytes());
+        Bytes::from(packet)
+    }
+
     fn ipv6_atomic_udp(source: SocketAddr, target: SocketAddr, payload: &[u8], id: u32) -> Bytes {
         let packet = synthesize_udp_response(source, target, payload, 1500, 0, id)
             .unwrap()
@@ -1890,6 +1901,71 @@ mod tests {
         }
         pseudo.extend_from_slice(tcp);
         checksum(&pseudo)
+    }
+
+    #[test]
+    fn malformed_tcp_options_do_not_open_remote_connections() {
+        for (operator, target) in [
+            ("192.0.2.2:40000", "198.51.100.10:443"),
+            ("[fd00::2]:40000", "[fd00::10]:443"),
+        ] {
+            let operator: SocketAddr = operator.parse().unwrap();
+            let target: SocketAddr = target.parse().unwrap();
+            for options in [[2, 3, 0, 0], [254, 0, 0, 0], [8, 10, 0, 0]] {
+                let mut engine = PacketEngine::new(PacketEngineLimits::default(), 7);
+                let mut transport = TestTransport::with_capacity(16);
+                engine
+                    .push_ingress(tcp_syn_with_options(operator, target, &options))
+                    .unwrap();
+                engine.poll(Duration::ZERO, &mut transport).unwrap();
+
+                assert!(transport.events.is_empty(), "invalid options {options:?}");
+                assert!(engine.tcp_by_id.is_empty());
+                assert_eq!(engine.sockets.iter().count(), 0);
+                assert!(engine.pop_egress().is_none());
+                engine
+                    .push_ingress(tcp_syn(operator, target, 1_000))
+                    .unwrap();
+                engine.poll(Duration::ZERO, &mut transport).unwrap();
+                assert!(matches!(
+                    transport.events.pop_front(),
+                    Some(Event::OpenTcp(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn valid_tcp_options_reach_the_stack_and_preserve_connection_admission() {
+        for (operator, target) in [
+            ("192.0.2.2:40000", "198.51.100.10:443"),
+            ("[fd00::2]:40000", "[fd00::10]:443"),
+        ] {
+            let operator: SocketAddr = operator.parse().unwrap();
+            let target: SocketAddr = target.parse().unwrap();
+            for options in [[2, 4, 5, 180], [254, 4, 1, 2], [0, 254, 0, 0], [1, 1, 1, 1]] {
+                let mut engine = PacketEngine::new(PacketEngineLimits::default(), 7);
+                let mut transport = TestTransport::with_capacity(16);
+                engine
+                    .push_ingress(tcp_syn_with_options(operator, target, &options))
+                    .unwrap();
+                engine.poll(Duration::ZERO, &mut transport).unwrap();
+                let Some(Event::OpenTcp(request)) = transport.events.pop_front() else {
+                    panic!("valid options {options:?} did not open a connection");
+                };
+                assert_eq!(request.operator, operator);
+                assert_eq!(request.target, target);
+                assert!(engine.pop_egress().is_none());
+                engine
+                    .push_command(PacketCommand::TcpOpened {
+                        flow_id: request.flow_id,
+                    })
+                    .unwrap();
+                engine.poll(Duration::ZERO, &mut transport).unwrap();
+                let reply = parse_test_tcp(engine.pop_egress().expect("expected SYN-ACK"));
+                assert_eq!(reply.flags & 0x12, 0x12);
+            }
+        }
     }
 
     #[test]

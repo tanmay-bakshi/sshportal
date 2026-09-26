@@ -2,6 +2,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
 
 use bytes::{Bytes, BytesMut};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{TcpPacket, TcpRepr};
 
 pub(super) const IP_PROTOCOL_TCP: u8 = 6;
 pub(super) const IP_PROTOCOL_UDP: u8 = 17;
@@ -330,29 +332,22 @@ pub(super) fn initial_tcp_syn(packet: &CompleteIpPacket) -> Option<TcpTuple> {
     if packet.protocol != IP_PROTOCOL_TCP {
         return None;
     }
-    let tcp = packet.transport();
-    if tcp.len() < 20 {
+    let tcp = TcpPacket::new_checked(packet.transport()).ok()?;
+    if !tcp.syn() || tcp.ack() || tcp.fin() || tcp.rst() || tcp.psh() || tcp.urg() {
         return None;
     }
-    let header_bytes = usize::from(tcp[12] >> 4) * 4;
-    if header_bytes < 20 || header_bytes > tcp.len() {
-        return None;
-    }
-    if transport_checksum(packet.source, packet.target, IP_PROTOCOL_TCP, tcp) != 0 {
-        return None;
-    }
-    let flags = tcp[13];
-    if flags & 0x02 == 0 || flags & 0x3d != 0 {
-        return None;
-    }
-    let source_port = u16::from_be_bytes([tcp[0], tcp[1]]);
-    let target_port = u16::from_be_bytes([tcp[2], tcp[3]]);
-    if source_port == 0 || target_port == 0 {
-        return None;
-    }
+    // Admission must accept the same TCP encoding as the stack before it can
+    // allocate a flow and request a remote connection.
+    let repr = TcpRepr::parse(
+        &tcp,
+        &packet.source.into(),
+        &packet.target.into(),
+        &ChecksumCapabilities::default(),
+    )
+    .ok()?;
     Some(TcpTuple {
-        operator: SocketAddr::new(packet.source, source_port),
-        target: SocketAddr::new(packet.target, target_port),
+        operator: SocketAddr::new(packet.source, repr.src_port),
+        target: SocketAddr::new(packet.target, repr.dst_port),
     })
 }
 
