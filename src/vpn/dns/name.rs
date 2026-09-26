@@ -1,4 +1,4 @@
-use std::fmt;
+use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 
 const MAX_LABEL_LENGTH: usize = 63;
@@ -202,7 +202,7 @@ impl fmt::Display for DnsName {
             for &byte in label {
                 match byte {
                     b'.' | b'\\' => write!(formatter, "\\{}", char::from(byte))?,
-                    0x21..=0x7e => formatter.write_str(&char::from(byte).to_string())?,
+                    0x21..=0x7e => formatter.write_char(char::from(byte))?,
                     _ => write!(formatter, "\\{byte:03}")?,
                 }
             }
