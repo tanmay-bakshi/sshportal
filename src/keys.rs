@@ -72,8 +72,9 @@ impl AuthorizedKeyTarget {
         &self.prompt_path
     }
 
-    pub fn install(&self, public_key_openssh: &str) -> Result<bool> {
-        install_authorized_key_at_path(&self.authorized_keys_path, public_key_openssh)
+    /// Installs the public key identity without copying its untrusted comment.
+    pub fn install(&self, public_key: &PublicKey) -> Result<bool> {
+        install_authorized_key_at_path(&self.authorized_keys_path, public_key)
     }
 
     #[cfg(not(windows))]
@@ -111,8 +112,11 @@ pub fn authorized_key_support() -> Result<AuthorizedKeySupport> {
 
 fn install_authorized_key_at_path(
     authorized_keys_path: &Path,
-    public_key_openssh: &str,
+    public_key: &PublicKey,
 ) -> Result<bool> {
+    let normalized_key = PublicKey::from(public_key.key_data().clone())
+        .to_openssh()
+        .context("failed to encode the authorized public key")?;
     let ssh_directory = authorized_keys_path
         .parent()
         .ok_or_else(|| anyhow!("authorized_keys path had no parent directory"))?;
@@ -121,7 +125,6 @@ fn install_authorized_key_at_path(
         .with_context(|| format!("failed to create {}", ssh_directory.display()))?;
     set_directory_permissions(ssh_directory)?;
 
-    let normalized_key: String = public_key_openssh.trim().to_string();
     let mut existing_contents: String = String::new();
     if authorized_keys_path.exists() {
         let mut file = OpenOptions::new()
@@ -134,7 +137,8 @@ fn install_authorized_key_at_path(
 
     let already_present: bool = existing_contents
         .lines()
-        .any(|line| line.trim() == normalized_key);
+        .filter_map(|line| PublicKey::from_openssh(line.trim()).ok())
+        .any(|existing_key| existing_key.key_data() == public_key.key_data());
     if already_present {
         set_file_permissions(authorized_keys_path)?;
         return Ok(false);
@@ -212,7 +216,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::AuthorizedKeyTarget;
+    use super::{AuthorizedKeyTarget, parse_public_key};
 
     fn authorized_key_target_for_test(home_directory: &std::path::Path) -> AuthorizedKeyTarget {
         AuthorizedKeyTarget {
@@ -228,8 +232,9 @@ mod tests {
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN4hvJxW3y2gM5N1mW2S4Gv0y1D7g2cP1wI6Xo4YgNqS";
         let target = authorized_key_target_for_test(temp_dir.path());
 
-        let first_install = target.install(key).unwrap();
-        let second_install = target.install(key).unwrap();
+        let public_key = parse_public_key(key).unwrap();
+        let first_install = target.install(&public_key).unwrap();
+        let second_install = target.install(&public_key).unwrap();
 
         assert!(first_install);
         assert!(!second_install);
@@ -238,5 +243,45 @@ mod tests {
             fs::read_to_string(temp_dir.path().join(".ssh/authorized_keys")).unwrap();
         assert_eq!(authorized_keys.lines().count(), 1);
         assert_eq!(authorized_keys.trim(), key);
+    }
+
+    #[test]
+    fn authorized_key_installation_stores_only_the_parsed_key_identity() {
+        let temp_dir = TempDir::new().unwrap();
+        let approved_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let additional_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN4hvJxW3y2gM5N1mW2S4Gv0y1D7g2cP1wI6Xo4YgNqS";
+        let offered_key = format!("{approved_key} support key\n{additional_key}");
+        let parsed_key = parse_public_key(&offered_key).unwrap();
+        assert_eq!(
+            parsed_key.key_data(),
+            parse_public_key(approved_key).unwrap().key_data()
+        );
+        let target = authorized_key_target_for_test(temp_dir.path());
+
+        target.install(&parsed_key).unwrap();
+
+        let installed = fs::read_to_string(temp_dir.path().join(".ssh/authorized_keys")).unwrap();
+        assert_eq!(installed, format!("{approved_key}\n"));
+    }
+
+    #[test]
+    fn an_existing_key_comment_does_not_duplicate_the_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let target = authorized_key_target_for_test(temp_dir.path());
+        fs::create_dir(temp_dir.path().join(".ssh")).unwrap();
+        let existing = format!("# Operator keys\n{key} existing comment\n");
+        fs::write(&target.authorized_keys_path, &existing).unwrap();
+        let offered_key = parse_public_key(&format!("{key} another comment")).unwrap();
+
+        assert!(!target.install(&offered_key).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(&target.authorized_keys_path).unwrap(),
+            existing
+        );
     }
 }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use hostname::get;
+use russh::keys::PublicKey;
 use rustls::pki_types::CertificateDer;
 
 use sshportal::{
@@ -124,7 +125,7 @@ async fn run() -> Result<()> {
             let key_install = maybe_install_operator_key(
                 &cli,
                 &offer.operator_name,
-                &ssh_public_key,
+                &public_key,
                 persist_key_requested,
             )?;
             let decision = ClientDecision {
@@ -282,7 +283,7 @@ fn gather_client_environment() -> Result<LocalClientEnvironment> {
 fn maybe_install_operator_key(
     cli: &ClientCli,
     operator_name: &str,
-    ssh_public_key: &str,
+    ssh_public_key: &PublicKey,
     persist_key_requested: bool,
 ) -> Result<KeyInstallOutcome> {
     if !persist_key_requested {
