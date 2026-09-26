@@ -695,6 +695,78 @@ async fn rejected_session_requests_preserve_the_channel_state() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn pty_dimensions_preserve_unspecified_values_and_reject_overflow() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let temp_dir = tempdir().unwrap();
+        let key =
+            Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
+        let (client_io, server_io) = duplex(64 * 1024);
+        let shell = ShellLaunch::detect_for_current_platform().unwrap();
+        let server_task = tokio::spawn(run_remote_shell_server(
+            server_io,
+            "support-user".to_string(),
+            key.public_key().clone(),
+            temp_dir.path().to_path_buf(),
+            shell,
+        ));
+        let session = connect_authenticated_client_transport(client_io, "support-user", key)
+            .await
+            .unwrap();
+
+        for stage in ["initial", "allocated", "running"] {
+            let mut channel = session.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm", 65_536, 37, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(channel.wait().await, Some(ChannelMsg::Failure)));
+            let (cols, rows) = if stage == "initial" {
+                (0, 0)
+            } else {
+                (101, 37)
+            };
+            channel
+                .request_pty(true, "xterm", cols, rows, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+            if stage == "allocated" {
+                channel.window_change(0, 45, 0, 0).await.unwrap();
+            }
+            channel.exec(true, "read value; stty size").await.unwrap();
+            assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+            if stage == "running" {
+                channel.window_change(121, 0, 0, 0).await.unwrap();
+            }
+            channel.window_change(0, 0, 0, 0).await.unwrap();
+            channel.window_change(u32::MAX, 1, 0, 0).await.unwrap();
+            channel.data(&b"report-size\n"[..]).await.unwrap();
+            let (stdout, stderr, status) = collect_channel_output(&mut channel).await;
+            assert_eq!(status, 0, "{stage}: {stderr}");
+            let expected = match stage {
+                "initial" => "24 80",
+                "allocated" => "45 101",
+                "running" => "37 121",
+                _ => unreachable!(),
+            };
+            assert!(
+                stdout.lines().any(|line| line.trim() == expected),
+                "{stage}: {stdout:?}"
+            );
+            close_completed_session_channel(&mut channel).await;
+        }
+        session
+            .disconnect(Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("PTY dimension negotiation did not complete");
+}
+
+#[tokio::test]
 async fn transfers_large_exec_output_through_bounded_channels() {
     let temp_dir = tempdir().unwrap();
     let allowed_private_key =

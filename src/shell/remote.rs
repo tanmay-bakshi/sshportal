@@ -6,7 +6,7 @@ use std::process::{Child as StdChild, ExitStatus as StdExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{
     Child as PtyChild, ExitStatus as PtyExitStatus, MasterPty, PtyPair, PtySize, native_pty_system,
 };
@@ -162,13 +162,61 @@ struct RemoteShellHandler {
 }
 
 impl RemoteShellHandler {
-    fn shell_size(cols: u32, rows: u32, pix_width: u32, pix_height: u32) -> PtySize {
-        PtySize {
-            rows: rows.max(1) as u16,
-            cols: cols.max(1) as u16,
-            pixel_width: pix_width as u16,
-            pixel_height: pix_height as u16,
+    fn shell_size(
+        current: PtySize,
+        cols: u32,
+        rows: u32,
+        pix_width: u32,
+        pix_height: u32,
+    ) -> Result<PtySize> {
+        // ConPTY uses signed COORD fields; Unix winsize fields are unsigned.
+        let max_cells = if cfg!(windows) {
+            i16::MAX as u32
+        } else {
+            u16::MAX as u32
+        };
+        if cols > max_cells
+            || rows > max_cells
+            || pix_width > u16::MAX as u32
+            || pix_height > u16::MAX as u32
+        {
+            bail!("PTY dimensions exceed native platform limits");
         }
+        // RFC 4254 leaves zero dimensions unspecified, including pixel dimensions.
+        let dimension = |requested: u32, current| {
+            if requested == 0 {
+                current
+            } else {
+                requested as u16
+            }
+        };
+        Ok(PtySize {
+            rows: dimension(rows, current.rows),
+            cols: dimension(cols, current.cols),
+            pixel_width: dimension(pix_width, current.pixel_width),
+            pixel_height: dimension(pix_height, current.pixel_height),
+        })
+    }
+
+    fn resize_pty(
+        master: &dyn MasterPty,
+        cols: u32,
+        rows: u32,
+        pix_width: u32,
+        pix_height: u32,
+    ) -> Result<()> {
+        let current = master.get_size().context("failed to read PTY dimensions")?;
+        let size = match Self::shell_size(current, cols, rows, pix_width, pix_height) {
+            Ok(size) => size,
+            Err(error) => {
+                debug_log(format!("ignoring invalid PTY window change: {error}"));
+                return Ok(());
+            }
+        };
+        if size != current {
+            master.resize(size).context("failed to resize PTY")?;
+        }
+        Ok(())
     }
 
     fn exit_status_code(status: StdExitStatus) -> u32 {
@@ -564,7 +612,20 @@ impl server::Handler for RemoteShellHandler {
             return Ok(());
         };
         let pty_system = native_pty_system();
-        let size = Self::shell_size(col_width, row_height, pix_width, pix_height);
+        let size = match Self::shell_size(
+            PtySize::default(),
+            col_width,
+            row_height,
+            pix_width,
+            pix_height,
+        ) {
+            Ok(size) => size,
+            Err(error) => {
+                debug_log(format!("rejecting invalid PTY request: {error}"));
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
         let pair = match pty_system.openpty(size) {
             Ok(pair) => pair,
             Err(error) => {
@@ -807,21 +868,28 @@ impl server::Handler for RemoteShellHandler {
         pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let size = Self::shell_size(col_width, row_height, pix_width, pix_height);
         let guard = self.shell_states.lock().await;
         match guard.get(&channel) {
             Some(SessionChannelState::PtyAllocated { pair, .. }) => {
-                pair.master
-                    .resize(size)
-                    .context("failed to resize pending PTY")?;
+                Self::resize_pty(
+                    pair.master.as_ref(),
+                    col_width,
+                    row_height,
+                    pix_width,
+                    pix_height,
+                )?;
             }
             Some(SessionChannelState::RunningPty { master, .. }) => {
                 let master_guard = master
                     .lock()
                     .map_err(|_| anyhow!("failed to lock PTY master"))?;
-                master_guard
-                    .resize(size)
-                    .context("failed to resize running PTY")?;
+                Self::resize_pty(
+                    master_guard.as_ref(),
+                    col_width,
+                    row_height,
+                    pix_width,
+                    pix_height,
+                )?;
             }
             _ => {}
         }
@@ -835,9 +903,67 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use portable_pty::{ChildKiller, ExitStatus as PtyExitStatus};
+    use portable_pty::{ChildKiller, ExitStatus as PtyExitStatus, PtySize};
 
     use super::{PtyChild, PtyChildState, RemoteShellHandler};
+
+    #[test]
+    fn pty_size_updates_preserve_unspecified_dimensions() {
+        let current = PtySize {
+            rows: 37,
+            cols: 101,
+            pixel_width: 808,
+            pixel_height: 592,
+        };
+        assert_eq!(
+            RemoteShellHandler::shell_size(current, 0, 0, 0, 0).unwrap(),
+            current
+        );
+        assert_eq!(
+            RemoteShellHandler::shell_size(current, 120, 0, 0, 700).unwrap(),
+            PtySize {
+                cols: 120,
+                pixel_height: 700,
+                ..current
+            }
+        );
+        assert_eq!(
+            RemoteShellHandler::shell_size(current, 0, 45, 960, 0).unwrap(),
+            PtySize {
+                rows: 45,
+                pixel_width: 960,
+                ..current
+            }
+        );
+    }
+
+    #[test]
+    fn pty_size_updates_reject_unrepresentable_dimensions_without_wrapping() {
+        let current = PtySize::default();
+        let max_cells = if cfg!(windows) {
+            i16::MAX as u32
+        } else {
+            u16::MAX as u32
+        };
+        let max_pixels = u16::MAX as u32;
+        let largest =
+            RemoteShellHandler::shell_size(current, max_cells, max_cells, max_pixels, max_pixels)
+                .unwrap();
+        assert_eq!(u32::from(largest.cols), max_cells);
+        assert_eq!(u32::from(largest.rows), max_cells);
+        assert_eq!(u32::from(largest.pixel_width), max_pixels);
+        assert_eq!(u32::from(largest.pixel_height), max_pixels);
+        for dimensions in [
+            [max_cells + 1, 24, 0, 0],
+            [80, max_cells + 1, 0, 0],
+            [80, 24, max_pixels + 1, 0],
+            [80, 24, 0, max_pixels + 1],
+            [u32::MAX; 4],
+        ] {
+            let [cols, rows, width, height] = dimensions;
+            assert!(RemoteShellHandler::shell_size(current, cols, rows, width, height).is_err());
+        }
+    }
 
     struct InterruptedOutput {
         interrupted: bool,
