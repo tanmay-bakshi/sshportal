@@ -274,7 +274,7 @@ impl<E: CommandExecutor> PreparedHostNetwork<E> {
         let tun_index = u32::try_from(tun_index).context("the VPN interface index is negative")?;
         let transport = TransportSocket::new(transport_local, transport_peer)?;
         let route_plan = RoutePlan::for_policy(&self.policy, self.network)?;
-        let session = SessionIdentity::new(self.platform)?;
+        let session = SessionIdentity::new(self.platform, &self.executor)?;
         let tunnel = TunnelIdentity {
             name: tun_name.to_string(),
             index: tun_index,
@@ -3496,10 +3496,10 @@ struct SessionIdentity {
 }
 
 impl SessionIdentity {
-    fn new(platform: Platform) -> Result<Self> {
+    fn new<E: CommandExecutor>(platform: Platform, executor: &E) -> Result<Self> {
         let mut id = [0_u8; 16];
         rand::fill(&mut id);
-        let process_identity = process_identity(platform, std::process::id())?
+        let process_identity = process_identity(platform, executor, std::process::id())?
             .context("failed to determine the VPN process identity")?;
         Ok(Self {
             id,
@@ -3517,7 +3517,7 @@ fn recover_stale_journal<E: CommandExecutor>(
         return Ok(());
     };
     validate_journal(platform, &journal)?;
-    if process_identity(platform, journal.header.owner_pid)?.as_deref()
+    if process_identity(platform, executor, journal.header.owner_pid)?.as_deref()
         == Some(journal.header.owner_identity.as_str())
     {
         bail!(
@@ -3564,17 +3564,24 @@ fn validate_journal(platform: Platform, journal: &SessionJournal) -> Result<()> 
     Ok(())
 }
 
-fn process_identity(platform: Platform, pid: u32) -> Result<Option<String>> {
+fn process_identity<E: CommandExecutor>(
+    platform: Platform,
+    executor: &E,
+    pid: u32,
+) -> Result<Option<String>> {
     match platform {
         Platform::Linux => linux_process_identity(pid),
-        Platform::Macos => command_process_identity(CommandSpec::new(
-            "ps",
-            ["-p", &pid.to_string(), "-o", "lstart="],
-        )),
-        Platform::Windows => command_process_identity(powershell(format!(
-            "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+        Platform::Macos => command_process_identity(
+            executor,
+            CommandSpec::new("ps", ["-p", &pid.to_string(), "-o", "lstart="]),
+        ),
+        Platform::Windows => command_process_identity(
+            executor,
+            powershell(format!(
+                "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
              if ($null -ne $process) {{ $process.StartTime.ToUniversalTime().Ticks }}"
-        ))),
+            )),
+        ),
     }
 }
 
@@ -3600,8 +3607,11 @@ fn linux_process_identity(pid: u32) -> Result<Option<String>> {
     Ok(Some((*start_time).to_string()))
 }
 
-fn command_process_identity(command: CommandSpec) -> Result<Option<String>> {
-    let output = SystemCommandExecutor.execute(&command)?;
+fn command_process_identity<E: CommandExecutor>(
+    executor: &E,
+    command: CommandSpec,
+) -> Result<Option<String>> {
+    let output = executor.execute(&command)?;
     if output.success {
         let identity = output.stdout.trim();
         return if identity.is_empty() {
@@ -4017,7 +4027,6 @@ mod tests {
         cleanup_resources(Platform::Linux, &executor, &resources).unwrap();
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn stale_macos_journal_recovers_after_the_tunnel_and_routes_disappear() {
         let temp = TempDir::new().unwrap();
@@ -4054,6 +4063,7 @@ mod tests {
             store.arm(resource).unwrap();
         }
         let executor = MockExecutor::with_outputs([
+            Ok(CommandOutput::success("current process identity")),
             Ok(CommandOutput {
                 success: false,
                 stdout: String::new(),
@@ -4075,7 +4085,11 @@ mod tests {
 
         assert!(!store.path.exists());
         let calls = executor.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0],
+            CommandSpec::new("ps", ["-p", &header.owner_pid.to_string(), "-o", "lstart="])
+        );
         assert!(
             calls
                 .iter()
@@ -4258,6 +4272,61 @@ mod tests {
         assert!(recover_stale_journal(Platform::Linux, &executor, &store).is_err());
 
         assert!(store.path.exists());
+    }
+
+    #[test]
+    fn recovery_preserves_journals_owned_by_an_active_process() {
+        for platform in [Platform::Macos, Platform::Windows] {
+            let temp = TempDir::new().unwrap();
+            let store = journal_store(&temp);
+            let header = JournalHeader {
+                version: JOURNAL_VERSION,
+                platform,
+                owner_pid: 123,
+                owner_identity: "active process identity".to_string(),
+                session_id: [4; 16],
+            };
+            store.begin(&header).unwrap();
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(format!(
+                "{}\n",
+                header.owner_identity
+            )))]);
+
+            let error = recover_stale_journal(platform, &executor, &store).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("still owns the host-network state")
+            );
+            assert!(store.path.exists());
+            assert_eq!(executor.calls().len(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_owner_inspection_preserves_the_recovery_journal() {
+        for platform in [Platform::Macos, Platform::Windows] {
+            let temp = TempDir::new().unwrap();
+            let store = journal_store(&temp);
+            store
+                .begin(&JournalHeader {
+                    version: JOURNAL_VERSION,
+                    platform,
+                    owner_pid: 123,
+                    owner_identity: "unknown process identity".to_string(),
+                    session_id: [4; 16],
+                })
+                .unwrap();
+            let executor =
+                MockExecutor::with_outputs([Err(anyhow::anyhow!("process inspection failed"))]);
+
+            let error = recover_stale_journal(platform, &executor, &store).unwrap_err();
+
+            assert!(error.to_string().contains("process inspection failed"));
+            assert!(store.path.exists());
+            assert_eq!(executor.calls().len(), 1);
+        }
     }
 
     #[test]
