@@ -110,20 +110,20 @@ fn normalize_cidrs(include_cidrs: Vec<IpNet>) -> Vec<IpNet> {
         .into_iter()
         .map(|network| network.trunc())
         .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
+    candidates.sort_unstable();
 
-    let mut normalized: Vec<IpNet> = Vec::new();
-    for candidate in candidates {
-        if normalized
-            .iter()
-            .any(|existing: &IpNet| existing.contains(&candidate.network()))
-        {
-            continue;
+    let mut previous: Option<IpNet> = None;
+    candidates.retain(|candidate| {
+        // Canonical CIDRs sort by address, then prefix length. Retained ranges
+        // are disjoint, so only the last one can contain the next candidate.
+        if previous.is_some_and(|existing| existing.contains(&candidate.network())) {
+            return false;
         }
-        normalized.push(candidate);
-    }
-    normalized
+        previous = Some(*candidate);
+        true
+    });
+    candidates.shrink_to_fit();
+    candidates
 }
 
 fn normalize_domains(include_domains: Vec<String>) -> Result<Vec<String>> {
@@ -260,6 +260,54 @@ mod tests {
         assert!(policy.contains_ip("2001:db8:1:ffff::1".parse().unwrap()));
         assert!(!policy.contains_ip("10.21.0.1".parse().unwrap()));
         assert!(!policy.contains_ip("2001:db8:2::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_normalization_preserves_adjacent_selectors_and_removes_nested_selectors() {
+        let expected = [
+            "0.0.0.0/32",
+            "10.0.0.0/8",
+            "11.0.0.0/9",
+            "11.128.0.0/9",
+            "255.255.255.255/32",
+            "::/128",
+            "2001:db8::/32",
+            "2001:db9::/33",
+            "2001:db9:8000::/33",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128",
+        ]
+        .map(|value| value.parse().unwrap());
+        let mut input = expected.to_vec();
+        for nested in [
+            "10.0.0.7/16",
+            "10.255.255.255/32",
+            "11.255.255.255/32",
+            "2001:db8::7/64",
+            "2001:db8:ffff:ffff::/64",
+            "2001:db9:8000::1/128",
+        ] {
+            input.push(nested.parse().unwrap());
+        }
+        input.extend(expected);
+        input.reverse();
+        let policy = SystemVpnPolicy::new(input, Vec::new()).unwrap();
+        assert_eq!(policy.include_cidrs(), expected);
+        let all = SystemVpnPolicy::new(
+            expected
+                .into_iter()
+                .chain(["0.0.0.1/0".parse().unwrap(), "::1/0".parse().unwrap()])
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            all.include_cidrs(),
+            [
+                "0.0.0.0/0".parse::<ipnet::IpNet>().unwrap(),
+                "::/0".parse().unwrap()
+            ]
+        );
+        assert!(!all.is_full_tunnel());
     }
 
     #[test]
