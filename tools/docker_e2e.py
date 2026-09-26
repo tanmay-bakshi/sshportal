@@ -3,6 +3,7 @@
 """Run a Linux Docker-backed end-to-end validation of sshportal."""
 
 import argparse
+import errno
 import fcntl
 import http.client
 import os
@@ -254,28 +255,27 @@ def read_available_output(spawned: SpawnedProcess, timeout_seconds: float) -> st
     :param spawned: Process descriptor.
     :param timeout_seconds: Maximum time to wait for new output.
     :returns: Newly read text.
+    :raises OSError: If reading the PTY fails for a reason other than closure.
     """
 
-    selector = selectors.DefaultSelector()
-    selector.register(spawned.master_fd, selectors.EVENT_READ)
     chunks: list[str] = []
     deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        events = selector.select(remaining)
-        if len(events) == 0:
-            break
-        for _key, _mask in events:
+    with selectors.DefaultSelector() as selector:
+        selector.register(spawned.master_fd, selectors.EVENT_READ)
+        while time.monotonic() < deadline:
+            events = selector.select(deadline - time.monotonic())
+            if len(events) == 0:
+                break
             try:
                 data = os.read(spawned.master_fd, READ_CHUNK_SIZE)
-            except OSError:
-                data = b""
+            except OSError as error:
+                # Linux reports closure of the PTY slave as EIO.
+                if error.errno != errno.EIO:
+                    raise
+                break
             if len(data) == 0:
                 break
-            decoded = data.decode(errors="replace")
-            chunks.append(decoded)
-        if len(events) == 0:
-            break
+            chunks.append(data.decode(errors="replace"))
     output = "".join(chunks)
     if len(output) > 0:
         spawned.transcript += output

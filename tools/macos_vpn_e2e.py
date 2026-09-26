@@ -4,6 +4,7 @@
 
 import argparse
 import asyncio
+import errno
 import ipaddress
 import json
 import os
@@ -67,28 +68,29 @@ class SpawnedProcess:
 
         :param timeout_seconds: Maximum time to wait for output.
         :returns: Newly captured output.
+        :raises OSError: If reading the PTY fails for a reason other than closure.
         """
 
         if self.closed:
             return ""
-        selector = selectors.DefaultSelector()
-        selector.register(self.master_fd, selectors.EVENT_READ)
         chunks: list[str] = []
         deadline = time.monotonic() + timeout_seconds
-        try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.master_fd, selectors.EVENT_READ)
             while time.monotonic() < deadline:
                 events = selector.select(deadline - time.monotonic())
                 if len(events) == 0:
                     break
                 try:
                     data = os.read(self.master_fd, READ_CHUNK_BYTES)
-                except OSError:
-                    data = b""
+                except OSError as error:
+                    # Linux reports closure of the PTY slave as EIO.
+                    if error.errno != errno.EIO:
+                        raise
+                    break
                 if len(data) == 0:
                     break
                 chunks.append(data.decode(errors="replace"))
-        finally:
-            selector.close()
         output = "".join(chunks)
         self.transcript += output
         return output
