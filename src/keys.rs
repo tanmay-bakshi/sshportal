@@ -1,5 +1,7 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -125,45 +127,39 @@ fn install_authorized_key_at_path(
         .with_context(|| format!("failed to create {}", ssh_directory.display()))?;
     set_directory_permissions(ssh_directory)?;
 
-    let mut existing_contents: String = String::new();
-    if authorized_keys_path.exists() {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(authorized_keys_path)
-            .with_context(|| format!("failed to open {}", authorized_keys_path.display()))?;
-        file.read_to_string(&mut existing_contents)
-            .with_context(|| format!("failed to read {}", authorized_keys_path.display()))?;
-    }
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(authorized_keys_path)
+        .with_context(|| format!("failed to open {}", authorized_keys_path.display()))?;
+    // The same locked handle covers inspection and append, including competing processes.
+    file.lock()
+        .with_context(|| format!("failed to lock {}", authorized_keys_path.display()))?;
+    set_file_permissions(&file)?;
+    let mut existing_contents = String::new();
+    file.read_to_string(&mut existing_contents)
+        .with_context(|| format!("failed to read {}", authorized_keys_path.display()))?;
 
     let already_present: bool = existing_contents
         .lines()
         .filter_map(|line| PublicKey::from_openssh(line.trim()).ok())
         .any(|existing_key| existing_key.key_data() == public_key.key_data());
     if already_present {
-        set_file_permissions(authorized_keys_path)?;
         return Ok(false);
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(authorized_keys_path)
-        .with_context(|| format!("failed to open {}", authorized_keys_path.display()))?;
-    if !existing_contents.is_empty() && !existing_contents.ends_with('\n') {
-        file.write_all(b"\n").with_context(|| {
-            format!(
-                "failed to append newline to {}",
-                authorized_keys_path.display()
-            )
-        })?;
-    }
-    file.write_all(normalized_key.as_bytes())
+    let separator = if !existing_contents.is_empty() && !existing_contents.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let entry = format!("{separator}{normalized_key}\n");
+    file.write_all(entry.as_bytes())
         .with_context(|| format!("failed to append key to {}", authorized_keys_path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finalize {}", authorized_keys_path.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to flush {}", authorized_keys_path.display()))?;
-    set_file_permissions(authorized_keys_path)?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", authorized_keys_path.display()))?;
     Ok(true)
 }
 
@@ -182,8 +178,6 @@ fn home_directory() -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn set_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     let permissions = fs::Permissions::from_mode(0o700);
     fs::set_permissions(path, permissions)
         .with_context(|| format!("failed to set permissions on {}", path.display()))?;
@@ -196,23 +190,22 @@ fn set_directory_permissions(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
+fn set_file_permissions(file: &File) -> Result<()> {
     let permissions = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    file.set_permissions(permissions)
+        .context("failed to set authorized_keys permissions")?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions(_path: &Path) -> Result<()> {
+fn set_file_permissions(_file: &File) -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Barrier};
 
     use tempfile::TempDir;
 
@@ -282,6 +275,58 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&target.authorized_keys_path).unwrap(),
             existing
+        );
+    }
+
+    #[test]
+    fn concurrent_key_installations_append_one_complete_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = authorized_key_target_for_test(temp_dir.path());
+        let key = parse_public_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+        let start = Arc::new(Barrier::new(8));
+        let installers = (0..8)
+            .map(|_| {
+                let target = target.clone();
+                let key = key.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    target.install(&key).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let installed = installers
+            .into_iter()
+            .map(|task| usize::from(task.join().unwrap()))
+            .sum::<usize>();
+
+        assert_eq!(installed, 1);
+        assert_eq!(
+            fs::read_to_string(&target.authorized_keys_path).unwrap(),
+            format!("{}\n", key.to_openssh().unwrap()),
+        );
+    }
+
+    #[test]
+    fn key_installation_preserves_an_unterminated_existing_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = authorized_key_target_for_test(temp_dir.path());
+        let key = parse_public_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+        fs::create_dir(temp_dir.path().join(".ssh")).unwrap();
+        fs::write(&target.authorized_keys_path, "# Existing keys").unwrap();
+
+        assert!(target.install(&key).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(&target.authorized_keys_path).unwrap(),
+            format!("# Existing keys\n{}\n", key.to_openssh().unwrap()),
         );
     }
 }
