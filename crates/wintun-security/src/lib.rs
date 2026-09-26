@@ -307,15 +307,19 @@ fn stage_fresh_image(
         "wintun-{EXPECTED_SHA256}-{:032x}.dll",
         random::<u128>()
     ));
-    let mut cached = create_secure_file(&cache_path, descriptor).with_context(|| {
+    let cached = create_secure_file(&cache_path, descriptor).with_context(|| {
         format!(
             "failed to create cached Wintun image at {}",
             cache_path.display()
         )
     })?;
-    let staged_image = StagedImage::new(cache_path.clone());
+    let mut staged_image = StagedImage::new(cache_path.clone(), cached);
+    let cached = staged_image
+        .writer
+        .as_mut()
+        .expect("staged image owns its writer");
     bundled.seek(SeekFrom::Start(0))?;
-    let copied = std::io::copy(&mut bundled, &mut cached)
+    let copied = std::io::copy(&mut bundled, cached)
         .context("failed to copy Wintun into its secure cache")?;
     ensure!(
         copied == EXPECTED_LENGTH,
@@ -327,20 +331,22 @@ fn stage_fresh_image(
     cached
         .sync_all()
         .context("failed to persist the cached Wintun image")?;
-    verify_sha256(&mut cached, &cache_path)?;
-    drop(cached);
+    verify_sha256(cached, &cache_path)?;
+    drop(staged_image.writer.take());
     Ok(staged_image)
 }
 
 struct StagedImage {
     path: PathBuf,
+    writer: Option<File>,
     remove_on_drop: bool,
 }
 
 impl StagedImage {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, writer: File) -> Self {
         Self {
             path,
+            writer: Some(writer),
             remove_on_drop: true,
         }
     }
@@ -356,6 +362,8 @@ impl StagedImage {
 
 impl Drop for StagedImage {
     fn drop(&mut self) {
+        // The staging handle denies delete sharing, so close it before cleanup.
+        drop(self.writer.take());
         if self.remove_on_drop {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -711,6 +719,31 @@ mod tests {
     use super::{VerifiedWintun, restrict_process_dll_search_to_system32, wide};
 
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn failed_staging_closes_the_writer_before_removing_the_image() {
+        let path = std::env::temp_dir().join(format!(
+            "sshportal-staging-{:032x}.dll",
+            rand::random::<u128>()
+        ));
+        let result = (|| -> anyhow::Result<()> {
+            let descriptor = super::SecurityDescriptor::new()?;
+            let file = super::create_secure_file(&path, &descriptor)?;
+            let _staged = super::StagedImage::new(path.clone(), file);
+            anyhow::bail!("staging failed after file creation");
+        })();
+        let leaked = path.exists();
+        if leaked {
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("staging failed after file creation")
+        );
+        assert!(!leaked, "failed staging left its cache image behind");
+    }
 
     #[test]
     fn excludes_the_application_directory_from_default_dll_resolution() {
