@@ -7,7 +7,6 @@
 | SSH | Local SSH listener | None | Shells, commands, and optional SSH dynamic forwarding |
 | SOCKS | Local SOCKS5 listener | None | TCP `CONNECT` and UDP `ASSOCIATE` |
 | VPN | System TUN interface | None | Internet-bound IPv4/IPv6 TCP, UDP, and DNS |
-| macOS per-app VPN | One signed app and its helper processes | None | TCP and UDP flows from that app |
 
 The project ships two binaries:
 
@@ -211,51 +210,10 @@ validity-period, signature, and chain validation remain mandatory. No certificat
 an operating-system keychain or trust store.
 
 The approved capability is enforced again for every client-side network stream before DNS or
-socket creation. SOCKS and macOS per-app sessions permit arbitrary TCP and UDP destinations but no
+socket creation. SOCKS sessions permit arbitrary TCP and UDP destinations but no
 resolver streams. Full system VPN permits arbitrary destinations and resolver names. A selective
 system VPN permits literal addresses only inside its approved CIDRs and hostnames or resolver names
 only inside its approved suffixes; a CIDR-only session cannot use the resolver endpoint.
-
-### macOS per-app VPN
-
-On macOS 15 or later, `--vpn-app` routes only a selected signed application through the client. The
-server process does not need root privileges, does not install routes, and does not create a TUN
-interface:
-
-```text
-selected app and helpers -> SSHPortal app proxy -> private authenticated SOCKS5
-                         -> bounded HTTP/2 session -> approved WebSocket
-                         -> client TCP/UDP egress
-
-all other applications  -> normal macOS network path
-```
-
-Install the signed companion in `/Applications`, then select the target `.app` bundle:
-
-```bash
-sshportal-server \
-  --listen 127.0.0.1:8080 \
-  --operator-name support-team \
-  --vpn-app /Applications/Firefox.app \
-  --vpn-companion /Applications/SSHPortal.app
-```
-
-The client connects through the same HTTPS/WSS URL and sees a consent prompt naming the selected
-application. That name describes the scope requested and enforced by the operator's macOS
-companion. The client cannot attest the originating process across the WebSocket, so approving an
-application session authorizes arbitrary outbound TCP and UDP requested through that session. The
-first operator-side run asks macOS to approve the SSHPortal system extension and VPN configuration.
-System policy may require an administrator to approve that installation, but `sshportal-server`
-itself must remain an ordinary user process.
-
-The rule matches the selected executable by signing identifier, designated requirement, and path. macOS also includes helper processes spawned by that application, which covers normal browser renderer, networking, and GPU helpers. It does not identify one PID: another instance of the same signed application at the same path is in scope too. Existing connections retain their existing path; new TCP and UDP flows use the tunnel until the WebSocket closes or the server stops. Other applications keep their normal route.
-
-The companion owns no remote transport. It forwards native Network Extension flows into a random,
-username/password-protected loopback SOCKS endpoint owned by `sshportal-server`. That endpoint uses
-the same bounded HTTP/2 network session as SOCKS and system VPN modes, so client consent, egress,
-flow limits, and teardown have one implementation. Normal shutdown, transport loss, startup
-failure, Ctrl-C, SIGTERM, SIGHUP, or loss of the companion control pipe removes the per-app VPN
-configuration.
 
 ### Routing behavior
 
@@ -345,12 +303,9 @@ Only the operator-side server needs these privileges and platform components. A 
 
 The minimum supported Rust version is 1.91.
 
-The Rust client and the SOCKS and system-VPN server modes build natively on Linux, macOS, and
-Windows. The macOS 15-or-later per-app mode additionally needs the Swift companion and system
-extension. CI compiles and tests the Rust code on all three operating systems, builds both
-architectures of the macOS companion without signing, cross-builds the static-CRT Windows package
-from macOS, and runs privileged system-VPN end-to-end paths in Linux containers and on a native
-macOS host.
+Both binaries build natively on Linux, macOS, and Windows. CI compiles and tests the Rust code on
+all three operating systems, cross-builds the static-CRT Windows package from macOS, and runs
+privileged system-VPN end-to-end paths in Linux containers and on a native macOS host.
 
 ```bash
 cargo build --bins
@@ -358,64 +313,6 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 ```
-
-The native macOS targets and their protocol tests can be built without signing:
-
-```bash
-ruby macos/Support/generate_project.rb
-xcodebuild \
-  -project macos/SSHPortal.xcodeproj \
-  -scheme SSHPortal \
-  -destination 'platform=macOS,arch=arm64' \
-  -derivedDataPath target/macos-derived \
-  CODE_SIGNING_ALLOWED=NO \
-  test
-```
-
-[`macos/Support/build_universal.sh`](macos/Support/build_universal.sh) builds arm64 and x86-64 Rust binaries plus a universal companion and embedded system extension. Its unsigned mode is useful for compilation and packaging checks, but macOS will not activate an unsigned network extension:
-
-```bash
-macos/Support/build_universal.sh --unsigned
-```
-
-The output is `target/sshportal-macos-universal.zip` with a neighboring SHA-256 checksum file.
-
-#### macOS signing and notarization
-
-Native per-app VPN requires a paid Apple Developer Program team with the Network Extensions and System Extension capabilities. A Personal Team cannot create the required profiles.
-
-For local development, let Xcode create Apple Development profiles after selecting the paid team:
-
-```bash
-xcodebuild \
-  -project macos/SSHPortal.xcodeproj \
-  -scheme SSHPortal \
-  -configuration Debug \
-  -destination 'generic/platform=macOS' \
-  -derivedDataPath target/macos-development-derived \
-  -allowProvisioningUpdates \
-  DEVELOPMENT_TEAM='<paid-team-id>' \
-  build
-```
-
-The account must have an unexpired Apple Development certificate whose private key is present in the login keychain.
-
-For Developer ID distribution, create and install two manual provisioning profiles:
-
-- The `com.tanmaybakshi.sshportal.macos` profile grants Network Extensions and System Extension installation.
-- The `com.tanmaybakshi.sshportal.macos.AppProxyExtension` profile grants Network Extensions.
-
-The keychain must also contain the matching Developer ID Application certificate and its private key. Build a signed universal package with the profile names shown in the developer portal:
-
-```bash
-export SSHPORTAL_DEVELOPMENT_TEAM='<paid-team-id>'
-export SSHPORTAL_APP_PROFILE='<containing-app-profile-name>'
-export SSHPORTAL_EXTENSION_PROFILE='<app-proxy-profile-name>'
-export SSHPORTAL_DEVELOPER_IDENTITY='Developer ID Application: Example Name (TEAMID)'
-macos/Support/build_universal.sh --developer-id
-```
-
-To notarize in the same build, first store notary credentials using `xcrun notarytool store-credentials`, then set `SSHPORTAL_NOTARY_PROFILE` to that keychain profile name. The build submits the archive, staples the companion app, and recreates the final zip.
 
 The Docker-backed Linux end-to-end harnesses are [`tools/docker_e2e.py`](tools/docker_e2e.py) for
 SSH and [`tools/docker_vpn_e2e.py`](tools/docker_vpn_e2e.py) for the isolated
@@ -503,9 +400,9 @@ validation plus the native macOS system-VPN test on that exact tagged commit. Th
 also contains the signed Wintun DLL and [`WINTUN-LICENSE.txt`](licenses/WINTUN.txt). Every archive
 has a SHA-256 checksum file.
 
-The tagged workflow does not publish an unsigned macOS per-app companion as though it were usable.
-Build the universal macOS package with the signing and optional notarization procedure above; the
-standalone Rust binaries remain sufficient for system VPN, SOCKS, and SSH modes on macOS.
+On macOS, build the standalone binaries with `cargo build --locked --release --bins`.
+SSH, SOCKS, and system VPN modes do not require an Apple Developer membership or provisioning
+profiles. System VPN mode requires root privileges to configure networking.
 
 ## License
 

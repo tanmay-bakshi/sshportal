@@ -9,8 +9,8 @@ use tokio::task::JoinHandle;
 
 use crate::debug::debug_log;
 use crate::socks::{
-    SOCKS_REPLY_GENERAL_FAILURE, SOCKS_REPLY_SUCCESS, SocksAuthentication,
-    negotiate_socks5_connect, write_socks5_response,
+    SOCKS_REPLY_GENERAL_FAILURE, SOCKS_REPLY_SUCCESS, negotiate_socks5_connect,
+    write_socks5_response,
 };
 
 use super::common::NoopClientHandler;
@@ -72,7 +72,7 @@ async fn handle_dynamic_forward_connection(
     mut stream: TcpStream,
     session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
 ) -> Result<()> {
-    let target = negotiate_socks5_connect(&mut stream, &SocksAuthentication::None).await?;
+    let target = negotiate_socks5_connect(&mut stream).await?;
     let originator_addr = stream
         .peer_addr()
         .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));

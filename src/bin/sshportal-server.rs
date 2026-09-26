@@ -23,8 +23,6 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::WebSocketStream;
 use url::form_urlencoded;
 
-#[cfg(target_os = "macos")]
-use sshportal::MacosPerAppVpn;
 use sshportal::{
     ClientDecision, ClientHello, ControlPacket, DEFAULT_CONNECT_PATH, DEFAULT_HEALTH_PATH,
     OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, SystemVpnPolicy, VpnScope,
@@ -37,7 +35,7 @@ use sshportal::{
     name = "sshportal-server",
     about = "Accept one consent-gated support client and expose SSH, SOCKS, or VPN access.",
     long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and starts exactly one client-approved SSH, SOCKS, or VPN session.",
-    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080\n  sudo sshportal-server --vpn\n  sudo sshportal-server --vpn --vpn-include-cidr 10.20.0.0/16 --vpn-include-domain anthem.com\n  sshportal-server --vpn-app /Applications/Firefox.app"
+    after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080\n  sudo sshportal-server --vpn\n  sudo sshportal-server --vpn --vpn-include-cidr 10.20.0.0/16 --vpn-include-domain anthem.com"
 )]
 struct ServerCli {
     /// HTTP address for the one-time rendezvous endpoint.
@@ -65,21 +63,21 @@ struct ServerCli {
         long,
         default_value = "127.0.0.1:0",
         value_name = "LISTEN_ADDR",
-        conflicts_with_all = ["socks_only", "vpn", "vpn_app"]
+        conflicts_with_all = ["socks_only", "vpn"]
     )]
     ssh_listen: SocketAddr,
     /// Optional local SOCKS5 listener to expose for the lifetime of the session.
     #[arg(
         long,
         value_name = "LISTEN_ADDR",
-        conflicts_with_all = ["socks_only", "vpn", "vpn_app"]
+        conflicts_with_all = ["socks_only", "vpn"]
     )]
     dynamic_forward: Option<SocketAddr>,
     /// Run without SSH and expose only this local SOCKS5 listener.
     #[arg(
         long,
         value_name = "LISTEN_ADDR",
-        conflicts_with_all = ["operator_key", "persist_operator_key", "vpn", "vpn_app"]
+        conflicts_with_all = ["operator_key", "persist_operator_key", "vpn"]
     )]
     socks_only: Option<SocketAddr>,
     /// Open a system VPN through the client.
@@ -93,8 +91,7 @@ struct ServerCli {
             "persist_operator_key",
             "ssh_listen",
             "dynamic_forward",
-            "socks_only",
-            "vpn_app"
+            "socks_only"
         ]
     )]
     vpn: bool,
@@ -110,26 +107,6 @@ struct ServerCli {
     /// suffixes; wildcard syntax is neither needed nor accepted.
     #[arg(long, value_name = "DOMAIN", requires = "vpn")]
     vpn_include_domain: Vec<String>,
-    /// On macOS, route only new connections from this signed application through the client.
-    ///
-    /// The server remains unprivileged. macOS may require administrator approval when the native
-    /// SSHPortal system extension is installed for the first time.
-    #[arg(
-        long,
-        value_name = "APP_BUNDLE",
-        conflicts_with_all = [
-            "operator_key",
-            "persist_operator_key",
-            "ssh_listen",
-            "dynamic_forward",
-            "socks_only",
-            "vpn"
-        ]
-    )]
-    vpn_app: Option<PathBuf>,
-    /// Explicit SSHPortal.app bundle to use for native per-app VPN support.
-    #[arg(long, value_name = "APP_BUNDLE", requires = "vpn_app")]
-    vpn_companion: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -271,10 +248,6 @@ enum ServerSessionMode {
     VpnSystem {
         policy: SystemVpnPolicy,
     },
-    #[cfg(target_os = "macos")]
-    VpnApplication {
-        configuration: MacosPerAppVpn,
-    },
 }
 
 impl ServerSessionMode {
@@ -288,12 +261,6 @@ impl ServerSessionMode {
             Self::VpnSystem { policy } => OfferedSession::Vpn {
                 scope: VpnScope::System {
                     policy: policy.clone(),
-                },
-            },
-            #[cfg(target_os = "macos")]
-            Self::VpnApplication { configuration } => OfferedSession::Vpn {
-                scope: VpnScope::Application {
-                    application: configuration.application_name().to_string(),
                 },
             },
         };
@@ -391,19 +358,6 @@ async fn run() -> Result<()> {
             }
             println!("VPN mode requires administrator/root privileges and WSS");
         }
-        #[cfg(target_os = "macos")]
-        ServerSessionMode::VpnApplication { configuration } => {
-            println!(
-                "native per-app VPN requested for {} ({})",
-                configuration.application_name(),
-                configuration.application_bundle().display()
-            );
-            println!(
-                "macOS companion: {}",
-                configuration.companion_bundle().display()
-            );
-            println!("per-app VPN requires WSS but does not require root privileges");
-        }
     }
 
     let mut http_task = tokio::spawn(run_http_server(
@@ -447,10 +401,6 @@ async fn run() -> Result<()> {
                 policy.clone(),
             )
             .await
-        }
-        #[cfg(target_os = "macos")]
-        ServerSessionMode::VpnApplication { configuration } => {
-            configuration.run(established_session.websocket).await
         }
     };
     {
@@ -823,19 +773,6 @@ fn resolve_session_mode(cli: &ServerCli) -> Result<ServerSessionMode> {
             SystemVpnPolicy::new(cli.vpn_include_cidr.clone(), cli.vpn_include_domain.clone())?;
         return Ok(ServerSessionMode::VpnSystem { policy });
     }
-    if let Some(application_bundle) = &cli.vpn_app {
-        #[cfg(target_os = "macos")]
-        {
-            let configuration =
-                MacosPerAppVpn::resolve(application_bundle, cli.vpn_companion.as_deref())?;
-            return Ok(ServerSessionMode::VpnApplication { configuration });
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = application_bundle;
-            bail!("--vpn-app is supported only on macOS");
-        }
-    }
     if let Some(listen_addr) = cli.socks_only {
         return Ok(ServerSessionMode::Socks { listen_addr });
     }
@@ -980,6 +917,19 @@ mod tests {
             mode,
             ServerSessionMode::VpnSystem { policy } if policy.is_full_tunnel()
         ));
+    }
+
+    #[test]
+    fn unsupported_application_vpn_options_are_rejected() {
+        for option in ["--vpn-app", "--vpn-companion"] {
+            let error = ServerCli::try_parse_from([
+                "sshportal-server",
+                option,
+                "/Applications/Example.app",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]

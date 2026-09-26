@@ -3,8 +3,6 @@
 mod control;
 mod debug;
 mod keys;
-#[cfg(target_os = "macos")]
-mod macos;
 mod network;
 mod platform;
 mod shell;
@@ -20,8 +18,6 @@ pub use keys::{
     AuthorizedKeySupport, AuthorizedKeyTarget, OperatorKeyMaterial, authorized_key_support,
     load_operator_key, parse_public_key,
 };
-#[cfg(target_os = "macos")]
-pub use macos::MacosPerAppVpn;
 pub use network::{run_client_network_proxy, run_operator_socks_proxy};
 pub use platform::{OperatingSystem, Platform, ShellLaunch};
 pub use shell::{run_client_session_proxy, run_remote_shell_server};

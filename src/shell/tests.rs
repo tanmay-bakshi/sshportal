@@ -14,7 +14,7 @@ use crate::network::NetworkTarget;
 use crate::platform::{ShellFamily, ShellLaunch};
 use crate::socks::{
     SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT,
-    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksAuthentication,
+    SOCKS_REPLY_COMMAND_NOT_SUPPORTED, SOCKS_REPLY_SUCCESS, SOCKS_VERSION,
     negotiate_socks5_connect,
 };
 use crate::websocket_to_io;
@@ -235,9 +235,7 @@ fn longest_prefix_suffix_match(buffer: &[u8], needle: &[u8]) -> usize {
 #[tokio::test]
 async fn negotiates_socks5_domain_connect_request() {
     let (mut client_side, mut server_side) = duplex(1024);
-    let server_task = tokio::spawn(async move {
-        negotiate_socks5_connect(&mut server_side, &SocksAuthentication::None).await
-    });
+    let server_task = tokio::spawn(async move { negotiate_socks5_connect(&mut server_side).await });
 
     client_side
         .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_NONE])
@@ -278,9 +276,7 @@ async fn negotiates_socks5_domain_connect_request() {
 #[tokio::test]
 async fn rejects_unsupported_socks5_command() {
     let (mut client_side, mut server_side) = duplex(1024);
-    let server_task = tokio::spawn(async move {
-        negotiate_socks5_connect(&mut server_side, &SocksAuthentication::None).await
-    });
+    let server_task = tokio::spawn(async move { negotiate_socks5_connect(&mut server_side).await });
 
     client_side
         .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_NONE])

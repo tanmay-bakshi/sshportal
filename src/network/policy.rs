@@ -15,10 +15,7 @@ pub(super) enum ClientNetworkPolicy {
 impl ClientNetworkPolicy {
     pub(super) fn from_approved_session(session: &OfferedSession) -> Result<Self> {
         match session {
-            OfferedSession::Socks {}
-            | OfferedSession::Vpn {
-                scope: VpnScope::Application { .. },
-            } => Ok(Self::DirectEgress),
+            OfferedSession::Socks {} => Ok(Self::DirectEgress),
             OfferedSession::Vpn {
                 scope: VpnScope::System { policy },
             } => Ok(Self::SystemVpn(policy.clone())),
@@ -93,31 +90,22 @@ mod tests {
     }
 
     #[test]
-    fn socks_and_application_vpn_allow_egress_but_not_resolver_streams() {
-        for session in [
-            OfferedSession::Socks {},
-            OfferedSession::Vpn {
-                scope: VpnScope::Application {
-                    application: "Firefox".to_string(),
-                },
-            },
+    fn socks_allows_egress_but_not_resolver_streams() {
+        let policy = policy_for(OfferedSession::Socks {});
+        for target in [
+            NetworkTarget::new("192.0.2.8", 443).unwrap(),
+            NetworkTarget::new("arbitrary.example", 53).unwrap(),
         ] {
-            let policy = policy_for(session);
-            for target in [
-                NetworkTarget::new("192.0.2.8", 443).unwrap(),
-                NetworkTarget::new("arbitrary.example", 53).unwrap(),
-            ] {
-                policy.authorize_target(&target).unwrap();
-            }
-            assert!(!policy.allows_resolver_stream());
-            assert_eq!(
-                policy
-                    .authorize_resolver_name("arbitrary.example")
-                    .unwrap_err()
-                    .kind,
-                NetworkErrorKind::PermissionDenied
-            );
+            policy.authorize_target(&target).unwrap();
         }
+        assert!(!policy.allows_resolver_stream());
+        assert_eq!(
+            policy
+                .authorize_resolver_name("arbitrary.example")
+                .unwrap_err()
+                .kind,
+            NetworkErrorKind::PermissionDenied
+        );
     }
 
     #[test]

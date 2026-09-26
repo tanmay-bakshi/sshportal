@@ -21,8 +21,6 @@ pub(crate) struct SocksUdpDatagram {
 
 pub(crate) const SOCKS_VERSION: u8 = 0x05;
 pub(crate) const SOCKS_AUTH_NONE: u8 = 0x00;
-#[cfg(any(target_os = "macos", test))]
-pub(crate) const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
 pub(crate) const SOCKS_NO_ACCEPTABLE_METHODS: u8 = 0xff;
 pub(crate) const SOCKS_CMD_CONNECT: u8 = 0x01;
 pub(crate) const SOCKS_CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -40,51 +38,28 @@ pub(crate) const SOCKS_ATYP_DOMAIN_NAME: u8 = 0x03;
 pub(crate) const SOCKS_ATYP_IPV6: u8 = 0x04;
 
 const SOCKS_UDP_HEADER_PREFIX_BYTES: usize = 3;
-#[cfg(any(target_os = "macos", test))]
-const USERNAME_PASSWORD_VERSION: u8 = 0x01;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SocksAuthentication {
-    None,
-    #[cfg(any(target_os = "macos", test))]
-    UsernamePassword {
-        username: String,
-        password: String,
-    },
-}
-
-pub(crate) async fn negotiate_socks5_connect<S>(
-    stream: &mut S,
-    authentication: &SocksAuthentication,
-) -> Result<NetworkTarget>
+pub(crate) async fn negotiate_socks5_connect<S>(stream: &mut S) -> Result<NetworkTarget>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    match negotiate_socks5(stream, false, authentication).await? {
+    match negotiate_socks5(stream, false).await? {
         SocksRequest::Connect(target) => Ok(target),
         SocksRequest::UdpAssociate => unreachable!("UDP is rejected when it is disabled"),
     }
 }
 
-pub(crate) async fn negotiate_socks5_network<S>(
-    stream: &mut S,
-    authentication: &SocksAuthentication,
-) -> Result<SocksRequest>
+pub(crate) async fn negotiate_socks5_network<S>(stream: &mut S) -> Result<SocksRequest>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    negotiate_socks5(stream, true, authentication).await
+    negotiate_socks5(stream, true).await
 }
 
-async fn negotiate_socks5<S>(
-    stream: &mut S,
-    udp_supported: bool,
-    authentication: &SocksAuthentication,
-) -> Result<SocksRequest>
+async fn negotiate_socks5<S>(stream: &mut S, udp_supported: bool) -> Result<SocksRequest>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    negotiate_authentication(stream, authentication).await?;
+    negotiate_authentication(stream).await?;
 
     let mut request_header = [0_u8; 4];
     stream
@@ -123,10 +98,7 @@ where
     }
 }
 
-async fn negotiate_authentication<S>(
-    stream: &mut S,
-    authentication: &SocksAuthentication,
-) -> Result<()>
+async fn negotiate_authentication<S>(stream: &mut S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -145,12 +117,7 @@ where
         .read_exact(&mut methods)
         .await
         .context("failed to read SOCKS methods")?;
-    let required_method = match authentication {
-        SocksAuthentication::None => SOCKS_AUTH_NONE,
-        #[cfg(any(target_os = "macos", test))]
-        SocksAuthentication::UsernamePassword { .. } => SOCKS_AUTH_USERNAME_PASSWORD,
-    };
-    if !methods.contains(&required_method) {
+    if !methods.contains(&SOCKS_AUTH_NONE) {
         stream
             .write_all(&[SOCKS_VERSION, SOCKS_NO_ACCEPTABLE_METHODS])
             .await
@@ -163,92 +130,13 @@ where
     }
 
     stream
-        .write_all(&[SOCKS_VERSION, required_method])
+        .write_all(&[SOCKS_VERSION, SOCKS_AUTH_NONE])
         .await
         .context("failed to accept SOCKS authentication method")?;
     stream
         .flush()
         .await
-        .context("failed to flush SOCKS authentication response")?;
-    match authentication {
-        SocksAuthentication::None => Ok(()),
-        #[cfg(any(target_os = "macos", test))]
-        SocksAuthentication::UsernamePassword { username, password } => {
-            negotiate_username_password(stream, username, password).await
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-async fn negotiate_username_password<S>(
-    stream: &mut S,
-    expected_username: &str,
-    expected_password: &str,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut header = [0_u8; 2];
-    stream
-        .read_exact(&mut header)
-        .await
-        .context("failed to read SOCKS username/password header")?;
-    if header[0] != USERNAME_PASSWORD_VERSION {
-        send_username_password_status(stream, 1).await?;
-        bail!("unsupported SOCKS username/password version {}", header[0]);
-    }
-
-    let mut username = vec![0_u8; usize::from(header[1])];
-    stream
-        .read_exact(&mut username)
-        .await
-        .context("failed to read SOCKS username")?;
-    let mut password_length = [0_u8; 1];
-    stream
-        .read_exact(&mut password_length)
-        .await
-        .context("failed to read SOCKS password length")?;
-    let mut password = vec![0_u8; usize::from(password_length[0])];
-    stream
-        .read_exact(&mut password)
-        .await
-        .context("failed to read SOCKS password")?;
-
-    let credentials_match = constant_time_eq(&username, expected_username.as_bytes())
-        & constant_time_eq(&password, expected_password.as_bytes());
-    if !credentials_match {
-        send_username_password_status(stream, 1).await?;
-        bail!("SOCKS username/password authentication failed");
-    }
-
-    send_username_password_status(stream, 0).await
-}
-
-#[cfg(any(target_os = "macos", test))]
-async fn send_username_password_status<S>(stream: &mut S, status: u8) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    stream
-        .write_all(&[USERNAME_PASSWORD_VERSION, status])
-        .await
-        .context("failed to write SOCKS username/password result")?;
-    stream
-        .flush()
-        .await
-        .context("failed to flush SOCKS username/password result")
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn constant_time_eq(actual: &[u8], expected: &[u8]) -> bool {
-    let compared_length = actual.len().max(expected.len());
-    let mut difference = actual.len() ^ expected.len();
-    for index in 0..compared_length {
-        let actual_byte = actual.get(index).copied().unwrap_or(0);
-        let expected_byte = expected.get(index).copied().unwrap_or(0);
-        difference |= usize::from(actual_byte ^ expected_byte);
-    }
-    difference == 0
+        .context("failed to flush SOCKS authentication response")
 }
 
 async fn read_socks_target<S>(stream: &mut S, address_type: u8) -> Result<NetworkTarget>
@@ -435,8 +323,8 @@ mod tests {
     use crate::network::NetworkTarget;
 
     use super::{
-        SOCKS_ATYP_IPV4, SOCKS_AUTH_USERNAME_PASSWORD, SOCKS_CMD_CONNECT, SOCKS_VERSION,
-        SocksAuthentication, SocksUdpDatagram, decode_socks_target, decode_socks_udp_datagram,
+        SOCKS_ATYP_IPV4, SOCKS_AUTH_NONE, SOCKS_CMD_CONNECT, SOCKS_NO_ACCEPTABLE_METHODS,
+        SOCKS_VERSION, SocksUdpDatagram, decode_socks_target, decode_socks_udp_datagram,
         encode_socks_target, encode_socks_udp_datagram, negotiate_socks5_connect,
     };
 
@@ -492,37 +380,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn username_password_authentication_accepts_matching_credentials() {
+    async fn connect_selects_no_authentication_from_offered_methods() {
         let (mut client, mut server) = duplex(1024);
-        let server_task = tokio::spawn(async move {
-            negotiate_socks5_connect(
-                &mut server,
-                &SocksAuthentication::UsernamePassword {
-                    username: "sshportal".to_string(),
-                    password: "session-secret".to_string(),
-                },
-            )
-            .await
-        });
+        let server_task = tokio::spawn(async move { negotiate_socks5_connect(&mut server).await });
 
         client
-            .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_USERNAME_PASSWORD])
+            .write_all(&[SOCKS_VERSION, 2, 0x02, SOCKS_AUTH_NONE])
             .await
             .unwrap();
         let mut method = [0_u8; 2];
         client.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [SOCKS_VERSION, SOCKS_AUTH_USERNAME_PASSWORD]);
-
-        client
-            .write_all(&[
-                1, 9, b's', b's', b'h', b'p', b'o', b'r', b't', b'a', b'l', 14, b's', b'e', b's',
-                b's', b'i', b'o', b'n', b'-', b's', b'e', b'c', b'r', b'e', b't',
-            ])
-            .await
-            .unwrap();
-        let mut authentication_result = [0_u8; 2];
-        client.read_exact(&mut authentication_result).await.unwrap();
-        assert_eq!(authentication_result, [1, 0]);
+        assert_eq!(method, [SOCKS_VERSION, SOCKS_AUTH_NONE]);
 
         client
             .write_all(&[
@@ -545,43 +413,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn username_password_authentication_rejects_wrong_password() {
-        let (mut client, mut server) = duplex(1024);
-        let server_task = tokio::spawn(async move {
-            negotiate_socks5_connect(
-                &mut server,
-                &SocksAuthentication::UsernamePassword {
-                    username: "sshportal".to_string(),
-                    password: "expected".to_string(),
-                },
-            )
-            .await
-        });
+    async fn negotiation_rejects_clients_without_no_authentication_support() {
+        for greeting in [vec![SOCKS_VERSION, 0], vec![SOCKS_VERSION, 1, 0x02]] {
+            let (mut client, mut server) = duplex(1024);
+            let server_task =
+                tokio::spawn(async move { negotiate_socks5_connect(&mut server).await });
 
-        client
-            .write_all(&[SOCKS_VERSION, 1, SOCKS_AUTH_USERNAME_PASSWORD])
-            .await
-            .unwrap();
-        let mut method = [0_u8; 2];
-        client.read_exact(&mut method).await.unwrap();
-        client
-            .write_all(&[
-                1, 9, b's', b's', b'h', b'p', b'o', b'r', b't', b'a', b'l', 5, b'w', b'r', b'o',
-                b'n', b'g',
-            ])
-            .await
-            .unwrap();
-
-        let mut authentication_result = [0_u8; 2];
-        client.read_exact(&mut authentication_result).await.unwrap();
-        assert_eq!(authentication_result, [1, 1]);
-        assert!(
-            server_task
-                .await
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("authentication failed")
-        );
+            client.write_all(&greeting).await.unwrap();
+            let mut method = [0_u8; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [SOCKS_VERSION, SOCKS_NO_ACCEPTABLE_METHODS]);
+            assert!(server_task.await.unwrap().is_err());
+        }
     }
 }

@@ -15,6 +15,4 @@ pub(crate) use session::{
     TcpTunnelSender, UdpReceiveCredit, UdpTunnelReceiver, UdpTunnelSender,
     start_operator_network_session,
 };
-#[cfg(target_os = "macos")]
-pub(crate) use socks_frontend::run_operator_network_proxy_with_listener;
 pub use socks_frontend::run_operator_socks_proxy;

@@ -55,7 +55,6 @@ pub enum OfferedSession {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VpnScope {
     System { policy: SystemVpnPolicy },
-    Application { application: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -103,19 +102,7 @@ impl ControlPacket {
                     &offer.operator_name,
                     MAX_DISPLAY_LABEL_BYTES,
                     true,
-                )?;
-                if let OfferedSession::Vpn {
-                    scope: VpnScope::Application { application },
-                } = &offer.session
-                {
-                    validate_terminal_text(
-                        "application VPN name",
-                        application,
-                        MAX_DISPLAY_LABEL_BYTES,
-                        true,
-                    )?;
-                }
-                Ok(())
+                )
             }
             Self::ClientDecision(decision) => {
                 if decision.key_installed && !decision.session_allowed {
@@ -280,13 +267,13 @@ mod tests {
         receive_result.unwrap()
     }
 
-    fn application_offer(operator_name: &str, application: &str) -> ControlPacket {
+    fn system_vpn_offer(operator_name: &str) -> ControlPacket {
         ControlPacket::ServerOffer(ServerOffer {
             protocol_version: PROTOCOL_VERSION,
             operator_name: operator_name.to_string(),
             session: OfferedSession::Vpn {
-                scope: VpnScope::Application {
-                    application: application.to_string(),
+                scope: VpnScope::System {
+                    policy: SystemVpnPolicy::default(),
                 },
             },
         })
@@ -320,22 +307,23 @@ mod tests {
     }
 
     #[test]
-    fn application_vpn_offer_names_the_scoped_application() {
-        let packet = ControlPacket::ServerOffer(ServerOffer {
-            protocol_version: PROTOCOL_VERSION,
-            operator_name: "support".to_string(),
-            session: OfferedSession::Vpn {
-                scope: VpnScope::Application {
-                    application: "Firefox".to_string(),
+    fn unsupported_vpn_scopes_are_rejected() {
+        for scope in [
+            serde_json::json!({ "kind": "application", "application": "Firefox" }),
+            serde_json::json!({ "kind": "unknown" }),
+        ] {
+            let encoded = serde_json::json!({
+                "type": "server_offer",
+                "protocol_version": PROTOCOL_VERSION,
+                "operator_name": "support",
+                "session": {
+                    "mode": "vpn",
+                    "scope": scope,
                 },
-            },
-        });
-
-        let encoded = serde_json::to_value(packet).unwrap();
-
-        assert_eq!(encoded["session"]["mode"], "vpn");
-        assert_eq!(encoded["session"]["scope"]["kind"], "application");
-        assert_eq!(encoded["session"]["scope"]["application"], "Firefox");
+            });
+            let error = serde_json::from_value::<ControlPacket>(encoded).unwrap_err();
+            assert!(error.to_string().contains("unknown variant"));
+        }
     }
 
     #[tokio::test]
@@ -355,7 +343,7 @@ mod tests {
             serde_json::to_value(hello).unwrap()
         );
 
-        let offer = application_offer("فريق الدعم", "Firefox 火狐");
+        let offer = system_vpn_offer("فريق الدعم 火狐");
         let received_offer = round_trip(&offer).await;
         assert_eq!(
             serde_json::to_value(received_offer).unwrap(),
@@ -376,7 +364,7 @@ mod tests {
 
     #[test]
     fn display_labels_must_be_nonblank_and_bounded() {
-        let blank_operator = application_offer("\u{2003}\u{2003}", "Firefox");
+        let blank_operator = system_vpn_offer("\u{2003}\u{2003}");
         assert!(
             blank_operator
                 .validate()
@@ -385,42 +373,18 @@ mod tests {
                 .contains("operator name must not be blank")
         );
 
-        let blank_application = application_offer("support", " \t ");
-        assert!(
-            blank_application
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("application VPN name must not be blank")
-        );
-
         let long_operator = "a".repeat(MAX_DISPLAY_LABEL_BYTES + 1);
-        assert!(
-            application_offer(&long_operator, "Firefox")
-                .validate()
-                .is_err()
-        );
+        assert!(system_vpn_offer(&long_operator).validate().is_err());
 
-        let long_application = "火".repeat(MAX_DISPLAY_LABEL_BYTES / 3 + 1);
-        assert!(
-            application_offer("support", &long_application)
-                .validate()
-                .is_err()
-        );
+        let long_unicode_operator = "火".repeat(MAX_DISPLAY_LABEL_BYTES / 3 + 1);
+        assert!(system_vpn_offer(&long_unicode_operator).validate().is_err());
     }
 
     #[test]
     fn terminal_controls_and_bidirectional_formatting_are_rejected() {
         for unsafe_character in ['\n', '\u{1b}', '\u{2028}', '\u{202e}', '\u{2066}'] {
             let operator = format!("support{unsafe_character}spoof");
-            assert!(application_offer(&operator, "Firefox").validate().is_err());
-
-            let application = format!("Fire{unsafe_character}fox");
-            assert!(
-                application_offer("support", &application)
-                    .validate()
-                    .is_err()
-            );
+            assert!(system_vpn_offer(&operator).validate().is_err());
 
             let decision = ControlPacket::ClientDecision(ClientDecision {
                 session_allowed: false,
@@ -561,8 +525,8 @@ mod tests {
                     "session": {
                         "mode": "vpn",
                         "scope": {
-                            "kind": "application",
-                            "application": "Firefox",
+                            "kind": "system",
+                            "policy": { "include_cidrs": [], "include_domains": [] },
                             "unexpected": true,
                         },
                     },
@@ -621,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn send_packet_rejects_invalid_display_text_before_writing() {
         let (mut sender, _receiver) = websocket_pair().await;
-        let packet = application_offer("support\u{202e}hidden", "Firefox");
+        let packet = system_vpn_offer("support\u{202e}hidden");
 
         let error = send_packet(&mut sender, &packet).await.unwrap_err();
 

@@ -204,18 +204,13 @@ fn session_consent_prompt(operator_name: &str, session: &OfferedSession) -> Stri
             "Allow {operator_name} to open SSH support sessions into this environment while this connection remains open?"
         ),
         OfferedSession::Socks {} => format!(
-            "Allow {operator_name} to route TCP connections through this environment using a SOCKS5 proxy while this connection remains open?"
+            "Allow {operator_name} to route TCP connections and UDP datagrams through this environment using a SOCKS5 proxy while this connection remains open?"
         ),
         OfferedSession::Vpn {
             scope: VpnScope::System { policy },
         } => format!(
             "Allow {operator_name} to {} while this connection remains open?",
             describe_system_vpn(policy)
-        ),
-        OfferedSession::Vpn {
-            scope: VpnScope::Application { application },
-        } => format!(
-            "macOS enforces process-level VPN scope for {application} on the operator's machine, but this client cannot attest process provenance. Approval therefore authorizes arbitrary TCP and UDP egress through this environment. Allow {operator_name} to start that application-scoped VPN session while this connection remains open?"
         ),
     }
 }
@@ -454,6 +449,13 @@ fn+7AiBo/pGqKkSraMBARq6fd2yOaFYPpg/ojDnhdejubqEvTw==
     }
 
     #[test]
+    fn socks_consent_describes_tcp_and_udp_access() {
+        let description = session_consent_prompt("support", &OfferedSession::Socks {});
+        assert!(description.contains("TCP connections and UDP datagrams"));
+        assert!(description.contains("while this connection remains open"));
+    }
+
+    #[test]
     fn vpn_mode_rejects_plain_websocket_transport() {
         let url = Url::parse("ws://support.example/connect").unwrap();
 
@@ -537,21 +539,5 @@ fn+7AiBo/pGqKkSraMBARq6fd2yOaFYPpg/ojDnhdejubqEvTw==
         }
         assert!(description.contains("only the operator's"));
         assert!(description.contains("all subdomains"));
-    }
-
-    #[test]
-    fn application_vpn_consent_states_the_actual_client_authorization_boundary() {
-        let description = session_consent_prompt(
-            "support",
-            &OfferedSession::Vpn {
-                scope: VpnScope::Application {
-                    application: "Firefox".to_string(),
-                },
-            },
-        );
-
-        assert!(description.contains("macOS enforces process-level VPN scope for Firefox"));
-        assert!(description.contains("client cannot attest process provenance"));
-        assert!(description.contains("authorizes arbitrary TCP and UDP egress"));
     }
 }

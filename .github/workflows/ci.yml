@@ -166,50 +166,6 @@ jobs:
         timeout-minutes: 3
         run: cargo test --locked shell::tests::local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport -- --nocapture
 
-  native-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Verify generated Xcode project
-        run: |
-          gem install xcodeproj --version 1.27.0 --no-document
-          ruby macos/Support/generate_project.rb
-          git diff --exit-code -- macos/SSHPortal.xcodeproj
-      - name: Test native per-app VPN targets
-        run: |
-          xcodebuild \
-            -project macos/SSHPortal.xcodeproj \
-            -scheme SSHPortal \
-            -configuration Debug \
-            -destination 'platform=macOS' \
-            -derivedDataPath target/macos-ci-derived \
-            CODE_SIGNING_ALLOWED=NO \
-            test
-      - name: Build universal companion and system extension
-        run: |
-          xcodebuild \
-            -project macos/SSHPortal.xcodeproj \
-            -scheme SSHPortal \
-            -configuration Release \
-            -destination 'generic/platform=macOS' \
-            -derivedDataPath target/macos-ci-universal-derived \
-            CODE_SIGNING_ALLOWED=NO \
-            ARCHS='arm64 x86_64' \
-            ONLY_ACTIVE_ARCH=NO \
-            build
-          lipo \
-            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/MacOS/SSHPortal \
-            -verify_arch arm64
-          lipo \
-            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/MacOS/SSHPortal \
-            -verify_arch x86_64
-          lipo \
-            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/Library/SystemExtensions/SSHPortalAppProxy.systemextension/Contents/MacOS/SSHPortalAppProxy \
-            -verify_arch arm64
-          lipo \
-            target/macos-ci-universal-derived/Build/Products/Release/SSHPortal.app/Contents/Library/SystemExtensions/SSHPortalAppProxy.systemextension/Contents/MacOS/SSHPortalAppProxy \
-            -verify_arch x86_64
-
   e2e-macos-system-vpn:
     runs-on: macos-latest
     timeout-minutes: 20

@@ -2244,11 +2244,6 @@ mod tests {
         for approved_session in [
             OfferedSession::Socks {},
             OfferedSession::Vpn {
-                scope: VpnScope::Application {
-                    application: "Firefox".to_string(),
-                },
-            },
-            OfferedSession::Vpn {
                 scope: VpnScope::System { policy: cidr_only },
             },
         ] {

@@ -20,9 +20,9 @@ use crate::network::session::{
 use crate::socks::{
     SOCKS_REPLY_CONNECTION_NOT_ALLOWED, SOCKS_REPLY_CONNECTION_REFUSED,
     SOCKS_REPLY_GENERAL_FAILURE, SOCKS_REPLY_HOST_UNREACHABLE, SOCKS_REPLY_NETWORK_UNREACHABLE,
-    SOCKS_REPLY_SUCCESS, SOCKS_REPLY_TTL_EXPIRED, SocksAuthentication, SocksRequest,
-    SocksUdpDatagram, decode_socks_udp_datagram, encode_socks_udp_datagram,
-    negotiate_socks5_network, write_socks5_response,
+    SOCKS_REPLY_SUCCESS, SOCKS_REPLY_TTL_EXPIRED, SocksRequest, SocksUdpDatagram,
+    decode_socks_udp_datagram, encode_socks_udp_datagram, negotiate_socks5_network,
+    write_socks5_response,
 };
 
 const SOCKS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -86,26 +86,24 @@ where
         .local_addr()
         .context("failed to read SOCKS5 proxy listener address")?;
     println!("SOCKS5 proxy listening on {bound_addr} (SSH disabled)");
-    run_operator_network_proxy_with_listener(websocket, listener, SocksAuthentication::None).await
+    run_operator_network_proxy_with_listener(websocket, listener).await
 }
 
-pub(crate) async fn run_operator_network_proxy_with_listener<S>(
+async fn run_operator_network_proxy_with_listener<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
     listener: TcpListener,
-    authentication: SocksAuthentication,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (session, runtime) = start_operator_network_session(websocket).await?;
-    run_socks_listener(session, runtime, listener, authentication).await
+    run_socks_listener(session, runtime, listener).await
 }
 
 async fn run_socks_listener(
     session: OperatorNetworkSession,
     runtime: NetworkSessionRuntime,
     listener: TcpListener,
-    authentication: SocksAuthentication,
 ) -> Result<()> {
     let mut flows = JoinSet::new();
     let session_result = {
@@ -121,10 +119,9 @@ async fn run_socks_listener(
                         }
                     };
                     let flow_session = session.clone();
-                    let flow_authentication = authentication.clone();
                     debug_log(format!("accepted SOCKS client {peer}"));
                     flows.spawn(async move {
-                        if let Err(error) = run_socks_flow(stream, flow_session, flow_authentication).await {
+                        if let Err(error) = run_socks_flow(stream, flow_session).await {
                             debug_log(format!("SOCKS client {peer} ended with an error: {error:#}"));
                         }
                     });
@@ -144,14 +141,10 @@ async fn run_socks_listener(
     session_result
 }
 
-async fn run_socks_flow(
-    mut stream: TcpStream,
-    session: OperatorNetworkSession,
-    authentication: SocksAuthentication,
-) -> Result<()> {
+async fn run_socks_flow(mut stream: TcpStream, session: OperatorNetworkSession) -> Result<()> {
     let request = match tokio::time::timeout(
         SOCKS_NEGOTIATION_TIMEOUT,
-        negotiate_socks5_network(&mut stream, &authentication),
+        negotiate_socks5_network(&mut stream),
     )
     .await
     {
@@ -615,9 +608,8 @@ mod tests {
     use crate::network::session::run_client_network_session;
     use crate::socks::{
         SOCKS_ATYP_DOMAIN_NAME, SOCKS_ATYP_IPV4, SOCKS_ATYP_IPV6, SOCKS_AUTH_NONE,
-        SOCKS_AUTH_USERNAME_PASSWORD, SOCKS_CMD_CONNECT, SOCKS_CMD_UDP_ASSOCIATE,
-        SOCKS_REPLY_SUCCESS, SOCKS_VERSION, SocksAuthentication, SocksUdpDatagram,
-        decode_socks_target, decode_socks_udp_datagram, encode_socks_target,
+        SOCKS_CMD_CONNECT, SOCKS_CMD_UDP_ASSOCIATE, SOCKS_REPLY_SUCCESS, SOCKS_VERSION,
+        SocksUdpDatagram, decode_socks_target, decode_socks_udp_datagram, encode_socks_target,
         encode_socks_udp_datagram,
     };
 
@@ -650,7 +642,7 @@ mod tests {
         bound_target: Option<NetworkTarget>,
     }
 
-    async fn start_network_proxy(authentication: SocksAuthentication) -> NetworkProxyHarness {
+    async fn start_network_proxy() -> NetworkProxyHarness {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let socks_address = listener.local_addr().unwrap();
         let (operator_io, client_io) = duplex(WEBSOCKET_TRANSPORT_BYTES);
@@ -662,47 +654,13 @@ mod tests {
             run_client_network_session(client_websocket, OfferedSession::Socks {}).await
         });
         let operator_task = tokio::spawn(async move {
-            run_operator_network_proxy_with_listener(operator_websocket, listener, authentication)
-                .await
+            run_operator_network_proxy_with_listener(operator_websocket, listener).await
         });
         NetworkProxyHarness {
             socks_address,
             operator_task,
             client_task,
         }
-    }
-
-    async fn authenticate_username_password(
-        stream: &mut TcpStream,
-        username: &str,
-        password: &str,
-    ) -> bool {
-        stream
-            .write_all(&[
-                SOCKS_VERSION,
-                2,
-                SOCKS_AUTH_NONE,
-                SOCKS_AUTH_USERNAME_PASSWORD,
-            ])
-            .await
-            .unwrap();
-        let mut method = [0_u8; 2];
-        stream.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [SOCKS_VERSION, SOCKS_AUTH_USERNAME_PASSWORD]);
-
-        let username_length = u8::try_from(username.len()).unwrap();
-        let password_length = u8::try_from(password.len()).unwrap();
-        let mut credentials = Vec::with_capacity(username.len() + password.len() + 3);
-        credentials.extend_from_slice(&[1, username_length]);
-        credentials.extend_from_slice(username.as_bytes());
-        credentials.push(password_length);
-        credentials.extend_from_slice(password.as_bytes());
-        stream.write_all(&credentials).await.unwrap();
-
-        let mut result = [0_u8; 2];
-        stream.read_exact(&mut result).await.unwrap();
-        assert_eq!(result[0], 1);
-        result[1] == 0
     }
 
     async fn authenticate_without_credentials(stream: &mut TcpStream) {
@@ -772,12 +730,9 @@ mod tests {
         }
     }
 
-    async fn open_authenticated_tcp_flow(
-        socks_address: SocketAddr,
-        destination_port: u16,
-    ) -> TcpStream {
+    async fn open_tcp_flow(socks_address: SocketAddr, destination_port: u16) -> TcpStream {
         let mut stream = TcpStream::connect(socks_address).await.unwrap();
-        assert!(authenticate_username_password(&mut stream, "operator", "session-secret").await);
+        authenticate_without_credentials(&mut stream).await;
         let target = NetworkTarget::new("localhost", destination_port).unwrap();
         let reply = request_socks_command(&mut stream, SOCKS_CMD_CONNECT, &target).await;
         assert_eq!(reply.status, SOCKS_REPLY_SUCCESS);
@@ -902,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn socks_listener_bounds_connections_before_network_flow_admission() {
         tokio::time::timeout(Duration::from_secs(20), async {
-            let proxy = start_network_proxy(SocksAuthentication::None).await;
+            let proxy = start_network_proxy().await;
             let mut active_connections = Vec::with_capacity(NETWORK_SESSION_FLOW_LIMIT);
             for _ in 0..NETWORK_SESSION_FLOW_LIMIT {
                 let mut stream = TcpStream::connect(proxy.socks_address).await.unwrap();
@@ -941,30 +896,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_domain_connects_are_isolated_over_one_websocket_session() {
+    async fn domain_connects_are_isolated_over_one_websocket_session() {
         tokio::time::timeout(TEST_TIMEOUT, async {
             let (first_endpoint, first_endpoint_task) =
                 spawn_tcp_echo_endpoint(b"first-egress").await;
             let (second_endpoint, second_endpoint_task) =
                 spawn_tcp_echo_endpoint(b"second-egress").await;
-            let proxy = start_network_proxy(SocksAuthentication::UsernamePassword {
-                username: "operator".to_string(),
-                password: "session-secret".to_string(),
-            })
-            .await;
+            let proxy = start_network_proxy().await;
 
             let (mut first_flow, mut second_flow) = tokio::join!(
-                open_authenticated_tcp_flow(proxy.socks_address, first_endpoint.port()),
-                open_authenticated_tcp_flow(proxy.socks_address, second_endpoint.port()),
+                open_tcp_flow(proxy.socks_address, first_endpoint.port()),
+                open_tcp_flow(proxy.socks_address, second_endpoint.port()),
             );
-
-            let mut rejected_flow = TcpStream::connect(proxy.socks_address).await.unwrap();
-            assert!(
-                !authenticate_username_password(&mut rejected_flow, "operator", "wrong-secret")
-                    .await
-            );
-            let mut rejected_byte = [0_u8; 1];
-            assert_eq!(rejected_flow.read(&mut rejected_byte).await.unwrap(), 0);
 
             let mut first_greeting = [0_u8; 12];
             let mut second_greeting = [0_u8; 13];
@@ -989,7 +932,7 @@ mod tests {
             drop(proxy);
         })
         .await
-        .expect("authenticated SOCKS TCP integration test timed out");
+        .expect("SOCKS TCP integration test timed out");
     }
 
     #[tokio::test]
@@ -997,7 +940,7 @@ mod tests {
         tokio::time::timeout(TEST_TIMEOUT, async {
             let (first_endpoint, first_endpoint_task) = spawn_localhost_udp_echo_endpoint().await;
             let (second_endpoint, second_endpoint_task) = spawn_udp_echo_endpoint().await;
-            let proxy = start_network_proxy(SocksAuthentication::None).await;
+            let proxy = start_network_proxy().await;
             let mut control = TcpStream::connect(proxy.socks_address).await.unwrap();
             authenticate_without_credentials(&mut control).await;
             let unspecified_target =
@@ -1048,7 +991,7 @@ mod tests {
             let (busy_endpoint, busy_endpoint_task) =
                 spawn_udp_echo_endpoint_for(busy_datagrams).await;
             let (quiet_endpoint, quiet_endpoint_task) = spawn_udp_echo_endpoint().await;
-            let proxy = start_network_proxy(SocksAuthentication::None).await;
+            let proxy = start_network_proxy().await;
             let mut control = TcpStream::connect(proxy.socks_address).await.unwrap();
             authenticate_without_credentials(&mut control).await;
             let unspecified_target =
