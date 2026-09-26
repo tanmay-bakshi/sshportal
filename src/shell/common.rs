@@ -2,7 +2,7 @@ use anyhow::Result;
 use russh::client;
 use russh::keys::{PublicKey, ssh_key};
 
-use crate::debug::debug_enabled;
+use crate::debug::{debug_enabled, debug_log};
 
 #[derive(Default)]
 pub(super) struct NoopClientHandler;
@@ -25,7 +25,7 @@ pub(super) fn debug_public_key(label: &str, public_key: &PublicKey) {
     let rendered_key = public_key
         .to_openssh()
         .unwrap_or_else(|_| "<failed to render public key>".to_string());
-    eprintln!("[sshportal-debug] {label}: {rendered_key}");
+    debug_log(format!("{label}: {rendered_key}"));
 }
 
 pub(super) fn same_public_key(left: &PublicKey, right: &PublicKey) -> bool {
