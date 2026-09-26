@@ -7,8 +7,8 @@ license = "Apache-2.0"
 publish = false
 
 [target.'cfg(target_os = "windows")'.dependencies]
-anyhow = "1.0.98"
-rand = "0.10.0"
+anyhow = "1.0.103"
+rand = "0.10.1"
 sha2 = "0.11.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

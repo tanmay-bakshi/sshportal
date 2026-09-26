@@ -2,14 +2,14 @@
 
 use std::env;
 use std::fs::File;
-use std::io::{self, BufReader, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use hostname::get;
 use russh::keys::PublicKey;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 use sshportal::{
     AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ControlPacket,
@@ -179,9 +179,8 @@ fn load_tls_ca_certificates(paths: &[PathBuf]) -> Result<Vec<CertificateDer<'sta
         let file = File::open(path).with_context(|| {
             format!("failed to open TLS CA certificate file {}", path.display())
         })?;
-        let mut reader = BufReader::new(file);
-        let certificates = rustls_pemfile::certs(&mut reader)
-            .collect::<std::io::Result<Vec<_>>>()
+        let certificates = CertificateDer::pem_reader_iter(file)
+            .collect::<Result<Vec<_>, _>>()
             .with_context(|| {
                 format!(
                     "failed to decode PEM certificates from TLS CA file {}",
