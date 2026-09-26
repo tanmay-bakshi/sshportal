@@ -1,11 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use russh::client;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::debug::debug_log;
 use crate::socks::{
@@ -15,6 +16,12 @@ use crate::socks::{
 
 use super::common::NoopClientHandler;
 use super::forwarding::bridge_ssh_channel_with_tcp_stream;
+
+const MAX_DYNAMIC_FORWARD_CONNECTIONS: usize = 256;
+const SOCKS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+mod tests;
 
 pub(super) struct DynamicForwardListener {
     listen_addr: SocketAddr,
@@ -44,8 +51,19 @@ pub(super) async fn start_dynamic_forward_listener(
         .local_addr()
         .context("failed to read dynamic forward listener address")?;
     let task = tokio::spawn(async move {
+        // The listener owns accepted connections, including incomplete negotiations.
+        // Dropping its JoinSet aborts them when the session tears down the listener.
+        let mut connections = JoinSet::new();
         loop {
-            let accept_result = listener.accept().await;
+            let accept_result = tokio::select! {
+                accepted = listener.accept(), if connections.len() < MAX_DYNAMIC_FORWARD_CONNECTIONS => accepted,
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        debug_log(format!("dynamic forward connection failed to join: {error}"));
+                    }
+                    continue;
+                }
+            };
             let (stream, remote_addr) = match accept_result {
                 Ok(parts) => parts,
                 Err(error) => {
@@ -55,7 +73,7 @@ pub(super) async fn start_dynamic_forward_listener(
             };
             debug_log(format!("accepted SOCKS client from {remote_addr}"));
             let session = Arc::clone(&session);
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 if let Err(error) = handle_dynamic_forward_connection(stream, session).await {
                     debug_log(format!("SOCKS client handling failed: {error:#}"));
                 }
@@ -72,7 +90,12 @@ async fn handle_dynamic_forward_connection(
     mut stream: TcpStream,
     session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
 ) -> Result<()> {
-    let target = negotiate_socks5_connect(&mut stream).await?;
+    let target = tokio::time::timeout(
+        SOCKS_NEGOTIATION_TIMEOUT,
+        negotiate_socks5_connect(&mut stream),
+    )
+    .await
+    .context("SOCKS negotiation timed out")??;
     let originator_addr = stream
         .peer_addr()
         .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
