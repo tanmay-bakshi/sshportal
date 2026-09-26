@@ -28,7 +28,7 @@ use tokio_tungstenite::{
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 use tokio_util::task::AbortOnDropHandle;
-use url::Url;
+use url::{Host, Url};
 
 use crate::DEFAULT_CONNECT_PATH;
 
@@ -622,9 +622,13 @@ async fn connect_via_proxy(
 
 fn destination_host_and_port(url: &Url) -> Result<(String, u16)> {
     let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("server URL `{url}` is missing a host"))?
-        .to_string();
+        .host()
+        .ok_or_else(|| anyhow!("server URL `{url}` is missing a host"))?;
+    let host = match host {
+        Host::Domain(domain) => domain.to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    };
     let port = url.port_or_known_default().ok_or_else(|| {
         anyhow!(
             "server URL `{url}` is missing a known default port for scheme `{}`",
@@ -642,8 +646,12 @@ fn proxy_endpoint(proxy: &Intercept) -> Result<(String, u16, String)> {
         .to_string();
     let proxy_host = proxy_uri
         .host()
-        .ok_or_else(|| anyhow!("proxy URI `{proxy_uri}` is missing a host"))?
-        .to_string();
+        .ok_or_else(|| anyhow!("proxy URI `{proxy_uri}` is missing a host"))?;
+    let proxy_host = proxy_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(proxy_host)
+        .to_owned();
     let default_port = match proxy_scheme.as_str() {
         "http" => 80,
         "https" => 443,
@@ -882,7 +890,7 @@ mod tests {
 
     use super::{
         WebSocketConnectTimeouts, connect_async_with_proxy_matcher,
-        connect_async_with_proxy_matcher_and_timeouts, normalize_websocket_url,
+        connect_async_with_proxy_matcher_and_timeouts, normalize_websocket_url, proxy_endpoint,
         selected_proxy_for_websocket_url, start_websocket_writer_with_capacity, tls_client_config,
         validate_connect_response,
     };
@@ -982,6 +990,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(proxy.uri().to_string(), "http://proxy.internal:8080/");
+    }
+
+    #[test]
+    fn ipv6_https_proxy_host_is_a_tls_ip_identity() {
+        let matcher = Matcher::builder().https("https://[::1]:8443").build();
+        let url = normalize_websocket_url("wss://example.com").unwrap();
+        let proxy = selected_proxy_for_websocket_url(&matcher, &url)
+            .unwrap()
+            .unwrap();
+        let (host, port, scheme) = proxy_endpoint(&proxy).unwrap();
+
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8443);
+        assert_eq!(scheme, "https");
+        assert!(matches!(
+            rustls::pki_types::ServerName::try_from(host).unwrap(),
+            rustls::pki_types::ServerName::IpAddress(_)
+        ));
     }
 
     #[test]
@@ -1148,57 +1174,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connects_through_http_proxy_tunnel_with_basic_auth() {
-        let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server_listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let (socket, _) = server_listener.accept().await.unwrap();
-            let _websocket = accept_async(socket).await.unwrap();
+    async fn connects_directly_to_an_ipv6_websocket_server() {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accept_async(socket).await.unwrap()
         });
-
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
-        let proxy_task = tokio::spawn(async move {
-            let (mut inbound, _) = proxy_listener.accept().await.unwrap();
-            let request = read_request_headers(&mut inbound).await.unwrap();
-            let expected_authority = format!("127.0.0.1:{}", server_addr.port());
-            assert!(request.starts_with(&format!(
-                "CONNECT {expected_authority} HTTP/1.1\r\nHost: {expected_authority}\r\n"
-            )));
-            assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
-
-            inbound
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .unwrap();
-
-            let mut outbound = TcpStream::connect(server_addr).await.unwrap();
-            let websocket_request = read_request_headers(&mut inbound).await.unwrap();
-            outbound
-                .write_all(websocket_request.as_bytes())
-                .await
-                .unwrap();
-
-            let websocket_response = read_request_headers(&mut outbound).await.unwrap();
-            inbound
-                .write_all(websocket_response.as_bytes())
-                .await
-                .unwrap();
-        });
-
-        let url =
-            normalize_websocket_url(&format!("http://127.0.0.1:{}", server_addr.port())).unwrap();
-        let matcher = Matcher::builder()
-            .all(format!("http://user:pass@127.0.0.1:{}", proxy_addr.port()))
-            .build();
-
-        let (websocket, _response) = connect_async_with_proxy_matcher(&url, &matcher)
-            .await
-            .unwrap();
+        let url = normalize_websocket_url(&format!("ws://{address}")).unwrap();
+        let result = connect_async_with_proxy_matcher(&url, &Matcher::builder().build()).await;
+        if result.is_err() {
+            server.abort();
+        }
+        let (websocket, _) = result.unwrap();
         drop(websocket);
+        drop(server.await.unwrap());
+    }
 
-        server_task.await.unwrap();
-        proxy_task.await.unwrap();
+    #[tokio::test]
+    async fn connects_through_http_proxy_tunnel_with_basic_auth() {
+        for (server_bind, proxy_bind) in [
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("[::1]:0", "127.0.0.1:0"),
+            ("127.0.0.1:0", "[::1]:0"),
+            ("[::1]:0", "[::1]:0"),
+        ] {
+            let server_listener = TcpListener::bind(server_bind).await.unwrap();
+            let server_addr = server_listener.local_addr().unwrap();
+            let server_task = tokio::spawn(async move {
+                let (socket, _) = server_listener.accept().await.unwrap();
+                let _websocket = accept_async(socket).await.unwrap();
+            });
+
+            let proxy_listener = TcpListener::bind(proxy_bind).await.unwrap();
+            let proxy_addr = proxy_listener.local_addr().unwrap();
+            let proxy_task = tokio::spawn(async move {
+                let (mut inbound, _) = proxy_listener.accept().await.unwrap();
+                let request = read_request_headers(&mut inbound).await.unwrap();
+                let expected_authority = server_addr.to_string();
+                assert!(request.starts_with(&format!(
+                    "CONNECT {expected_authority} HTTP/1.1\r\nHost: {expected_authority}\r\n"
+                )));
+                assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+
+                inbound
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+
+                let mut outbound = TcpStream::connect(server_addr).await.unwrap();
+                let websocket_request = read_request_headers(&mut inbound).await.unwrap();
+                outbound
+                    .write_all(websocket_request.as_bytes())
+                    .await
+                    .unwrap();
+
+                let websocket_response = read_request_headers(&mut outbound).await.unwrap();
+                inbound
+                    .write_all(websocket_response.as_bytes())
+                    .await
+                    .unwrap();
+            });
+
+            let url = normalize_websocket_url(&format!("http://{server_addr}")).unwrap();
+            let matcher = Matcher::builder()
+                .all(format!("http://user:pass@{proxy_addr}"))
+                .build();
+
+            let (websocket, _response) = connect_async_with_proxy_matcher(&url, &matcher)
+                .await
+                .unwrap();
+            drop(websocket);
+
+            server_task.await.unwrap();
+            proxy_task.await.unwrap();
+        }
     }
 
     async fn read_request_headers(stream: &mut TcpStream) -> io::Result<String> {
