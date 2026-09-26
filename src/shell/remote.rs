@@ -558,6 +558,11 @@ impl server::Handler for RemoteShellHandler {
         debug_log(format!(
             "pty_request term={term} cols={col_width} rows={row_height} pix_width={pix_width} pix_height={pix_height}"
         ));
+        let mut guard = self.shell_states.lock().await;
+        let Some(SessionChannelState::Pending(pending_state)) = guard.get_mut(&channel) else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
         let pty_system = native_pty_system();
         let size = Self::shell_size(col_width, row_height, pix_width, pix_height);
         let pair = match pty_system.openpty(size) {
@@ -569,17 +574,13 @@ impl server::Handler for RemoteShellHandler {
             }
         };
 
-        let mut guard = self.shell_states.lock().await;
-        let Some(SessionChannelState::Pending(pending_state)) = guard.remove(&channel) else {
-            session.channel_failure(channel)?;
-            return Ok(());
-        };
+        let env_vars = std::mem::take(&mut pending_state.env_vars);
         guard.insert(
             channel,
             SessionChannelState::PtyAllocated {
                 pair,
                 term: term.to_string(),
-                env_vars: pending_state.env_vars,
+                env_vars,
             },
         );
         session.channel_success(channel)?;
@@ -624,6 +625,13 @@ impl server::Handler for RemoteShellHandler {
         debug_log("shell_request received");
         let pending_state = {
             let mut guard = self.shell_states.lock().await;
+            if !matches!(
+                guard.get(&channel),
+                Some(SessionChannelState::PtyAllocated { .. })
+            ) {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
             guard.remove(&channel)
         };
         let Some(SessionChannelState::PtyAllocated {
@@ -660,6 +668,13 @@ impl server::Handler for RemoteShellHandler {
         ));
         let pending_state = {
             let mut guard = self.shell_states.lock().await;
+            if !matches!(
+                guard.get(&channel),
+                Some(SessionChannelState::Pending(_) | SessionChannelState::PtyAllocated { .. })
+            ) {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
             guard.remove(&channel)
         };
         let start_result = match pending_state {

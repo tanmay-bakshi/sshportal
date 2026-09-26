@@ -132,7 +132,10 @@ async fn collect_exec_output(
     command: &str,
 ) -> (String, String, u32) {
     channel.exec(true, command).await.unwrap();
+    collect_channel_output(channel).await
+}
 
+async fn collect_channel_output(channel: &mut Channel<client::Msg>) -> (String, String, u32) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_status = None;
@@ -591,6 +594,104 @@ async fn executes_noninteractive_commands_over_authenticated_transport() {
         .await
         .unwrap();
     server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn rejected_session_requests_preserve_the_channel_state() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let temp_dir = tempdir().unwrap();
+        let key =
+            Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
+        let (client_io, server_io) = duplex(64 * 1024);
+        let shell = ShellLaunch::detect_for_current_platform().unwrap();
+        let server_task = tokio::spawn(run_remote_shell_server(
+            server_io,
+            "support-user".to_string(),
+            key.public_key().clone(),
+            temp_dir.path().to_path_buf(),
+            shell.clone(),
+        ));
+        let session = connect_authenticated_client_transport(client_io, "support-user", key)
+            .await
+            .unwrap();
+
+        for with_pty in [false, true] {
+            for request in ["pty", "shell", "exec"] {
+                let mut channel = session.channel_open_session().await.unwrap();
+                if with_pty {
+                    channel
+                        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                        .await
+                        .unwrap();
+                    assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+                }
+                let command = match shell.family() {
+                    ShellFamily::Posix => "IFS= read -r value; printf 'accepted:%s\\n' \"$value\"",
+                    ShellFamily::PowerShell => {
+                        "$value = [Console]::ReadLine(); [Console]::WriteLine('accepted:' + $value)"
+                    }
+                };
+                channel.exec(true, command).await.unwrap();
+                assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+                match request {
+                    "pty" => channel
+                        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                        .await
+                        .unwrap(),
+                    "shell" => channel.request_shell(true).await.unwrap(),
+                    "exec" => channel.exec(true, "exit 99").await.unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(matches!(channel.wait().await, Some(ChannelMsg::Failure)));
+                channel.data(&b"still-connected\n"[..]).await.unwrap();
+                let (stdout, stderr, status) = collect_channel_output(&mut channel).await;
+                assert_eq!(status, 0, "pty={with_pty}, request={request}: {stderr}");
+                assert!(
+                    stdout.contains("accepted:still-connected"),
+                    "pty={with_pty}, request={request}: {stdout:?}"
+                );
+                close_completed_session_channel(&mut channel).await;
+            }
+        }
+
+        for with_pty in [false, true] {
+            let mut channel = session.channel_open_session().await.unwrap();
+            channel
+                .set_env(true, "SSHPORTAL_TEST_MARKER", "pending-channel-preserved")
+                .await
+                .unwrap();
+            assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+            if with_pty {
+                channel
+                    .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                    .await
+                    .unwrap();
+                assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+                channel
+                    .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                    .await
+                    .unwrap();
+            } else {
+                channel.request_shell(true).await.unwrap();
+            }
+            assert!(matches!(channel.wait().await, Some(ChannelMsg::Failure)));
+            let command = match shell.family() {
+                ShellFamily::Posix => "printf '%s\\n' \"$SSHPORTAL_TEST_MARKER\"",
+                ShellFamily::PowerShell => "Write-Output $env:SSHPORTAL_TEST_MARKER",
+            };
+            let (stdout, stderr, status) = collect_exec_output(&mut channel, command).await;
+            assert_eq!(status, 0, "{stderr}");
+            assert!(stdout.contains("pending-channel-preserved"));
+            close_completed_session_channel(&mut channel).await;
+        }
+        session
+            .disconnect(Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("rejected SSH request damaged its existing channel");
 }
 
 #[tokio::test]
