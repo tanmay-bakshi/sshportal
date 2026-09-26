@@ -121,3 +121,51 @@ where
     drop(ssh_proxy_listener);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use russh::keys::PrivateKey;
+    use tempfile::tempdir;
+    use tokio::io::duplex;
+
+    use crate::platform::ShellLaunch;
+    use crate::shell::run_remote_shell_server;
+
+    use super::connect_authenticated_client_transport;
+
+    #[tokio::test]
+    async fn rsa_operator_keys_authenticate_over_the_production_ssh_transport() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let key = Arc::new(
+                PrivateKey::from_openssh(include_str!("../../tests/fixtures/rsa_operator_key"))
+                    .unwrap(),
+            );
+            assert!(matches!(
+                key.algorithm(),
+                russh::keys::ssh_key::Algorithm::Rsa { .. }
+            ));
+            let working_directory = tempdir().unwrap();
+            let (client, server) = duplex(64 * 1024);
+            let server_task = tokio::spawn(run_remote_shell_server(
+                server,
+                "support-user".to_string(),
+                key.public_key().clone(),
+                working_directory.path().to_path_buf(),
+                ShellLaunch::detect_for_current_platform().unwrap(),
+            ));
+            let session = connect_authenticated_client_transport(client, "support-user", key)
+                .await
+                .unwrap();
+            session
+                .disconnect(russh::Disconnect::ByApplication, "test complete", "en-US")
+                .await
+                .unwrap();
+            server_task.await.unwrap().unwrap();
+        })
+        .await
+        .expect("RSA authentication did not complete");
+    }
+}
