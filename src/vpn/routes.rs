@@ -1920,44 +1920,44 @@ fn linux_routes_for_exact_prefix<E: CommandExecutor>(
     prefix: IpNet,
     table: u32,
 ) -> Result<Vec<LinuxRouteRecord>> {
-    let output = executor.execute(&CommandSpec::new(
-        "ip",
-        [
-            "-j".to_string(),
-            "-details".to_string(),
-            "-N".to_string(),
-            ip_family_flag(prefix).to_string(),
-            "route".to_string(),
-            "show".to_string(),
-            "table".to_string(),
-            table.to_string(),
-            "exact".to_string(),
-            prefix.to_string(),
-        ],
-    ))?;
-    if output.exit_code != Some(0) {
-        return Ok(Vec::new());
-    }
-    parse_linux_route_records(&output.stdout, prefix.addr().is_ipv6(), Some(table))
+    // A dump of one nonexistent table fails like an inspection error. Querying
+    // all tables keeps absence a successful empty result without hiding failures.
+    let output = run_required(
+        executor,
+        &CommandSpec::new(
+            "ip",
+            [
+                "-j".to_string(),
+                "-details".to_string(),
+                "-N".to_string(),
+                ip_family_flag(prefix).to_string(),
+                "route".to_string(),
+                "show".to_string(),
+                "table".to_string(),
+                "all".to_string(),
+                "exact".to_string(),
+                prefix.to_string(),
+            ],
+        ),
+    )?;
+    Ok(parse_linux_route_records(&output, prefix.addr().is_ipv6())?
+        .into_iter()
+        .filter(|record| record.table == table && record.prefix == prefix)
+        .collect())
 }
 
-fn parse_linux_route_records(
-    output: &str,
-    ipv6: bool,
-    default_table: Option<u32>,
-) -> Result<Vec<LinuxRouteRecord>> {
+fn parse_linux_route_records(output: &str, ipv6: bool) -> Result<Vec<LinuxRouteRecord>> {
     let values = serde_json::from_str::<Vec<serde_json::Value>>(output.trim())
         .context("failed to decode Linux route inventory")?;
     values
         .into_iter()
-        .map(|value| parse_linux_route_record(value, ipv6, default_table))
+        .map(|value| parse_linux_route_record(value, ipv6))
         .collect()
 }
 
 fn parse_linux_route_record(
     mut identity: serde_json::Value,
     ipv6: bool,
-    default_table: Option<u32>,
 ) -> Result<LinuxRouteRecord> {
     let object = identity
         .as_object_mut()
@@ -1967,7 +1967,7 @@ fn parse_linux_route_record(
         .with_context(|| format!("Linux returned invalid route destination `{destination}`"))?;
     let table = match object.get("table") {
         Some(value) => json_u32(value, "route table")?,
-        None => default_table.unwrap_or(LINUX_MAIN_ROUTE_TABLE),
+        None => LINUX_MAIN_ROUTE_TABLE,
     };
     object.insert(
         "table".to_string(),
@@ -2335,11 +2335,11 @@ fn lookup_linux_peer_path<E: CommandExecutor>(
     }
 
     let parent = exactly_one_linux_route(
-        parse_linux_route_records(&parent_output, transport.peer.is_ipv6(), None)?,
+        parse_linux_route_records(&parent_output, transport.peer.is_ipv6())?,
         "matched parent route",
     )?;
     let resolved = exactly_one_linux_route(
-        parse_linux_route_records(&resolved_output, transport.peer.is_ipv6(), None)?,
+        parse_linux_route_records(&resolved_output, transport.peer.is_ipv6())?,
         "resolved WebSocket route",
     )?;
     validate_linux_parent_route(&parent, &resolved, transport)?;
@@ -2646,8 +2646,8 @@ fn inventory_linux_route_records<E: CommandExecutor>(
             ],
         ),
     )?;
-    let mut records = parse_linux_route_records(&ipv4, false, None)?;
-    records.extend(parse_linux_route_records(&ipv6, true, None)?);
+    let mut records = parse_linux_route_records(&ipv4, false)?;
+    records.extend(parse_linux_route_records(&ipv6, true)?);
     Ok(records)
 }
 
@@ -3825,7 +3825,7 @@ mod tests {
 
     fn linux_route_fixture(json: &str) -> LinuxRouteRecord {
         exactly_one_linux_route(
-            parse_linux_route_records(json, false, None).unwrap(),
+            parse_linux_route_records(json, false).unwrap(),
             "test route",
         )
         .unwrap()
@@ -4703,7 +4703,6 @@ mod tests {
             parse_linux_route_records(
                 r#"[{"type":"1","dst":"2001:db8:2::/64","from":"2001:db8:1::/64","gateway":"2001:db8:ffff::1","dev":"ethernet0","table":"100","protocol":"3","scope":"0","prefsrc":"2001:db8:1::99","flags":[]}]"#,
                 true,
-                None,
             )
             .unwrap(),
             "source-specific IPv6 parent route",
@@ -4713,7 +4712,6 @@ mod tests {
             parse_linux_route_records(
                 r#"[{"type":"1","dst":"2001:db8:2::8","from":"2001:db8:1::22","gateway":"2001:db8:ffff::1","dev":"ethernet0","table":"100","flags":[],"uid":0,"cache":[]}]"#,
                 true,
-                None,
             )
             .unwrap(),
             "resolved source-specific IPv6 route",
@@ -4775,12 +4773,12 @@ mod tests {
             r#"[{"type":"1","dst":"default","gateway":"192.0.2.1","dev":"ethernet0","table":"100","protocol":"3","scope":"0","flags":[]}]"#,
         );
         let unchanged = MockExecutor::with_outputs([Ok(CommandOutput::success(
-            r#"[{"type":"1","dst":"default","gateway":"192.0.2.1","dev":"ethernet0","protocol":"3","scope":"0","flags":[]}]"#,
+            r#"[{"type":"1","dst":"default","gateway":"192.0.2.1","dev":"ethernet0","table":"100","protocol":"3","scope":"0","flags":[]}]"#,
         ))]);
         assert!(linux_parent_route_is_present(&unchanged, &parent).unwrap());
 
         let changed = MockExecutor::with_outputs([Ok(CommandOutput::success(
-            r#"[{"type":"1","dst":"default","gateway":"192.0.2.254","dev":"ethernet0","protocol":"3","scope":"0","flags":[]}]"#,
+            r#"[{"type":"1","dst":"default","gateway":"192.0.2.254","dev":"ethernet0","table":"100","protocol":"3","scope":"0","flags":[]}]"#,
         ))]);
         assert!(!linux_parent_route_is_present(&changed, &parent).unwrap());
     }
@@ -4795,7 +4793,6 @@ mod tests {
                 {"type":"1","dst":"default","gateway":"198.51.100.1","dev":"wifi0","table":"100","protocol":"3","scope":"0","metric":100,"flags":[]}
             ]"#,
             false,
-            None,
         )
         .unwrap();
         let owned = OwnedResource::Route {
@@ -5014,7 +5011,7 @@ mod tests {
         let executor = MockExecutor::with_outputs([
             Ok(CommandOutput::success("")),
             Ok(CommandOutput::success(
-                r#"[{"type":"1","dst":"203.0.113.8","gateway":"198.51.100.1","dev":"wifi0","protocol":"3","scope":"0","prefsrc":"198.51.100.2","metric":4,"flags":[]}]"#,
+                r#"[{"type":"1","dst":"203.0.113.8","gateway":"198.51.100.1","dev":"wifi0","table":"200","protocol":"3","scope":"0","prefsrc":"198.51.100.2","metric":4,"flags":[]}]"#,
             )),
             Ok(CommandOutput::success("")),
         ]);
@@ -5041,6 +5038,68 @@ mod tests {
         apply_resource(Platform::Linux, &executor, &resource, ApplyMode::Initial).unwrap();
 
         assert_eq!(executor.calls()[0].arguments[2], "add");
+    }
+
+    #[test]
+    fn failed_linux_route_inspection_does_not_attempt_a_mutation() {
+        let resource = OwnedResource::Route {
+            prefix: "10.20.0.0/16".parse().unwrap(),
+            target: linux_target("tun7", None),
+        };
+        for exit_code in [Some(2), None] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                exit_code,
+                stdout: "[]".to_string(),
+                stderr: "RTNETLINK answers: Operation not permitted".to_string(),
+            })]);
+
+            let result = ensure_resource_present(Platform::Linux, &executor, &resource);
+
+            assert!(result.is_err());
+            assert_eq!(executor.calls().len(), 1);
+        }
+    }
+
+    #[test]
+    fn exact_linux_route_inspection_preserves_table_identity() {
+        for (destination, ipv6) in [("203.0.113.0/24", false), ("2001:db8:123::/64", true)] {
+            let prefix = destination.parse().unwrap();
+            let records = serde_json::json!([
+                {"dst": destination, "dev": "lo", "table": "100", "metric": 4},
+                {"dst": destination, "dev": "lo", "table": "200", "metric": 9},
+                {"dst": destination, "dev": "lo", "table": "254", "metric": 12}
+            ])
+            .to_string();
+            for (table, expected_metric) in
+                [(100, Some(4)), (200, Some(9)), (254, Some(12)), (300, None)]
+            {
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(&records))]);
+
+                let found = linux_routes_for_exact_prefix(&executor, prefix, table).unwrap();
+
+                assert_eq!(found.len(), usize::from(expected_metric.is_some()));
+                assert!(
+                    found
+                        .iter()
+                        .all(|record| record.table == table && record.prefix == prefix)
+                );
+                assert_eq!(found.first().map(|record| record.metric), expected_metric);
+                assert_eq!(
+                    executor.calls()[0].arguments[3],
+                    if ipv6 { "-6" } else { "-4" }
+                );
+                assert_eq!(
+                    &executor.calls()[0].arguments[6..],
+                    ["table", "all", "exact", destination]
+                );
+            }
+            let empty = MockExecutor::with_outputs([Ok(CommandOutput::success("[]"))]);
+            assert!(
+                linux_routes_for_exact_prefix(&empty, prefix, 300)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
