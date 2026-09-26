@@ -21,6 +21,7 @@ import termios
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -222,19 +223,26 @@ def spawn_pty_process(label: str, command: list[str]) -> SpawnedProcess:
     :returns: Running process descriptor.
     """
 
-    master_fd, slave_fd = pty.openpty()
-    set_pty_window_size(slave_fd, DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
-    process = subprocess.Popen(
-        command,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        text=False,
-        cwd=PROJECT_ROOT,
-        start_new_session=True,
-    )
-    os.close(slave_fd)
-    return SpawnedProcess(label=label, process=process, master_fd=master_fd, transcript="")
+    with ExitStack() as cleanup:
+        master_fd, slave_fd = pty.openpty()
+        cleanup.callback(os.close, master_fd)
+        try:
+            set_pty_window_size(slave_fd, DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
+            process = subprocess.Popen(
+                command,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=False,
+                cwd=PROJECT_ROOT,
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave_fd)
+        spawned = SpawnedProcess(label=label, process=process, master_fd=master_fd, transcript="")
+        # The returned descriptor owns the master after successful startup.
+        cleanup.pop_all()
+        return spawned
 
 
 def set_pty_window_size(fd: int, rows: int, cols: int) -> None:

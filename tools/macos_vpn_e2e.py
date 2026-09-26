@@ -24,6 +24,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -600,20 +601,25 @@ def spawn_process(
     :returns: Spawned process descriptor.
     """
 
-    master_fd, slave_fd = pty.openpty()
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=PROJECT_ROOT,
-            env=env,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            start_new_session=True,
-        )
-    finally:
-        os.close(slave_fd)
-    return SpawnedProcess(label, process, master_fd, "")
+    with ExitStack() as cleanup:
+        master_fd, slave_fd = pty.openpty()
+        cleanup.callback(os.close, master_fd)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=PROJECT_ROOT,
+                env=env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave_fd)
+        spawned = SpawnedProcess(label, process, master_fd, "")
+        # The returned descriptor owns the master after successful startup.
+        cleanup.pop_all()
+        return spawned
 
 
 def choose_loopback_port() -> int:
