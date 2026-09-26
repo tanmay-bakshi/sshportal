@@ -616,25 +616,13 @@ impl PacketEngine {
         now: Duration,
         transport: &mut T,
     ) -> Result<(), PacketEngineError<T::Error>> {
-        let mut ingress_budget = self.limits.max_ingress_packets;
-        while ingress_budget > 0 && self.device.has_ingress() {
-            let Some(packet) = self.take_one_ingress() else {
+        for _ in 0..self.limits.max_ingress_packets {
+            let Some(packet) = self.device.pop_ingress() else {
                 break;
             };
             self.handle_raw_packet(now, packet, transport)?;
-            ingress_budget -= 1;
         }
         Ok(())
-    }
-
-    fn take_one_ingress(&mut self) -> Option<Bytes> {
-        let mut capture = IngressCapture::default();
-        let timestamp = Instant::ZERO;
-        let (rx, _tx) = smoltcp::phy::Device::receive(&mut self.device, timestamp)?;
-        smoltcp::phy::RxToken::consume(rx, |packet| {
-            capture.packet = Some(Bytes::copy_from_slice(packet));
-        });
-        capture.packet
     }
 
     fn advance_tcp_handshakes(&mut self, now: Duration) {
@@ -1533,11 +1521,6 @@ impl PacketEngine {
         self.pending_udp_bytes -= flow.pending_bytes;
         self.udp_by_tuple.remove(&flow.tuple);
     }
-}
-
-#[derive(Default)]
-struct IngressCapture {
-    packet: Option<Bytes>,
 }
 
 fn to_smoltcp_time(duration: Duration) -> Instant {

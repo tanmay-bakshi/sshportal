@@ -68,10 +68,6 @@ impl PacketQueue {
         self.bytes -= packet.len();
         Some(packet)
     }
-
-    fn is_empty(&self) -> bool {
-        self.packets.is_empty()
-    }
 }
 
 /// A deterministic, byte-bounded smoltcp device.
@@ -155,8 +151,13 @@ impl QueueDevice {
         self.egress.pop()
     }
 
-    pub(super) fn has_ingress(&self) -> bool {
-        !self.ingress.is_empty()
+    pub(super) fn pop_ingress(&mut self) -> Option<Bytes> {
+        // Receiving can produce an immediate response. Engine inspection and
+        // smoltcp share the same requirement for one MTU-sized egress slot.
+        if !self.egress.can_push(1, self.mtu) {
+            return None;
+        }
+        self.ingress.pop()
     }
 }
 
@@ -209,10 +210,7 @@ impl Device for QueueDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if !self.egress.can_push(1, self.mtu) {
-            return None;
-        }
-        let packet = self.ingress.pop()?;
+        let packet = self.pop_ingress()?;
         Some((
             QueueRxToken { packet },
             QueueTxToken {
@@ -244,7 +242,7 @@ impl Device for QueueDevice {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use smoltcp::phy::{Device, TxToken};
+    use smoltcp::phy::{Device, RxToken, TxToken};
     use smoltcp::time::Instant;
 
     use super::{QueueDevice, QueueError};
@@ -267,6 +265,46 @@ mod tests {
         let token = device.transmit(Instant::ZERO).unwrap();
         token.consume(16, |packet| packet.copy_from_slice(&[7_u8; 16]));
         assert_eq!(device.pop_egress().unwrap(), Bytes::from(vec![7_u8; 16]));
+    }
+
+    #[test]
+    fn owned_ingress_and_smoltcp_share_backpressure_and_accounting() {
+        for (egress_packets, egress_bytes) in [(1, 16), (2, 8)] {
+            let mut device = QueueDevice::new(8, 3, 8, egress_packets, egress_bytes, 8);
+            let first = Bytes::from(vec![1_u8; 4]);
+            let first_pointer = first.as_ptr();
+            device.push_ingress(first).unwrap();
+            device.push_ingress(Bytes::from_static(b"next")).unwrap();
+            device
+                .push_egress_batch(vec![Bytes::from_static(b"x")])
+                .unwrap();
+
+            assert!(device.pop_ingress().is_none());
+            assert!(device.receive(Instant::ZERO).is_none());
+            assert_eq!(
+                device.push_ingress(Bytes::from_static(b"!")),
+                Err((QueueError::Full, Bytes::from_static(b"!")))
+            );
+
+            assert_eq!(device.pop_egress().unwrap(), b"x".as_slice());
+            let packet = device.pop_ingress().unwrap();
+            assert_eq!(packet.as_ptr(), first_pointer);
+            assert_eq!(packet, [1_u8; 4].as_slice());
+            device.push_ingress(Bytes::from_static(b"last")).unwrap();
+
+            let (received, _) = device.receive(Instant::ZERO).unwrap();
+            received.consume(|packet| assert_eq!(packet, b"next"));
+            device
+                .push_ingress_front(Bytes::from_static(b"head"))
+                .unwrap();
+            assert_eq!(device.pop_ingress().unwrap(), b"head".as_slice());
+            let (received, _) = device.receive(Instant::ZERO).unwrap();
+            received.consume(|packet| assert_eq!(packet, b"last"));
+            assert!(device.pop_ingress().is_none());
+            device
+                .push_ingress(Bytes::from_static(b"12345678"))
+                .unwrap();
+        }
     }
 
     #[test]
