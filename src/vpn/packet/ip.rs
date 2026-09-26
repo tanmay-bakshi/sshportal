@@ -216,6 +216,7 @@ fn parse_ipv6(packet: Bytes) -> Result<ParsedIpPacket, ParseError> {
     if total_bytes > packet.len() {
         return Err(ParseError::Malformed);
     }
+    let packet = &packet[..total_bytes];
     let source =
         Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).map_err(|_| ParseError::Malformed)?);
     let target =
@@ -838,6 +839,28 @@ mod tests {
         assert_eq!(header.len(), 40);
         assert!(!points_into(&fragment.data, &packet));
         assert!(!points_into(&header, &packet));
+    }
+
+    #[test]
+    fn ipv6_fragment_header_must_fit_the_declared_payload() {
+        for payload_len in 1_u16..8 {
+            for buffer_len in [40 + usize::from(payload_len), 48, 4096] {
+                let mut packet = BytesMut::zeroed(buffer_len);
+                packet[0] = 0x60;
+                packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+                packet[6] = super::IP_PROTOCOL_FRAGMENT;
+                packet[7] = 64;
+                packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+                packet[24..40]
+                    .copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+                packet[40] = super::IP_PROTOCOL_UDP;
+
+                assert!(
+                    matches!(parse_ip_packet(packet.freeze()), Err(ParseError::Malformed)),
+                    "payload length {payload_len}, backing buffer length {buffer_len}"
+                );
+            }
+        }
     }
 
     #[test]
