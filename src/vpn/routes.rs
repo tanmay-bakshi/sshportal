@@ -434,11 +434,11 @@ impl<E: CommandExecutor> HostNetworkGuard<E> {
             && bypass.owned
             && let Some(resource) = &bypass.resource
         {
-            apply_resource(self.platform, &self.executor, resource, ApplyMode::Initial)?;
+            apply_resource(self.platform, &self.executor, resource)?;
         }
         for resource in &self.static_resources {
             if self.resources.contains(resource) {
-                apply_resource(self.platform, &self.executor, resource, ApplyMode::Initial)?;
+                apply_resource(self.platform, &self.executor, resource)?;
             }
         }
         if self.platform == Platform::Linux {
@@ -513,12 +513,7 @@ impl<E: CommandExecutor> HostNetworkGuard<E> {
             let owned = !resource_is_present(self.platform, &self.executor, replacement_resource)?;
             if owned {
                 self.arm_additional_resource(replacement_resource.clone())?;
-                apply_resource(
-                    self.platform,
-                    &self.executor,
-                    replacement_resource,
-                    ApplyMode::Initial,
-                )?;
+                apply_resource(self.platform, &self.executor, replacement_resource)?;
             }
             self.bypass = Some(BypassState {
                 resource: replacement,
@@ -642,7 +637,7 @@ impl<E: CommandExecutor> HostNetworkGuard<E> {
                     resource,
                 )?;
             } else {
-                apply_resource(self.platform, &self.executor, resource, ApplyMode::Initial)?;
+                apply_resource(self.platform, &self.executor, resource)?;
             }
             ensure_resource_present(self.platform, &self.executor, resource)?;
         }
@@ -703,12 +698,7 @@ impl<E: CommandExecutor> HostNetworkGuard<E> {
         let owned = !resource_is_present(self.platform, &self.executor, resource_ref)?;
         if owned {
             self.arm_additional_resource(resource_ref.clone())?;
-            apply_resource(
-                self.platform,
-                &self.executor,
-                resource_ref,
-                ApplyMode::Initial,
-            )?;
+            apply_resource(self.platform, &self.executor, resource_ref)?;
         }
         Ok(BypassState {
             resource,
@@ -728,7 +718,7 @@ impl<E: CommandExecutor> HostNetworkGuard<E> {
             return Ok(());
         }
         self.arm_additional_resource(resource.clone())?;
-        apply_resource(self.platform, &self.executor, &resource, ApplyMode::Initial)
+        apply_resource(self.platform, &self.executor, &resource)
     }
 
     fn arm_additional_resource(&mut self, resource: OwnedResource) -> Result<()> {
@@ -970,25 +960,21 @@ fn apply_resource<E: CommandExecutor>(
     platform: Platform,
     executor: &E,
     resource: &OwnedResource,
-    mode: ApplyMode,
 ) -> Result<()> {
     validate_resource(platform, resource)?;
     match resource {
-        OwnedResource::Route { prefix, target } => apply_route(executor, *prefix, target, mode),
+        OwnedResource::Route { prefix, target } => {
+            apply_route(executor, *prefix, target, ApplyMode::Initial)
+        }
         OwnedResource::LinuxIpv6Address {
             interface,
             address,
             gateway,
             prefix_len,
         } => {
-            let verb = if mode == ApplyMode::Initial {
-                "add"
-            } else {
-                "replace"
-            };
             run_required(
                 executor,
-                &linux_ipv6_address_command(verb, interface, *address, *gateway, *prefix_len),
+                &linux_ipv6_address_command("add", interface, *address, *gateway, *prefix_len),
             )?;
             Ok(())
         }
@@ -998,12 +984,6 @@ fn apply_resource<E: CommandExecutor>(
             gateway,
             prefix_len,
         } => {
-            if mode == ApplyMode::Reconcile {
-                let output = run_required(executor, &CommandSpec::new("ifconfig", [interface]))?;
-                if output.contains(&address.to_string()) {
-                    return Ok(());
-                }
-            }
             run_required(
                 executor,
                 &CommandSpec::new(
@@ -1068,6 +1048,84 @@ fn linux_ipv6_address_command(
     )
 }
 
+#[derive(Deserialize)]
+struct Ipv6AddressRecord {
+    local: Ipv6Addr,
+    #[serde(rename = "address")]
+    peer: Option<Ipv6Addr>,
+    #[serde(rename = "prefixlen")]
+    prefix_len: u8,
+}
+
+#[derive(Deserialize)]
+struct LinuxInterfaceAddresses {
+    addr_info: Vec<Ipv6AddressRecord>,
+}
+
+fn ipv6_address_is_present(
+    records: impl IntoIterator<Item = Ipv6AddressRecord>,
+    address: Ipv6Addr,
+    gateway: Ipv6Addr,
+    prefix_len: u8,
+) -> Result<bool> {
+    let mut present = false;
+    for record in records {
+        if record.local != address {
+            continue;
+        }
+        if record.peer != Some(gateway) || record.prefix_len != prefix_len {
+            bail!("IPv6 address {address} already exists with a different peer or prefix length");
+        }
+        present = true;
+    }
+    Ok(present)
+}
+
+fn parse_macos_ipv6_addresses(output: &str) -> Result<Vec<Ipv6AddressRecord>> {
+    let mut records = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("inet6") {
+            continue;
+        }
+        let local = parse_macos_ipv6_address(fields.next())?;
+        let mut field = fields.next();
+        let peer = if field == Some("-->") {
+            let peer = parse_macos_ipv6_address(fields.next())?;
+            field = fields.next();
+            Some(peer)
+        } else {
+            None
+        };
+        if field != Some("prefixlen") {
+            bail!("macOS IPv6 address record omitted its prefix length");
+        }
+        let prefix_len = fields
+            .next()
+            .context("macOS IPv6 address record omitted its prefix length")?
+            .parse::<u8>()
+            .context("macOS IPv6 address record contains an invalid prefix length")?;
+        if prefix_len > 128 {
+            bail!("macOS IPv6 address record contains an invalid prefix length");
+        }
+        records.push(Ipv6AddressRecord {
+            local,
+            peer,
+            prefix_len,
+        });
+    }
+    Ok(records)
+}
+
+fn parse_macos_ipv6_address(value: Option<&str>) -> Result<Ipv6Addr> {
+    let value = value.context("macOS IPv6 address record omitted an address")?;
+    value
+        .split_once('%')
+        .map_or(value, |(address, _scope)| address)
+        .parse()
+        .context("macOS IPv6 address record contains an invalid address")
+}
+
 fn resource_is_present<E: CommandExecutor>(
     platform: Platform,
     executor: &E,
@@ -1077,19 +1135,42 @@ fn resource_is_present<E: CommandExecutor>(
     match resource {
         OwnedResource::Route { prefix, target } => route_is_present(executor, *prefix, target),
         OwnedResource::LinuxIpv6Address {
-            interface, address, ..
+            interface,
+            address,
+            gateway,
+            prefix_len,
         } => {
-            let output = executor.execute(&CommandSpec::new(
-                "ip",
-                ["-6", "address", "show", "dev", interface],
-            ))?;
-            Ok(output.exit_code == Some(0) && output.stdout.contains(&address.to_string()))
+            let output = run_required(
+                executor,
+                &CommandSpec::new("ip", ["-j", "-6", "address", "show", "dev", interface]),
+            )?;
+            let interfaces: Vec<LinuxInterfaceAddresses> = serde_json::from_str(&output)
+                .context("failed to decode Linux IPv6 address inventory")?;
+            ipv6_address_is_present(
+                interfaces
+                    .into_iter()
+                    .flat_map(|interface| interface.addr_info),
+                *address,
+                *gateway,
+                *prefix_len,
+            )
         }
         OwnedResource::MacosIpv6Address {
-            interface, address, ..
+            interface,
+            address,
+            gateway,
+            prefix_len,
         } => {
-            let output = executor.execute(&CommandSpec::new("ifconfig", [interface]))?;
-            Ok(output.exit_code == Some(0) && output.stdout.contains(&address.to_string()))
+            let output = run_required(
+                executor,
+                &CommandSpec::new("ifconfig", ["-f", "inet6:default,addr:default", interface]),
+            )?;
+            ipv6_address_is_present(
+                parse_macos_ipv6_addresses(&output)?,
+                *address,
+                *gateway,
+                *prefix_len,
+            )
         }
         OwnedResource::WindowsIpv6Address {
             interface_index,
@@ -1120,7 +1201,7 @@ fn ensure_resource_present<E: CommandExecutor>(
     if resource_is_present(platform, executor, resource)? {
         return Ok(());
     }
-    apply_resource(platform, executor, resource, ApplyMode::Initial)
+    apply_resource(platform, executor, resource)
 }
 
 fn route_is_present<E: CommandExecutor>(
@@ -1330,7 +1411,7 @@ fn replace_bypass_resource<E: CommandExecutor>(
             Ok(())
         }
         (Platform::Windows, _, _) => {
-            apply_resource(platform, executor, new, ApplyMode::Initial)?;
+            apply_resource(platform, executor, new)?;
             cleanup_resource(platform, executor, old)
         }
         _ => bail!("invalid bypass-route replacement for {platform:?}"),
@@ -5040,7 +5121,7 @@ mod tests {
         };
         let executor = MockExecutor::default();
 
-        apply_resource(Platform::Linux, &executor, &resource, ApplyMode::Initial).unwrap();
+        apply_resource(Platform::Linux, &executor, &resource).unwrap();
 
         assert_eq!(executor.calls()[0].arguments[2], "add");
     }
@@ -5138,13 +5219,9 @@ mod tests {
             prefix_len: 126,
         };
 
-        apply_resource(
-            Platform::Linux,
-            &SystemCommandExecutor,
-            &resource,
-            ApplyMode::Initial,
-        )
-        .unwrap();
+        assert!(!resource_is_present(Platform::Linux, &SystemCommandExecutor, &resource).unwrap());
+        apply_resource(Platform::Linux, &SystemCommandExecutor, &resource).unwrap();
+        assert!(resource_is_present(Platform::Linux, &SystemCommandExecutor, &resource).unwrap());
         let inspect = CommandSpec::new("ip", ["-j", "-6", "address", "show", "dev", &interface.0]);
         let output = run_required(&SystemCommandExecutor, &inspect).unwrap();
         let inventory: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -5168,6 +5245,169 @@ mod tests {
                 .all(|entry| entry["local"] != "fd00::2")
         );
         cleanup_resource(Platform::Linux, &SystemCommandExecutor, &resource).unwrap();
+        assert!(!resource_is_present(Platform::Linux, &SystemCommandExecutor, &resource).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires root; creates a temporary utun interface"]
+    fn macos_ipv6_address_lifecycle_matches_the_kernel() {
+        let network = VpnNetworkConfiguration::select(
+            &inventory_routes(Platform::Macos, &SystemCommandExecutor).unwrap(),
+            rand::random(),
+            false,
+        )
+        .unwrap();
+        let device = tun::create(&tun::Configuration::default()).unwrap();
+        let resource = OwnedResource::MacosIpv6Address {
+            interface: tun::AbstractDevice::tun_name(&device).unwrap(),
+            address: network.interface_ipv6,
+            gateway: network.gateway_ipv6,
+            prefix_len: MACOS_POINT_TO_POINT_IPV6_PREFIX,
+        };
+
+        assert!(!resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
+        apply_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
+        assert!(resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
+        cleanup_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
+        assert!(!resource_is_present(Platform::Macos, &SystemCommandExecutor, &resource).unwrap());
+        cleanup_resource(Platform::Macos, &SystemCommandExecutor, &resource).unwrap();
+    }
+
+    fn unix_ipv6_address_resource(platform: Platform, interface: &str) -> OwnedResource {
+        match platform {
+            Platform::Linux => OwnedResource::LinuxIpv6Address {
+                interface: interface.to_string(),
+                address: "fd00::2".parse().unwrap(),
+                gateway: "fd00::1".parse().unwrap(),
+                prefix_len: 126,
+            },
+            Platform::Macos => OwnedResource::MacosIpv6Address {
+                interface: interface.to_string(),
+                address: "fd00::2".parse().unwrap(),
+                gateway: "fd00::1".parse().unwrap(),
+                prefix_len: 128,
+            },
+            Platform::Windows => panic!("expected a Unix address resource"),
+        }
+    }
+
+    #[test]
+    fn ipv6_address_inspection_compares_local_address_values() {
+        for (platform, output, expected) in [
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"fd00::20","address":"fd00::2","prefixlen":126}]}]"#,
+                false,
+            ),
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"FD00:0:0:0:0:0:0:2","address":"fd00::1","prefixlen":126}]}]"#,
+                true,
+            ),
+            (Platform::Linux, "[]", false),
+            (
+                Platform::Macos,
+                "utun42: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500\n\tinet6 fd00::20 --> fd00::2 prefixlen 128\n",
+                false,
+            ),
+            (
+                Platform::Macos,
+                "utun42: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500\n\tinet6 fe80::1%utun42 prefixlen 64 scopeid 0x2\n\tinet6 FD00:0:0:0:0:0:0:2 --> fd00::1 prefixlen 128\n",
+                true,
+            ),
+            (
+                Platform::Macos,
+                "utun42: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500\n",
+                false,
+            ),
+        ] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(output))]);
+            let resource = unix_ipv6_address_resource(platform, "utun42");
+            assert_eq!(
+                resource_is_present(platform, &executor, &resource).unwrap(),
+                expected,
+                "{platform:?}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_ipv6_address_identity_prevents_mutation() {
+        for (platform, output) in [
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"fd00::2","address":"fd00::3","prefixlen":126}]}]"#,
+            ),
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"fd00::2","address":"fd00::1","prefixlen":128}]}]"#,
+            ),
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"fd00::2","prefixlen":126}]}]"#,
+            ),
+            (
+                Platform::Macos,
+                "\tinet6 fd00::2 --> fd00::3 prefixlen 128\n",
+            ),
+            (
+                Platform::Macos,
+                "\tinet6 fd00::2 --> fd00::1 prefixlen 64\n",
+            ),
+            (Platform::Macos, "\tinet6 fd00::2 prefixlen 128\n"),
+        ] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(output))]);
+            let resource = unix_ipv6_address_resource(platform, "utun42");
+            assert!(
+                ensure_resource_present(platform, &executor, &resource).is_err(),
+                "{platform:?}: {output}"
+            );
+            assert_eq!(executor.calls().len(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_ipv6_address_inspection_prevents_mutation() {
+        for platform in [Platform::Linux, Platform::Macos] {
+            for exit_code in [Some(1), None] {
+                let executor = MockExecutor::with_outputs([Ok(CommandOutput {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: "inspection failed".to_string(),
+                })]);
+                let resource = unix_ipv6_address_resource(platform, "utun42");
+                assert!(ensure_resource_present(platform, &executor, &resource).is_err());
+                assert_eq!(executor.calls().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_ipv6_address_inspection_prevents_mutation() {
+        for (platform, output) in [
+            (Platform::Linux, ""),
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"not-an-address","prefixlen":126}]}]"#,
+            ),
+            (
+                Platform::Linux,
+                r#"[{"addr_info":[{"local":"fd00::2","address":"fd00::1"}]}]"#,
+            ),
+            (Platform::Macos, "inet6 not-an-address prefixlen 128"),
+            (Platform::Macos, "inet6 fd00::2 --> prefixlen 128"),
+            (Platform::Macos, "inet6 fd00::2 --> fd00::1"),
+            (Platform::Macos, "inet6 fd00::2 --> fd00::1 prefixlen 129"),
+        ] {
+            let executor = MockExecutor::with_outputs([Ok(CommandOutput::success(output))]);
+            let resource = unix_ipv6_address_resource(platform, "utun42");
+            assert!(
+                ensure_resource_present(platform, &executor, &resource).is_err(),
+                "{platform:?}: {output}"
+            );
+            assert_eq!(executor.calls().len(), 1);
+        }
     }
 
     #[test]
@@ -5182,7 +5422,7 @@ mod tests {
         let executor = MockExecutor::default();
 
         for resource in &resources {
-            apply_resource(Platform::Linux, &executor, resource, ApplyMode::Initial).unwrap();
+            apply_resource(Platform::Linux, &executor, resource).unwrap();
         }
         apply_dns_commands(
             Platform::Linux,
@@ -5228,7 +5468,7 @@ mod tests {
         let executor = MockExecutor::default();
 
         for resource in &resources {
-            apply_resource(Platform::Macos, &executor, resource, ApplyMode::Initial).unwrap();
+            apply_resource(Platform::Macos, &executor, resource).unwrap();
         }
 
         let displays = executor
@@ -5339,7 +5579,7 @@ mod tests {
         let executor = MockExecutor::default();
 
         for resource in &resources {
-            apply_resource(Platform::Windows, &executor, resource, ApplyMode::Initial).unwrap();
+            apply_resource(Platform::Windows, &executor, resource).unwrap();
         }
 
         let displays = executor
