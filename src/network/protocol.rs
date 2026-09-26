@@ -527,28 +527,36 @@ pub(crate) enum UdpCapsule {
 }
 
 pub(crate) fn encode_udp_capsule(capsule: &UdpCapsule) -> Result<Bytes> {
-    let (capsule_type, body) = match capsule {
+    let encoded = match capsule {
         UdpCapsule::Datagram(data) => {
             if data.len() > MAX_NETWORK_UDP_DATAGRAM_BYTES {
                 bail!("UDP datagram exceeds {MAX_NETWORK_UDP_DATAGRAM_BYTES} bytes");
             }
-            let mut body = Vec::with_capacity(1 + data.len());
-            encode_quic_varint(0, &mut body)?;
-            body.extend_from_slice(data);
-            (UDP_DATAGRAM_CAPSULE, body)
+            let mut encoded = encode_udp_capsule_header(UDP_DATAGRAM_CAPSULE, 1 + data.len())?;
+            encode_quic_varint(0, &mut encoded)?;
+            encoded.extend_from_slice(data);
+            encoded
         }
         UdpCapsule::Error(error) => {
-            let mut body = Vec::new();
-            encode_error(error, &mut body)?;
-            (UDP_ERROR_CAPSULE, body)
+            let message = truncate_utf8(&error.message, MAX_ERROR_MESSAGE_BYTES);
+            let message_len =
+                u16::try_from(message.len()).context("network error message is too long")?;
+            let mut encoded = encode_udp_capsule_header(UDP_ERROR_CAPSULE, 3 + message.len())?;
+            encoded.push(error.kind as u8);
+            encoded.put_u16(message_len);
+            encoded.extend_from_slice(message.as_bytes());
+            encoded
         }
         UdpCapsule::Ignored => bail!("an ignored UDP capsule cannot be encoded"),
     };
-    let mut encoded = Vec::with_capacity(16 + body.len());
-    encode_quic_varint(capsule_type, &mut encoded)?;
-    encode_quic_varint(body.len() as u64, &mut encoded)?;
-    encoded.extend_from_slice(&body);
     Ok(Bytes::from(encoded))
+}
+
+fn encode_udp_capsule_header(capsule_type: u64, body_len: usize) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(16 + body_len);
+    encode_quic_varint(capsule_type, &mut encoded)?;
+    encode_quic_varint(body_len as u64, &mut encoded)?;
+    Ok(encoded)
 }
 
 pub(crate) struct UdpCapsuleDecoder {
@@ -653,15 +661,6 @@ fn decode_quic_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>> {
     Ok(Some((value, length)))
 }
 
-fn encode_error(error: &NetworkError, output: &mut Vec<u8>) -> Result<()> {
-    output.push(error.kind as u8);
-    let message = truncate_utf8(&error.message, MAX_ERROR_MESSAGE_BYTES);
-    let message_len = u16::try_from(message.len()).context("network error message is too long")?;
-    output.put_u16(message_len);
-    output.extend_from_slice(message.as_bytes());
-    Ok(())
-}
-
 fn decode_error(bytes: &[u8]) -> Result<NetworkError> {
     if bytes.len() < 3 {
         bail!("network error is truncated");
@@ -683,15 +682,15 @@ fn decode_error(bytes: &[u8]) -> Result<NetworkError> {
     Ok(error)
 }
 
-fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
-        return value.to_string();
+        return value;
     }
     let mut end = max_bytes;
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    value[..end].to_string()
+    &value[..end]
 }
 
 fn sanitize_error_message(value: &str) -> String {
@@ -716,7 +715,7 @@ fn sanitize_error_message(value: &str) -> String {
             }
         })
         .collect::<String>();
-    truncate_utf8(&sanitized, MAX_ERROR_MESSAGE_BYTES)
+    truncate_utf8(&sanitized, MAX_ERROR_MESSAGE_BYTES).to_owned()
 }
 
 fn sanitize_header_message(value: &str) -> String {
@@ -730,7 +729,7 @@ fn sanitize_header_message(value: &str) -> String {
             }
         })
         .collect::<String>();
-    truncate_utf8(&sanitized, MAX_ERROR_MESSAGE_BYTES)
+    truncate_utf8(&sanitized, MAX_ERROR_MESSAGE_BYTES).to_owned()
 }
 
 fn hex_digit(value: u8) -> Result<u8> {
@@ -952,6 +951,48 @@ mod tests {
             headers.insert(super::UDP_PEER_HEADER, HeaderValue::from_static(invalid));
             assert!(decode_udp_peer_header(&headers).is_err());
         }
+    }
+
+    #[test]
+    fn udp_capsule_encoding_preserves_wire_bytes_at_length_boundaries() {
+        for (length, header) in [
+            (0, vec![0x00, 0x01, 0x00]),
+            (62, vec![0x00, 0x3f, 0x00]),
+            (63, vec![0x00, 0x40, 0x40, 0x00]),
+            (16_382, vec![0x00, 0x7f, 0xff, 0x00]),
+            (16_383, vec![0x00, 0x80, 0x00, 0x40, 0x00, 0x00]),
+            (
+                crate::MAX_NETWORK_UDP_DATAGRAM_BYTES,
+                vec![0x00, 0x80, 0x00, 0xff, 0xe4, 0x00],
+            ),
+        ] {
+            let payload = Bytes::from(vec![0xa5; length]);
+            let encoded = encode_udp_capsule(&UdpCapsule::Datagram(payload.clone())).unwrap();
+            assert_eq!(&encoded[..header.len()], header);
+            assert_eq!(&encoded[header.len()..], payload);
+        }
+        let encoded = encode_udp_capsule(&UdpCapsule::Error(NetworkError::new(
+            NetworkErrorKind::ConnectionRefused,
+            "oops",
+        )))
+        .unwrap();
+        assert_eq!(&encoded[..], b"\x7f\x00\x07\x05\x00\x04oops");
+        let encoded = encode_udp_capsule(&UdpCapsule::Error(NetworkError {
+            kind: NetworkErrorKind::ConnectionRefused,
+            message: format!("{}🙂", "a".repeat(511)),
+        }))
+        .unwrap();
+        assert_eq!(&encoded[..7], b"\x7f\x00\x42\x02\x05\x01\xff");
+        assert_eq!(&encoded[7..], vec![b'a'; 511]);
+        assert!(
+            encode_udp_capsule(&UdpCapsule::Datagram(Bytes::from(vec![
+                0;
+                crate::MAX_NETWORK_UDP_DATAGRAM_BYTES
+                    + 1
+            ])))
+            .is_err()
+        );
+        assert!(encode_udp_capsule(&UdpCapsule::Ignored).is_err());
     }
 
     #[test]
