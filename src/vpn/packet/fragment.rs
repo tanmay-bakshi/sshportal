@@ -119,14 +119,18 @@ impl FragmentReassembler {
     }
 
     pub(super) fn expire(&mut self, now: Duration) {
-        let expired: Vec<_> = self
-            .assemblies
-            .iter()
-            .filter_map(|(key, assembly)| (assembly.expires_at <= now).then_some(key.clone()))
-            .collect();
-        for key in expired {
-            self.remove(&key);
-        }
+        self.assemblies.retain(|_, assembly| {
+            if assembly.expires_at > now {
+                return true;
+            }
+            if let AssemblyState::Collecting {
+                accounted_bytes, ..
+            } = &assembly.state
+            {
+                self.buffered_bytes -= *accounted_bytes;
+            }
+            false
+        });
     }
 
     pub(super) fn next_expiry(&self) -> Option<Duration> {
@@ -580,6 +584,64 @@ mod tests {
             reassembler.ingest(Duration::from_secs(31), next),
             ReassemblyResult::Pending
         ));
+    }
+
+    #[test]
+    fn expiry_preserves_live_bytes_and_rejected_identities_until_their_deadline() {
+        let mut configured = limits();
+        configured.max_datagrams = 3;
+        let mut reassembler = FragmentReassembler::new(configured);
+        let first = IpFragment {
+            key: key(1),
+            protocol: 17,
+            offset: 0,
+            more: true,
+            data: Bytes::from_static(b"abcdefgh"),
+            template: Some(FragmentTemplate::Ipv4(ipv4_header())),
+        };
+        for identification in 1..=3 {
+            let fragment = IpFragment {
+                key: key(identification),
+                ..first.clone()
+            };
+            let now = Duration::from_secs(u64::from(identification - 1));
+            assert!(matches!(
+                reassembler.ingest(now, fragment.clone()),
+                ReassemblyResult::Pending
+            ));
+            if identification == 2 {
+                assert!(matches!(
+                    reassembler.ingest(now, fragment),
+                    ReassemblyResult::Dropped(FragmentDropReason::Overlap)
+                ));
+            }
+        }
+        assert_eq!(reassembler.buffered_bytes(), 56);
+        reassembler.expire(Duration::from_secs(29));
+        assert_eq!(reassembler.buffered_bytes(), 56);
+        assert_eq!(reassembler.next_expiry(), Some(Duration::from_secs(30)));
+        reassembler.expire(Duration::from_secs(30));
+        assert_eq!(reassembler.buffered_bytes(), 28);
+        assert_eq!(reassembler.next_expiry(), Some(Duration::from_secs(31)));
+        assert!(matches!(
+            reassembler.ingest(
+                Duration::from_secs(30),
+                IpFragment {
+                    key: key(2),
+                    ..first
+                }
+            ),
+            ReassemblyResult::Pending
+        ));
+        assert_eq!(reassembler.buffered_bytes(), 28);
+        reassembler.expire(Duration::from_secs(31));
+        assert_eq!(reassembler.buffered_bytes(), 28);
+        assert_eq!(reassembler.next_expiry(), Some(Duration::from_secs(32)));
+        reassembler.expire(Duration::from_secs(32));
+        assert_eq!(reassembler.buffered_bytes(), 0);
+        assert_eq!(reassembler.next_expiry(), None);
+        reassembler.expire(Duration::from_secs(32));
+        assert_eq!(reassembler.buffered_bytes(), 0);
     }
 
     #[test]
