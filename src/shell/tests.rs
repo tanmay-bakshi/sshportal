@@ -630,6 +630,208 @@ async fn transfers_large_exec_output_through_bounded_channels() {
     server_task.await.unwrap().unwrap();
 }
 
+async fn assert_command_output_drained(with_pty: bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let temp_dir = tempdir().unwrap();
+        let private_key = Arc::new(
+            PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap(),
+        );
+        let (client_io, server_io) = duplex(4096);
+        let shell = ShellLaunch::detect_for_current_platform().unwrap();
+        let server_task = tokio::spawn(run_remote_shell_server(
+            server_io,
+            "support-user".to_string(),
+            private_key.public_key().clone(),
+            temp_dir.path().to_path_buf(),
+            shell.clone(),
+        ));
+        let config = Arc::new(client::Config {
+            window_size: 4096,
+            maximum_packet_size: 4096,
+            inactivity_timeout: None,
+            ..client::Config::default()
+        });
+        let mut session = client::connect_stream(config, client_io, NoopClientHandler).await.unwrap();
+        assert!(session.authenticate_publickey(
+            "support-user",
+            PrivateKeyWithHashAlg::new(private_key, None),
+        ).await.unwrap().success());
+        let mut channel = session.channel_open_session().await.unwrap();
+        if with_pty {
+            channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.unwrap();
+        }
+        let size = 1024 * 1024;
+        let command = match shell.family() {
+            ShellFamily::Posix => format!(
+                "head -c {size} /dev/zero | tr '\\0' 'x'; head -c {size} /dev/zero | tr '\\0' 'y' >&2; exit 23"
+            ),
+            ShellFamily::PowerShell => format!(
+                "[Console]::Out.Write(('x' * {size})); [Console]::Error.Write(('y' * {size})); exit 23"
+            ),
+        };
+        let (stdout, stderr, status) = collect_exec_output(&mut channel, &command).await;
+
+        assert_eq!(status, 23);
+        if with_pty {
+            assert_eq!(stdout.len(), 2 * size);
+            assert_eq!(stdout, format!("{}{}", "x".repeat(size), "y".repeat(size)));
+            assert!(stderr.is_empty());
+        } else {
+            assert_eq!(stdout.len(), size);
+            assert_eq!(stderr.len(), size);
+            assert!(stdout.bytes().all(|byte| byte == b'x'));
+            assert!(stderr.bytes().all(|byte| byte == b'y'));
+        }
+        session.disconnect(Disconnect::ByApplication, "test complete", "en-US").await.unwrap();
+        server_task.await.unwrap().unwrap();
+    }).await.expect("SSH command did not drain its output and close");
+}
+
+#[tokio::test]
+async fn exec_output_is_drained_before_channel_eof() {
+    assert_command_output_drained(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_output_is_drained_before_channel_eof() {
+    assert_command_output_drained(true).await;
+}
+
+#[tokio::test]
+async fn concurrent_fast_commands_preserve_stdout_and_stderr() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let temp_dir = tempdir().unwrap();
+        let key =
+            Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
+        let shell = ShellLaunch::detect_for_current_platform().unwrap();
+        let (client_io, server_io) = duplex(4096);
+        let server_task = tokio::spawn(run_remote_shell_server(
+            server_io,
+            "support-user".to_string(),
+            key.public_key().clone(),
+            temp_dir.path().to_path_buf(),
+            shell.clone(),
+        ));
+        let session = connect_authenticated_client_transport(client_io, "support-user", key)
+            .await
+            .unwrap();
+        let mut commands = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let mut channel = session.channel_open_session().await.unwrap();
+            let command = match shell.family() {
+                ShellFamily::Posix => format!("printf 'out-{index}'; printf 'err-{index}' >&2"),
+                ShellFamily::PowerShell => format!(
+                    "[Console]::Out.Write('out-{index}'); [Console]::Error.Write('err-{index}')"
+                ),
+            };
+            commands.spawn(async move {
+                let (stdout, stderr, status) = collect_exec_output(&mut channel, &command).await;
+                assert_eq!(stdout, format!("out-{index}"));
+                assert_eq!(stderr, format!("err-{index}"));
+                assert_eq!(status, 0);
+            });
+        }
+        while let Some(completed) = commands.join_next().await {
+            completed.unwrap();
+        }
+        session
+            .disconnect(Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("concurrent SSH commands did not drain and close");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_a_busy_output_channel_reaps_its_process_and_keeps_ssh_usable() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let temp_dir = tempdir().unwrap();
+        let key =
+            Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
+        let shell = ShellLaunch::detect_for_current_platform().unwrap();
+        let (client_io, server_io) = duplex(4096);
+        let server_task = tokio::spawn(run_remote_shell_server(
+            server_io,
+            "support-user".to_string(),
+            key.public_key().clone(),
+            temp_dir.path().to_path_buf(),
+            shell.clone(),
+        ));
+        let session = connect_authenticated_client_transport(client_io, "support-user", key)
+            .await
+            .unwrap();
+        for with_pty in [false, true] {
+            let mut channel = session.channel_open_session().await.unwrap();
+            if with_pty {
+                channel
+                    .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                    .await
+                    .unwrap();
+            }
+            channel
+                .exec(true, "printf '%s\\n' $$; while :; do printf x; done")
+                .await
+                .unwrap();
+            let mut output = Vec::new();
+            let pid = loop {
+                let message = channel
+                    .wait()
+                    .await
+                    .expect("busy command ended before reporting its PID");
+                if let ChannelMsg::Data { data } = message {
+                    output.extend_from_slice(&data);
+                    if let Some(end) = output.iter().position(|byte| *byte == b'\n') {
+                        break std::str::from_utf8(&output[..end])
+                            .unwrap()
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap();
+                    }
+                }
+            };
+            channel.close().await.unwrap();
+            while let Some(message) = channel.wait().await {
+                if matches!(message, ChannelMsg::Close) {
+                    break;
+                }
+            }
+            loop {
+                let status = tokio::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        "kill -0 \"$1\" 2>/dev/null",
+                        "process-probe",
+                        &pid.to_string(),
+                    ])
+                    .status()
+                    .await
+                    .unwrap();
+                if !status.success() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let mut channel = session.channel_open_session().await.unwrap();
+        let command = marker_exec_command(&shell, "after-cancellation");
+        let (stdout, stderr, status) = collect_exec_output(&mut channel, &command).await;
+        assert!(stdout.contains("after-cancellation"));
+        assert!(stderr.is_empty());
+        assert_eq!(status, 0);
+        session
+            .disconnect(Disconnect::ByApplication, "test complete", "en-US")
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("busy SSH channel cleanup did not complete");
+}
+
 #[tokio::test]
 async fn reuses_authenticated_transport_for_multiple_shell_sessions() {
     let temp_dir = tempdir().unwrap();

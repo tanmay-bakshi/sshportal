@@ -222,7 +222,7 @@ impl RemoteShellHandler {
             .context("failed to spawn PTY process")?;
 
         let child = Arc::new(Mutex::new(PtyChildState::new(child)));
-        let mut reader = pair
+        let reader = pair
             .master
             .try_clone_reader()
             .context("failed to clone PTY reader")?;
@@ -247,26 +247,10 @@ impl RemoteShellHandler {
 
         let (output_sender, mut output_receiver) =
             tokio_mpsc::channel::<Vec<u8>>(SESSION_OUTPUT_CHANNEL_CAPACITY);
-        tokio::task::spawn_blocking(move || {
-            let mut buffer = [0_u8; 4096];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(bytes_read) => {
-                        if output_sender
-                            .blocking_send(buffer[..bytes_read].to_vec())
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        Self::read_process_output(reader, output_sender);
 
         let output_handle = handle.clone();
-        tokio::spawn(async move {
+        let output_task = tokio::spawn(async move {
             while let Some(bytes) = output_receiver.recv().await {
                 if output_handle.data(channel, bytes).await.is_err() {
                     break;
@@ -290,7 +274,7 @@ impl RemoteShellHandler {
         let exit_handle = handle.clone();
         let shell_states = Arc::clone(&self.shell_states);
         tokio::spawn(async move {
-            let exit_code = tokio::task::spawn_blocking(move || -> u32 {
+            let mut exit_code = tokio::task::spawn_blocking(move || -> u32 {
                 loop {
                     let maybe_status = {
                         let mut child_guard = match wait_child.lock() {
@@ -314,11 +298,21 @@ impl RemoteShellHandler {
             .await
             .unwrap_or(1);
             debug_log(format!("PTY process exited with status {exit_code}"));
+            let state = shell_states.lock().await.remove(&channel);
+            // ConPTY can keep its output pipe open until the master is released.
+            // Older Windows versions block in ClosePseudoConsole while output drains,
+            // so teardown must not occupy the runtime thread driving the forwarder.
+            let release_task = tokio::task::spawn_blocking(move || drop(state));
+            let (output_result, release_result) = tokio::join!(output_task, release_task);
+            for result in [output_result, release_result] {
+                if let Err(error) = result {
+                    debug_log(format!("PTY output completion failed: {error}"));
+                    exit_code = 1;
+                }
+            }
             let _ = exit_handle.exit_status_request(channel, exit_code).await;
             let _ = exit_handle.eof(channel).await;
             let _ = exit_handle.close(channel).await;
-            let mut guard = shell_states.lock().await;
-            guard.remove(&channel);
         });
         Ok(())
     }
@@ -376,7 +370,7 @@ impl RemoteShellHandler {
         Self::read_process_output(stderr, stderr_sender);
 
         let stdout_handle = handle.clone();
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             while let Some(bytes) = stdout_receiver.recv().await {
                 if stdout_handle.data(channel, bytes).await.is_err() {
                     break;
@@ -385,7 +379,7 @@ impl RemoteShellHandler {
         });
 
         let stderr_handle = handle.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             while let Some(bytes) = stderr_receiver.recv().await {
                 if stderr_handle
                     .extended_data(channel, SSH_EXTENDED_DATA_STDERR, bytes)
@@ -412,7 +406,7 @@ impl RemoteShellHandler {
         let exit_handle = handle.clone();
         let shell_states = Arc::clone(&self.shell_states);
         tokio::spawn(async move {
-            let exit_code = tokio::task::spawn_blocking(move || -> u32 {
+            let mut exit_code = tokio::task::spawn_blocking(move || -> u32 {
                 loop {
                     let maybe_status = {
                         let mut child_guard = match wait_child.lock() {
@@ -436,11 +430,18 @@ impl RemoteShellHandler {
             .await
             .unwrap_or(1);
             debug_log(format!("exec process exited with status {exit_code}"));
+            shell_states.lock().await.remove(&channel);
+            // Child exit does not imply that its buffered pipe output has reached SSH.
+            let (stdout_result, stderr_result) = tokio::join!(stdout_task, stderr_task);
+            for result in [stdout_result, stderr_result] {
+                if let Err(error) = result {
+                    debug_log(format!("exec output completion failed: {error}"));
+                    exit_code = 1;
+                }
+            }
             let _ = exit_handle.exit_status_request(channel, exit_code).await;
             let _ = exit_handle.eof(channel).await;
             let _ = exit_handle.close(channel).await;
-            let mut guard = shell_states.lock().await;
-            guard.remove(&channel);
         });
         Ok(())
     }
@@ -758,20 +759,25 @@ impl server::Handler for RemoteShellHandler {
             let mut guard = self.shell_states.lock().await;
             guard.remove(&channel)
         };
-        match removed_state {
-            Some(SessionChannelState::RunningPty { child, .. }) => {
-                debug_log("received SSH channel close");
-                if let Ok(mut child_guard) = child.lock() {
-                    let _ = child_guard.kill_if_running();
+        if let Some(state) = removed_state {
+            // The SSH dispatcher must keep consuming output while ConPTY closes.
+            // Waiting for teardown inside this callback can deadlock its forwarder.
+            std::mem::drop(tokio::task::spawn_blocking(move || {
+                match &state {
+                    SessionChannelState::RunningPty { child, .. } => {
+                        if let Ok(mut child_guard) = child.lock() {
+                            let _ = child_guard.kill_if_running();
+                        }
+                    }
+                    SessionChannelState::RunningExec { child, .. } => {
+                        if let Ok(mut child_guard) = child.lock() {
+                            let _ = child_guard.kill_if_running();
+                        }
+                    }
+                    _ => {}
                 }
-            }
-            Some(SessionChannelState::RunningExec { child, .. }) => {
-                debug_log("received SSH channel close");
-                if let Ok(mut child_guard) = child.lock() {
-                    let _ = child_guard.kill_if_running();
-                }
-            }
-            _ => {}
+                drop(state);
+            }));
         }
         Ok(())
     }
