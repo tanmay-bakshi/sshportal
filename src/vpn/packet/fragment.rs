@@ -223,11 +223,14 @@ impl FragmentReassembler {
 
         self.buffered_bytes += additional_bytes;
         *accounted_bytes += additional_bytes;
-        pieces.push(FragmentPiece {
-            offset: fragment.offset,
-            data: fragment.data,
-        });
-        pieces.sort_unstable_by_key(|piece| piece.offset);
+        let position = pieces.partition_point(|piece| piece.offset <= fragment.offset);
+        pieces.insert(
+            position,
+            FragmentPiece {
+                offset: fragment.offset,
+                data: fragment.data,
+            },
+        );
 
         let Some(total_size) = *total_size else {
             return AddResult::Pending;
