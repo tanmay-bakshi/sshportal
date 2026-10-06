@@ -15,6 +15,17 @@ The project ships two binaries:
 
 The server accepts one client at a time. Once the consent handshake succeeds, it closes the HTTP listener and keeps only that session's WebSocket alive. There is no persistent client daemon, background control plane, or multi-session broker.
 
+The server generates a fresh random join token on each launch. To supply a token in any session
+mode, use `--join-token`:
+
+```bash
+sshportal-server --join-token 'my-shared-token'
+```
+
+The token must be nonempty and is used exactly as supplied, including whitespace and special
+characters. The printed WebSocket URL encodes the complete token for the client; when using a public
+HTTPS origin, preserve that URL's encoded `token` query parameter. Client consent is still required.
+
 ## SSH Mode
 
 SSH is the default mode:

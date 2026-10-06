@@ -44,9 +44,10 @@ struct ServerCli {
     /// Operator identity shown to the client user during consent.
     #[arg(long, default_value = "support-operator")]
     operator_name: String,
-    /// Explicit join token to require from the client.
+    /// Exact, nonempty join token to require from the client.
     ///
-    /// If omitted, the server generates a fresh random token for this run.
+    /// Whitespace and special characters are preserved. If omitted, the server generates a fresh
+    /// random token for this run.
     #[arg(long, value_name = "TOKEN")]
     join_token: Option<String>,
     /// Seconds to wait for the client to finish the handshake before releasing the slot.
@@ -796,11 +797,10 @@ fn support_websocket_endpoint(listen: SocketAddr, join_token: &str) -> String {
 
 fn resolve_join_token(join_token: Option<String>) -> Result<String> {
     if let Some(join_token) = join_token {
-        let trimmed = join_token.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        if join_token.is_empty() {
+            bail!("--join-token must not be empty");
         }
-        bail!("--join-token must not be empty");
+        return Ok(join_token);
     }
 
     let mut token_bytes = [0_u8; 16];
@@ -879,9 +879,19 @@ mod tests {
 
     #[test]
     fn explicit_join_token_is_preserved() {
-        let token = resolve_join_token(Some("  shared-secret  ".to_string())).unwrap();
+        for literal in ["shared-secret", "  shared-secret  ", " \t ", "雪 /?&+#%"] {
+            let cli =
+                ServerCli::try_parse_from(["sshportal-server", "--join-token", literal]).unwrap();
+            let token = resolve_join_token(cli.join_token).unwrap();
+            assert_eq!(token, literal);
+        }
+    }
 
-        assert_eq!(token, "shared-secret");
+    #[test]
+    fn empty_explicit_join_token_is_rejected() {
+        let cli = ServerCli::try_parse_from(["sshportal-server", "--join-token", ""]).unwrap();
+        let error = resolve_join_token(cli.join_token).unwrap_err();
+        assert_eq!(error.to_string(), "--join-token must not be empty");
     }
 
     #[test]
@@ -1120,6 +1130,37 @@ mod tests {
         drop(first_socket);
         drop(queued_http);
         drop(second_socket);
+        stop_server(&state, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_requires_the_literal_explicit_join_token() {
+        let literal = "  shared+secret&雪  ";
+        let cli = ServerCli::try_parse_from(["sshportal-server", "--join-token", literal]).unwrap();
+        let token = resolve_join_token(cli.join_token).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let (mut state, _session_receiver) = test_state(Duration::from_secs(1));
+        Arc::get_mut(&mut state).unwrap().join_token = token.clone();
+        let server_task = tokio::spawn(run_http_server(
+            listener,
+            Arc::clone(&state),
+            test_limits(8, Duration::from_secs(2)),
+        ));
+
+        for incorrect_token in [literal.trim(), "wrong-token"] {
+            let url = support_websocket_endpoint(listen_addr, incorrect_token);
+            let error = connect_async(url).await.unwrap_err();
+            let WebSocketError::Http(response) = error else {
+                panic!("expected HTTP websocket rejection, received {error:?}");
+            };
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let url = support_websocket_endpoint(listen_addr, &token);
+        let (socket, response) = connect_async(url).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        drop(socket);
         stop_server(&state, server_task).await;
     }
 
