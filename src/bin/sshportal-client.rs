@@ -5,18 +5,22 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use futures_util::StreamExt;
 use hostname::get;
 use russh::keys::PublicKey;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 
 use sshportal::{
-    AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ControlPacket,
-    OfferedSession, PROTOCOL_VERSION, Platform, ShellLaunch, VpnScope, authorized_key_support,
-    connect_async_with_env_proxy_and_extra_roots, harden_dynamic_library_search,
-    install_default_rustls_crypto_provider, normalize_websocket_url, parse_public_key, recv_packet,
-    run_client_network_proxy, run_remote_shell_server, send_packet, websocket_to_io,
+    AuthorizedKeySupport, ClientDecision, ClientHello, ClientMetadata, ClientWebSocketStream,
+    ControlPacket, OfferedSession, PROTOCOL_VERSION, Platform, ReconnectHello, ReconnectOptions,
+    ReconnectSecret, ReconnectWindow, ServerOffer, ShellLaunch, Shutdown, VpnScope,
+    authorized_key_support, connect_async_with_env_proxy_and_extra_roots,
+    harden_dynamic_library_search, install_default_rustls_crypto_provider, is_connection_loss,
+    normalize_websocket_url, parse_public_key, recv_packet, run_client_network_proxy,
+    run_remote_shell_server, send_packet, websocket_to_io,
 };
 
 #[derive(Parser, Debug)]
@@ -45,6 +49,8 @@ struct ClientCli {
     /// Skip the prompt that approves persistent operator key installation.
     #[arg(long)]
     approve_key_install: bool,
+    #[command(flatten)]
+    reconnection: ReconnectOptions,
 }
 
 struct LocalClientEnvironment {
@@ -68,106 +74,250 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let cli = ClientCli::parse();
     install_default_rustls_crypto_provider();
-    let client_environment = gather_client_environment()?;
+    let shutdown = Shutdown::new()?;
+    let environment = gather_client_environment()?;
     let server_url = normalize_websocket_url(&cli.server)?;
-    let extra_tls_roots = load_tls_ca_certificates(&cli.tls_ca_certificates)?;
-    println!("connecting to {server_url}");
+    let roots = load_tls_ca_certificates(&cli.tls_ca_certificates)?;
+    let settings = cli.reconnection.settings()?;
+    let mut hello = ClientHello {
+        protocol_version: PROTOCOL_VERSION,
+        reconnect: settings.map(|settings| ReconnectHello {
+            client_identity: ReconnectSecret::generate(),
+            server_identity: None,
+            settings,
+        }),
+        metadata: environment.metadata.clone(),
+    };
+    let mut approval = None;
+    let mut window: Option<ReconnectWindow> = None;
+    loop {
+        println!("connecting to {server_url}");
+        let attempt =
+            establish_client_connection(&cli, &server_url, &roots, &mut hello, &mut approval);
+        let connection = tokio::select! {
+            _ = shutdown.token.cancelled() => return Ok(()),
+            result = async {
+                match &window {
+                    Some(window) => tokio::time::timeout_at(window.deadline, attempt)
+                        .await.context("automatic reconnection window expired")?,
+                    None => attempt.await,
+                }
+            } => result,
+        };
+        match connection {
+            Ok((websocket, offer)) => {
+                let negotiated = offer.reconnect.as_ref().map(|offer| offer.settings);
+                let session = run_approved_client_session(websocket, offer.session, &environment);
+                let result = tokio::select! {
+                    _ = shutdown.token.cancelled() => return Ok(()),
+                    result = session => result,
+                };
+                if negotiated.is_none() {
+                    return result;
+                }
+                if let Err(error) = &result {
+                    if !is_connection_loss(error) {
+                        return result;
+                    }
+                    eprintln!("support connection lost: {error:#}");
+                } else {
+                    eprintln!("support connection closed");
+                }
+                window = negotiated.map(ReconnectWindow::new);
+            }
+            Err(error) => {
+                if settings.is_none() || !is_connection_loss(&error) {
+                    return Err(error);
+                }
+                eprintln!("connection attempt failed: {error:#}");
+                let retry_settings = approval
+                    .as_ref()
+                    .and_then(|approved: &ClientApproval| approved.offer.reconnect.as_ref())
+                    .map(|offer| offer.settings)
+                    .or(settings)
+                    .expect("reconnection is enabled");
+                window.get_or_insert_with(|| ReconnectWindow::new(retry_settings));
+            }
+        }
+        let retry = window.as_ref().expect("recovery owns a retry window");
+        println!("waiting before reconnecting");
+        tokio::select! {
+            _ = shutdown.token.cancelled() => return Ok(()),
+            result = retry.wait() => result?,
+        }
+    }
+}
 
-    let (mut websocket, _response) =
-        connect_async_with_env_proxy_and_extra_roots(&server_url, extra_tls_roots)
+struct ClientApproval {
+    offer: ServerOffer,
+    decision: ClientDecision,
+}
+
+fn validate_resumed_offer(approved: &ServerOffer, received: &ServerOffer) -> Result<()> {
+    if approved != received {
+        bail!(
+            "server identity or approved capability changed; restart the client to approve a new session"
+        );
+    }
+    Ok(())
+}
+
+async fn establish_client_connection(
+    cli: &ClientCli,
+    server_url: &url::Url,
+    roots: &[CertificateDer<'static>],
+    hello: &mut ClientHello,
+    approval: &mut Option<ClientApproval>,
+) -> Result<(ClientWebSocketStream, ServerOffer)> {
+    let (mut websocket, _) =
+        connect_async_with_env_proxy_and_extra_roots(server_url, roots.to_vec())
             .await
             .context("failed to connect to sshportal server")?;
-    let hello = ClientHello {
-        protocol_version: PROTOCOL_VERSION,
-        metadata: client_environment.metadata.clone(),
-    };
-    send_packet(&mut websocket, &ControlPacket::ClientHello(hello)).await?;
-
-    let offer = match recv_packet(&mut websocket).await? {
+    send_packet(&mut websocket, &ControlPacket::ClientHello(hello.clone())).await?;
+    let packet = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        recv_packet(&mut websocket),
+    )
+    .await
+    .context("timed out waiting for the server offer")??;
+    let offer = match packet {
         ControlPacket::ServerOffer(offer) => offer,
+        ControlPacket::SessionRejected { reason } => {
+            bail!("server rejected the connection: {reason}")
+        }
         unexpected => bail!("expected server_offer packet, received {unexpected:?}"),
     };
-    if let Some(note) = session_transport_refusal(&offer.session, &server_url) {
-        let decision = ClientDecision {
-            session_allowed: false,
-            key_installed: false,
-            note: Some(note.clone()),
-        };
-        send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
-        bail!("{note}");
-    }
-
-    let session_allowed = if cli.approve_session {
-        true
+    let decision = if let Some(approved) = approval {
+        validate_resumed_offer(&approved.offer, &offer)?;
+        approved.decision.clone()
     } else {
-        prompt_yes_no(
-            &session_consent_prompt(&offer.operator_name, &offer.session),
-            false,
-        )?
-    };
-    if !session_allowed {
-        let decision = ClientDecision {
-            session_allowed: false,
-            key_installed: false,
-            note: Some("local user declined the support session".to_string()),
-        };
-        send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
-        bail!("support session was declined locally");
-    }
-
-    match offer.session {
-        OfferedSession::Ssh {
-            ssh_public_key,
-            persist_key_requested,
-        } => {
-            let public_key = parse_public_key(&ssh_public_key)?;
-            let shell = ShellLaunch::detect_for_current_platform()?;
-            let key_install = maybe_install_operator_key(
-                &cli,
-                &offer.operator_name,
-                &public_key,
+        if matches!(offer.session, OfferedSession::Socks {}) && server_url.scheme() == "ws" {
+            eprintln!(
+                "warning: SOCKS-only traffic is using an unencrypted WebSocket; use HTTPS/WSS outside a trusted network"
+            );
+        }
+        if let Some(note) = session_transport_refusal(&offer.session, server_url) {
+            send_packet(
+                &mut websocket,
+                &ControlPacket::ClientDecision(ClientDecision {
+                    session_allowed: false,
+                    key_installed: false,
+                    note: Some(note.clone()),
+                }),
+            )
+            .await?;
+            bail!("{note}");
+        }
+        if let Some(reconnect) = &offer.reconnect {
+            let requested = hello
+                .reconnect
+                .as_mut()
+                .context("server offered unrequested reconnection")?;
+            let expected = requested.settings.negotiate(reconnect.settings)?;
+            if expected != reconnect.settings
+                || requested
+                    .server_identity
+                    .as_ref()
+                    .is_some_and(|identity| *identity != reconnect.server_identity)
+            {
+                bail!("server returned an invalid reconnection offer");
+            }
+            requested.server_identity = Some(reconnect.server_identity.clone());
+        }
+        let mut prompt = session_consent_prompt(&offer.operator_name, &offer.session);
+        if let Some(reconnect) = &offer.reconnect {
+            prompt.push_str(&format!(
+                " This approval also permits the same operator and capability to reconnect while this client stays running, for up to {} seconds after each disconnection.",
+                reconnect.settings.timeout_seconds,
+            ));
+        }
+        let allowed = cli.approve_session || prompt_yes_no(&prompt, false).await?;
+        if !allowed {
+            send_packet(
+                &mut websocket,
+                &ControlPacket::ClientDecision(ClientDecision {
+                    session_allowed: false,
+                    key_installed: false,
+                    note: Some("local user declined the support session".to_string()),
+                }),
+            )
+            .await?;
+            bail!("support session was declined locally");
+        }
+        let key_install = match &offer.session {
+            OfferedSession::Ssh {
+                ssh_public_key,
                 persist_key_requested,
-            )?;
-            let decision = ClientDecision {
-                session_allowed: true,
-                key_installed: key_install.installed,
-                note: key_install.note,
-            };
-            send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
+            } => {
+                maybe_install_operator_key(
+                    cli,
+                    &offer.operator_name,
+                    &parse_public_key(ssh_public_key)?,
+                    *persist_key_requested,
+                )
+                .await?
+            }
+            _ => KeyInstallOutcome {
+                installed: false,
+                note: None,
+            },
+        };
+        let decision = ClientDecision {
+            session_allowed: true,
+            key_installed: key_install.installed,
+            note: key_install.note,
+        };
+        // Consent is owned by the process, so loss of the ready acknowledgement cannot lose it.
+        if offer.reconnect.is_some() {
+            *approval = Some(ClientApproval {
+                offer: offer.clone(),
+                decision: decision.clone(),
+            });
+        }
+        decision
+    };
+    send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
+    let packet = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        recv_packet(&mut websocket),
+    )
+    .await
+    .context("timed out waiting for session readiness")??;
+    match packet {
+        ControlPacket::SessionReady {} => Ok((websocket, offer)),
+        ControlPacket::SessionRejected { reason } => bail!("server rejected the session: {reason}"),
+        unexpected => bail!("expected session_ready packet, received {unexpected:?}"),
+    }
+}
 
-            let transport = websocket_to_io(websocket);
+async fn run_approved_client_session(
+    websocket: ClientWebSocketStream,
+    session: OfferedSession,
+    environment: &LocalClientEnvironment,
+) -> Result<()> {
+    match session {
+        OfferedSession::Ssh { ssh_public_key, .. } => {
             run_remote_shell_server(
-                transport,
-                client_environment.metadata.username,
-                public_key,
-                PathBuf::from(client_environment.metadata.working_directory),
-                shell,
+                websocket_to_io(websocket),
+                environment.metadata.username.clone(),
+                parse_public_key(&ssh_public_key)?,
+                PathBuf::from(&environment.metadata.working_directory),
+                ShellLaunch::detect_for_current_platform()?,
             )
             .await
         }
-        approved_session @ OfferedSession::Socks {} => {
-            if server_url.scheme() == "ws" {
-                eprintln!(
-                    "warning: SOCKS-only traffic is using an unencrypted WebSocket; use HTTPS/WSS outside a trusted network"
-                );
+        approved_session => {
+            match &approved_session {
+                OfferedSession::Socks {} => {
+                    println!("SOCKS-only support session approved (SSH disabled)");
+                }
+                OfferedSession::Vpn { .. } => {
+                    println!(
+                        "VPN egress session approved (SSH disabled; no local privileges required)"
+                    );
+                }
+                OfferedSession::Ssh { .. } => unreachable!("SSH sessions are handled above"),
             }
-            let decision = ClientDecision {
-                session_allowed: true,
-                key_installed: false,
-                note: None,
-            };
-            send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
-            println!("SOCKS-only support session approved (SSH disabled)");
-            run_client_network_proxy(websocket, approved_session).await
-        }
-        approved_session @ OfferedSession::Vpn { .. } => {
-            let decision = ClientDecision {
-                session_allowed: true,
-                key_installed: false,
-                note: None,
-            };
-            send_packet(&mut websocket, &ControlPacket::ClientDecision(decision)).await?;
-            println!("VPN egress session approved (SSH disabled; no local privileges required)");
             run_client_network_proxy(websocket, approved_session).await
         }
     }
@@ -279,7 +429,7 @@ fn gather_client_environment() -> Result<LocalClientEnvironment> {
     })
 }
 
-fn maybe_install_operator_key(
+async fn maybe_install_operator_key(
     cli: &ClientCli,
     operator_name: &str,
     ssh_public_key: &PublicKey,
@@ -312,7 +462,8 @@ fn maybe_install_operator_key(
                 target.prompt_path()
             ),
             false,
-        )?
+        )
+        .await?
     };
     if !install_key {
         return Ok(KeyInstallOutcome {
@@ -330,7 +481,15 @@ fn maybe_install_operator_key(
     })
 }
 
-fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
+struct ConsentTerminal;
+
+impl Drop for ConsentTerminal {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+async fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
     let stdin_is_terminal = io::stdin().is_terminal();
     let stdout_is_terminal = io::stdout().is_terminal();
     if !stdin_is_terminal || !stdout_is_terminal {
@@ -342,10 +501,41 @@ fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
     write!(stdout, "{prompt} {suffix} ").context("failed to write prompt")?;
     stdout.flush().context("failed to flush prompt")?;
 
+    crossterm::terminal::enable_raw_mode().context("failed to read terminal consent")?;
+    // The guard restores canonical input when the prompt completes or its future is cancelled.
+    let _terminal = ConsentTerminal;
+    let mut events = EventStream::new();
     let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| anyhow!("failed to read prompt response: {error}"))?;
+    while let Some(event) = events.next().await {
+        let Event::Key(key) = event.context("failed to read prompt response")? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'd'))
+        {
+            write!(stdout, "\r\n")?;
+            bail!("support session approval cancelled");
+        }
+        match key.code {
+            KeyCode::Enter => {
+                write!(stdout, "\r\n")?;
+                break;
+            }
+            KeyCode::Backspace if !answer.is_empty() => {
+                answer.pop();
+                write!(stdout, "\x08 \x08")?;
+            }
+            KeyCode::Char(character) if character.is_ascii_alphabetic() && answer.len() < 16 => {
+                answer.push(character);
+                write!(stdout, "{character}")?;
+            }
+            _ => {}
+        }
+        stdout.flush().context("failed to echo consent response")?;
+    }
     let normalized = answer.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return Ok(default);
@@ -365,7 +555,85 @@ mod tests {
     use tempfile::TempDir;
     use url::Url;
 
-    use super::{load_tls_ca_certificates, session_consent_prompt, session_transport_refusal};
+    use super::{
+        ClientCli, load_tls_ca_certificates, session_consent_prompt, session_transport_refusal,
+        validate_resumed_offer,
+    };
+    use clap::Parser;
+    use sshportal::{
+        PROTOCOL_VERSION, ReconnectOffer, ReconnectOptions, ReconnectSecret, ReconnectSettings,
+        ServerOffer,
+    };
+
+    #[test]
+    fn reconnect_configuration_is_opt_in_and_validated() {
+        let cli = ClientCli::try_parse_from([
+            "sshportal-client",
+            "--server",
+            "https://example.test",
+            "--reconnect",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.reconnection.settings().unwrap(),
+            ReconnectOptions {
+                reconnect: true,
+                ..Default::default()
+            }
+            .settings()
+            .unwrap()
+        );
+        assert!(
+            ClientCli::try_parse_from([
+                "sshportal-client",
+                "--server",
+                "https://example.test",
+                "--reconnect-timeout-seconds",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            ClientCli::try_parse_from([
+                "sshportal-client",
+                "--server",
+                "https://example.test",
+                "--reconnect-interval-seconds",
+                "2"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn continued_consent_rejects_changed_server_identity_or_capability() {
+        let approved = ServerOffer {
+            protocol_version: PROTOCOL_VERSION,
+            operator_name: "support".to_string(),
+            session: OfferedSession::Socks {},
+            reconnect: Some(ReconnectOffer {
+                server_identity: ReconnectSecret::generate(),
+                settings: ReconnectSettings {
+                    interval_seconds: 5,
+                    timeout_seconds: 300,
+                },
+            }),
+        };
+        validate_resumed_offer(&approved, &approved).unwrap();
+        let mut changed = approved.clone();
+        changed.operator_name = "someone-else".to_string();
+        assert!(validate_resumed_offer(&approved, &changed).is_err());
+        let mut changed = approved.clone();
+        changed.reconnect.as_mut().unwrap().server_identity = ReconnectSecret::generate();
+        assert!(validate_resumed_offer(&approved, &changed).is_err());
+        let mut changed = approved.clone();
+        changed.session = OfferedSession::Vpn {
+            scope: VpnScope::System {
+                policy: SystemVpnPolicy::full_tunnel(),
+            },
+        };
+        assert!(validate_resumed_offer(&approved, &changed).is_err());
+    }
 
     const TEST_CA_CERTIFICATE: &str = "\
 -----BEGIN CERTIFICATE-----

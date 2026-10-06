@@ -41,10 +41,12 @@ impl Harness {
                 .await
                 .unwrap(),
         ));
-        let listener =
-            start_dynamic_forward_listener(Arc::clone(&session), "127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap();
+        let listener = start_dynamic_forward_listener(
+            Arc::clone(&session),
+            Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()),
+        )
+        .await
+        .unwrap();
         Self {
             listener,
             session,

@@ -8,13 +8,14 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use crate::PROTOCOL_VERSION;
 use crate::platform::Platform;
+use crate::reconnect::{ReconnectHello, ReconnectOffer};
 use crate::vpn::SystemVpnPolicy;
 
 const MAX_DISPLAY_LABEL_BYTES: usize = 256;
 const MAX_DECISION_NOTE_BYTES: usize = 2 * 1024;
 const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientMetadata {
     pub hostname: String,
@@ -23,22 +24,24 @@ pub struct ClientMetadata {
     pub platform: Platform,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientHello {
     pub protocol_version: u32,
+    pub reconnect: Option<ReconnectHello>,
     pub metadata: ClientMetadata,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerOffer {
     pub protocol_version: u32,
+    pub reconnect: Option<ReconnectOffer>,
     pub operator_name: String,
     pub session: OfferedSession,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OfferedSession {
     Ssh {
@@ -51,7 +54,7 @@ pub enum OfferedSession {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VpnScope {
     System { policy: SystemVpnPolicy },
@@ -71,6 +74,8 @@ pub enum ControlPacket {
     ClientHello(ClientHello),
     ServerOffer(ServerOffer),
     ClientDecision(ClientDecision),
+    SessionReady {},
+    SessionRejected { reason: String },
 }
 
 impl fmt::Debug for ControlPacket {
@@ -79,6 +84,8 @@ impl fmt::Debug for ControlPacket {
             Self::ClientHello(_) => "ClientHello",
             Self::ServerOffer(_) => "ServerOffer",
             Self::ClientDecision(_) => "ClientDecision",
+            Self::SessionReady {} => "SessionReady",
+            Self::SessionRejected { .. } => "SessionRejected",
         })
     }
 }
@@ -86,8 +93,18 @@ impl fmt::Debug for ControlPacket {
 impl ControlPacket {
     fn validate(&self) -> Result<()> {
         match self {
+            Self::SessionReady {} => Ok(()),
+            Self::SessionRejected { reason } => validate_terminal_text(
+                "session rejection reason",
+                reason,
+                MAX_DECISION_NOTE_BYTES,
+                true,
+            ),
             Self::ClientHello(hello) => {
                 validate_protocol_version(hello.protocol_version)?;
+                if let Some(reconnect) = &hello.reconnect {
+                    reconnect.settings.validate()?;
+                }
                 validate_terminal_text(
                     "client username",
                     &hello.metadata.username,
@@ -97,6 +114,9 @@ impl ControlPacket {
             }
             Self::ServerOffer(offer) => {
                 validate_protocol_version(offer.protocol_version)?;
+                if let Some(reconnect) = &offer.reconnect {
+                    reconnect.settings.validate()?;
+                }
                 validate_terminal_text(
                     "server offer operator name",
                     &offer.operator_name,
@@ -176,10 +196,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        let next_message = websocket
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("peer closed the websocket before completing the handshake"))?;
+        let next_message = websocket.next().await.ok_or_else(|| {
+            anyhow::Error::new(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+                .context("peer closed the websocket before completing the handshake")
+        })?;
         match next_message.context("websocket read failed during handshake")? {
             Message::Binary(bytes) => {
                 let packet: ControlPacket =
@@ -200,7 +220,10 @@ where
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(frame) => {
                 let Some(close_frame) = frame else {
-                    bail!("peer closed the websocket without a reason");
+                    return Err(anyhow::Error::new(
+                        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                    )
+                    .context("peer closed the websocket without a reason"));
                 };
                 let reason = close_frame.reason.as_ref();
                 if validate_terminal_text(
@@ -213,7 +236,10 @@ where
                 {
                     bail!("peer closed the websocket with an unsafe reason");
                 }
-                bail!("peer closed the websocket: {reason}");
+                return Err(anyhow::Error::new(
+                    tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                )
+                .context(format!("peer closed the websocket: {reason}")));
             }
         }
     }
@@ -270,6 +296,7 @@ mod tests {
     fn system_vpn_offer(operator_name: &str) -> ControlPacket {
         ControlPacket::ServerOffer(ServerOffer {
             protocol_version: PROTOCOL_VERSION,
+            reconnect: None,
             operator_name: operator_name.to_string(),
             session: OfferedSession::Vpn {
                 scope: VpnScope::System {
@@ -283,6 +310,7 @@ mod tests {
     fn system_vpn_offer_identifies_its_scope() {
         let packet = ControlPacket::ServerOffer(ServerOffer {
             protocol_version: PROTOCOL_VERSION,
+            reconnect: None,
             operator_name: "support".to_string(),
             session: OfferedSession::Vpn {
                 scope: VpnScope::System {
@@ -330,6 +358,7 @@ mod tests {
     async fn legitimate_unicode_display_text_round_trips() {
         let hello = ControlPacket::ClientHello(ClientHello {
             protocol_version: PROTOCOL_VERSION,
+            reconnect: None,
             metadata: ClientMetadata {
                 hostname: "workstation".to_string(),
                 username: "工程師".to_string(),
@@ -433,6 +462,7 @@ mod tests {
     fn hello_and_offer_versions_are_validated_at_the_packet_boundary() {
         let hello = ControlPacket::ClientHello(ClientHello {
             protocol_version: PROTOCOL_VERSION + 1,
+            reconnect: None,
             metadata: ClientMetadata {
                 hostname: "workstation".to_string(),
                 username: "engineer".to_string(),
@@ -442,6 +472,7 @@ mod tests {
         });
         let offer = ControlPacket::ServerOffer(ServerOffer {
             protocol_version: PROTOCOL_VERSION + 1,
+            reconnect: None,
             operator_name: "support".to_string(),
             session: OfferedSession::Socks {},
         });
@@ -571,6 +602,7 @@ mod tests {
         ] {
             let packet = ControlPacket::ClientHello(ClientHello {
                 protocol_version: PROTOCOL_VERSION,
+                reconnect: None,
                 metadata: ClientMetadata {
                     hostname: "workstation".to_string(),
                     username,
@@ -630,6 +662,7 @@ mod tests {
         let attacker_value = "workstation\u{202e}hidden";
         let packet = ControlPacket::ClientHello(ClientHello {
             protocol_version: PROTOCOL_VERSION,
+            reconnect: None,
             metadata: ClientMetadata {
                 hostname: attacker_value.to_string(),
                 username: "engineer".to_string(),

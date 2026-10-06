@@ -482,7 +482,7 @@ async fn dynamic_forward_listener_routes_socks_connections_through_client_networ
     ));
     let dynamic_forward_listener = start_dynamic_forward_listener(
         Arc::clone(&upstream_session),
-        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap()),
     )
     .await
     .unwrap();
@@ -1074,7 +1074,8 @@ async fn local_ssh_proxy_accepts_repeated_sessions_over_one_client_transport() {
     ));
     let proxy_listener = start_ssh_proxy_listener(
         Arc::clone(&upstream_session),
-        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+        Arc::clone(&allowed_private_key),
         "support-user".to_string(),
         allowed_public_key,
     )
@@ -1164,7 +1165,8 @@ async fn local_ssh_proxy_executes_noninteractive_commands() {
     ));
     let proxy_listener = start_ssh_proxy_listener(
         Arc::clone(&upstream_session),
-        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+        Arc::clone(&allowed_private_key),
         "support-user".to_string(),
         allowed_public_key,
     )

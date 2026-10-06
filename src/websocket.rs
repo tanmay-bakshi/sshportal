@@ -447,10 +447,18 @@ where
 }
 
 fn map_websocket_error(error: WebSocketError) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::BrokenPipe,
-        format!("websocket transport error: {error}"),
-    )
+    let kind = match &error {
+        WebSocketError::Io(error) => error.kind(),
+        WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed => {
+            io::ErrorKind::BrokenPipe
+        }
+        WebSocketError::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+            | tokio_tungstenite::tungstenite::error::ProtocolError::HandshakeIncomplete,
+        ) => io::ErrorKind::ConnectionReset,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
 }
 
 #[cfg(test)]
@@ -678,6 +686,7 @@ async fn open_tcp_stream(
         TcpStream::connect((host, port)),
     )
     .await?
+    .map_err(crate::reconnect::TcpConnectFailure)
     .with_context(|| format!("failed to connect to {description} at {authority}"))?;
     socket.set_nodelay(true).with_context(|| {
         format!("failed to enable TCP_NODELAY for {description} at {authority}")
@@ -787,7 +796,11 @@ async fn read_proxy_response_headers(stream: &mut dyn WebSocketClientTransport) 
             .await
             .context("failed to read proxy CONNECT response")?;
         if bytes_read == 0 {
-            bail!("proxy closed the connection before finishing the CONNECT handshake");
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "proxy closed the connection before finishing the CONNECT handshake",
+            )
+            .into());
         }
 
         response.extend_from_slice(&chunk[..bytes_read]);
@@ -834,7 +847,10 @@ fn validate_connect_response(response: &[u8]) -> Result<()> {
     if status == "407" {
         bail!("proxy authentication was rejected");
     }
-    bail!("proxy CONNECT failed with HTTP status {status}");
+    Err(
+        crate::reconnect::ProxyConnectFailure(status.parse().expect("three ASCII status digits"))
+            .into(),
+    )
 }
 
 fn header_terminator_offset(bytes: &[u8]) -> Option<usize> {
@@ -890,10 +906,38 @@ mod tests {
 
     use super::{
         WebSocketConnectTimeouts, connect_async_with_proxy_matcher,
-        connect_async_with_proxy_matcher_and_timeouts, normalize_websocket_url, proxy_endpoint,
-        selected_proxy_for_websocket_url, start_websocket_writer_with_capacity, tls_client_config,
-        validate_connect_response,
+        connect_async_with_proxy_matcher_and_timeouts, map_websocket_error,
+        normalize_websocket_url, proxy_endpoint, selected_proxy_for_websocket_url,
+        start_websocket_writer_with_capacity, tls_client_config, validate_connect_response,
     };
+
+    #[test]
+    fn websocket_io_preserves_failure_kind_and_concrete_cause() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+        for (error, kind) in [
+            (
+                WebSocketError::Io(io::ErrorKind::ConnectionReset.into()),
+                io::ErrorKind::ConnectionReset,
+            ),
+            (
+                WebSocketError::Io(io::ErrorKind::InvalidData.into()),
+                io::ErrorKind::InvalidData,
+            ),
+            (
+                WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+                io::ErrorKind::ConnectionReset,
+            ),
+            (
+                WebSocketError::Protocol(ProtocolError::WrongHttpMethod),
+                io::ErrorKind::InvalidData,
+            ),
+        ] {
+            let mapped = map_websocket_error(error);
+            assert_eq!(mapped.kind(), kind);
+            assert!(mapped.get_ref().unwrap().is::<WebSocketError>());
+        }
+    }
 
     struct FlushRecordingSink {
         pending: Option<bytes::Bytes>,

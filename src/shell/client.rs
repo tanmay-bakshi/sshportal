@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::debug::debug_log;
@@ -57,14 +58,15 @@ where
 
 async fn wait_for_client_transport_close(
     session: &Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
-) {
+) -> Result<()> {
     loop {
         let is_closed = {
             let session_guard = session.lock().await;
             session_guard.is_closed()
         };
         if is_closed {
-            return;
+            let mut session = session.lock().await;
+            return (&mut *session).await.context("SSH client transport failed");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -84,42 +86,72 @@ fn print_ssh_proxy_usage(listen_addr: SocketAddr, username: &str) {
     println!("use SSH username `{username}` when opening proxied sessions");
 }
 
-pub async fn run_client_session_proxy<S>(
-    io: S,
-    username: &str,
-    private_key: Arc<PrivateKey>,
-    ssh_listen: SocketAddr,
-    dynamic_forward_listen: Option<SocketAddr>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let allowed_public_key = private_key.public_key().clone();
-    let session = connect_authenticated_client_transport(io, username, private_key).await?;
-    let session = Arc::new(AsyncMutex::new(session));
-    let ssh_proxy_listener = start_ssh_proxy_listener(
-        Arc::clone(&session),
-        ssh_listen,
-        username.to_string(),
-        allowed_public_key,
-    )
-    .await?;
-    print_ssh_proxy_usage(ssh_proxy_listener.local_addr(), username);
+/// Owns stable local listeners and their host key across approved transport epochs.
+pub struct OperatorSsh {
+    listener: Arc<TcpListener>,
+    dynamic: Option<Arc<TcpListener>>,
+    host_key: Arc<PrivateKey>,
+}
 
-    let dynamic_forward_listener = match dynamic_forward_listen {
-        Some(listen_addr) => {
-            let listener =
-                start_dynamic_forward_listener(Arc::clone(&session), listen_addr).await?;
-            println!("SOCKS5 proxy listening on {}", listener.local_addr());
-            Some(listener)
+impl OperatorSsh {
+    pub async fn bind(ssh_listen: SocketAddr, dynamic_listen: Option<SocketAddr>) -> Result<Self> {
+        let listener = Arc::new(
+            TcpListener::bind(ssh_listen)
+                .await
+                .with_context(|| format!("failed to bind SSH proxy to {ssh_listen}"))?,
+        );
+        let dynamic = match dynamic_listen {
+            Some(address) => Some(Arc::new(TcpListener::bind(address).await.with_context(
+                || format!("failed to bind dynamic SOCKS proxy to {address}"),
+            )?)),
+            None => None,
+        };
+        let host_key = Arc::new(
+            PrivateKey::random(&mut rand::rng(), russh::keys::ssh_key::Algorithm::Ed25519)
+                .context("failed to generate SSH proxy host key")?,
+        );
+        Ok(Self {
+            listener,
+            dynamic,
+            host_key,
+        })
+    }
+
+    pub async fn run<S>(&self, io: S, username: &str, private_key: Arc<PrivateKey>) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let allowed_public_key = private_key.public_key().clone();
+        let session = connect_authenticated_client_transport(io, username, private_key).await?;
+        let session = Arc::new(AsyncMutex::new(session));
+        let ssh_proxy_listener = start_ssh_proxy_listener(
+            Arc::clone(&session),
+            Arc::clone(&self.listener),
+            Arc::clone(&self.host_key),
+            username.to_string(),
+            allowed_public_key,
+        )
+        .await?;
+        print_ssh_proxy_usage(ssh_proxy_listener.local_addr(), username);
+
+        let dynamic_forward_listener = match &self.dynamic {
+            Some(listener) => {
+                let listener =
+                    start_dynamic_forward_listener(Arc::clone(&session), Arc::clone(listener))
+                        .await?;
+                println!("SOCKS5 proxy listening on {}", listener.local_addr());
+                Some(listener)
+            }
+            None => None,
+        };
+
+        let result = wait_for_client_transport_close(&session).await;
+        if let Some(listener) = dynamic_forward_listener {
+            listener.shutdown().await;
         }
-        None => None,
-    };
-
-    wait_for_client_transport_close(&session).await;
-    drop(dynamic_forward_listener);
-    drop(ssh_proxy_listener);
-    Ok(())
+        ssh_proxy_listener.shutdown().await;
+        result
+    }
 }
 
 #[cfg(test)]

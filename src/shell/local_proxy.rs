@@ -1,17 +1,17 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream as NativeTcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use russh::client;
-use russh::keys::{PrivateKey, PublicKey, ssh_key};
+use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use crate::debug::debug_log;
 
@@ -20,45 +20,69 @@ use super::common::{NoopClientHandler, same_public_key};
 pub(super) struct SshProxyListener {
     listen_addr: SocketAddr,
     task: JoinHandle<()>,
+    cancellation: CancellationToken,
 }
 impl SshProxyListener {
     pub(super) fn local_addr(&self) -> SocketAddr {
         self.listen_addr
     }
+
+    pub(super) async fn shutdown(mut self) {
+        self.cancellation.cancel();
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for SshProxyListener {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         self.task.abort();
     }
 }
 
-fn build_ssh_proxy_server_config() -> Result<Arc<server::Config>> {
-    let host_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519)
-        .context("failed to generate SSH proxy host key")?;
+fn build_ssh_proxy_server_config(host_key: &PrivateKey) -> Arc<server::Config> {
     let config = server::Config {
         auth_rejection_time: Duration::from_secs(2),
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 12,
         nodelay: true,
-        keys: vec![host_key],
+        keys: vec![host_key.clone()],
         ..Default::default()
     };
-    Ok(Arc::new(config))
+    Arc::new(config)
 }
 
-async fn run_local_ssh_proxy_connection<S>(
-    io: S,
+struct ConnectionSocket(NativeTcpStream);
+
+impl Drop for ConnectionSocket {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+async fn run_local_ssh_proxy_connection(
+    stream: TcpStream,
     config: Arc<server::Config>,
     handler: LocalSshProxyHandler,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let running_session = server::run_stream(config, io, handler)
-        .await
-        .context("failed to start local SSH proxy transport")?;
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let native = stream.into_std()?;
+    // Russh owns a background task after run_stream returns. This socket owner closes it even
+    // when the enclosing future is dropped, rather than detaching an old transport epoch.
+    let socket = ConnectionSocket(native.try_clone()?);
+    let stream = TcpStream::from_std(native)?;
+    let mut running_session = tokio::select! {
+        result = server::run_stream(config, stream, handler) => {
+            result.context("failed to start local SSH proxy transport")?
+        }
+        _ = cancellation.cancelled() => return Ok(()),
+    };
+    tokio::select! {
+        result = &mut running_session => return result.context("local SSH proxy connection failed"),
+        _ = cancellation.cancelled() => {}
+    }
+    drop(socket);
     running_session
         .await
         .context("local SSH proxy connection failed")
@@ -66,20 +90,25 @@ where
 
 pub(super) async fn start_ssh_proxy_listener(
     upstream_session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
-    listen_addr: SocketAddr,
+    listener: Arc<TcpListener>,
+    host_key: Arc<PrivateKey>,
     allowed_username: String,
     allowed_public_key: PublicKey,
 ) -> Result<SshProxyListener> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("failed to bind local SSH proxy listener to {listen_addr}"))?;
     let bound_addr = listener
         .local_addr()
         .context("failed to read local SSH proxy listener address")?;
-    let config = build_ssh_proxy_server_config()?;
+    let config = build_ssh_proxy_server_config(&host_key);
+    let cancellation = CancellationToken::new();
+    let cancelled = cancellation.clone();
     let task = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
         loop {
-            let accept_result = listener.accept().await;
+            let accept_result = tokio::select! {
+                _ = cancelled.cancelled() => break,
+                result = listener.accept(), if connections.len() < 256 => result,
+                _ = connections.join_next(), if !connections.is_empty() => continue,
+            };
             let (stream, remote_addr) = match accept_result {
                 Ok(parts) => parts,
                 Err(error) => {
@@ -91,6 +120,7 @@ pub(super) async fn start_ssh_proxy_listener(
                 "accepted local SSH proxy client from {remote_addr}"
             ));
             let config = Arc::clone(&config);
+            let cancellation = cancelled.clone();
             let handler = LocalSshProxyHandler {
                 allowed_username: allowed_username.clone(),
                 allow_unauthenticated: remote_addr.ip().is_loopback(),
@@ -98,16 +128,21 @@ pub(super) async fn start_ssh_proxy_listener(
                 upstream_session: Arc::clone(&upstream_session),
                 channels: Arc::new(AsyncMutex::new(HashMap::new())),
             };
-            tokio::spawn(async move {
-                if let Err(error) = run_local_ssh_proxy_connection(stream, config, handler).await {
+            connections.spawn(async move {
+                if let Err(error) =
+                    run_local_ssh_proxy_connection(stream, config, handler, cancellation).await
+                {
                     debug_log(format!("local SSH proxy connection failed: {error:#}"));
                 }
             });
         }
+        cancelled.cancel();
+        while connections.join_next().await.is_some() {}
     });
     Ok(SshProxyListener {
         listen_addr: bound_addr,
         task,
+        cancellation,
     })
 }
 

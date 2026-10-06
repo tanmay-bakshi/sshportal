@@ -25,20 +25,22 @@ use url::form_urlencoded;
 
 use sshportal::{
     ClientDecision, ClientHello, ControlPacket, DEFAULT_CONNECT_PATH, DEFAULT_HEALTH_PATH,
-    OfferedSession, OperatorKeyMaterial, PROTOCOL_VERSION, ServerOffer, SystemVpnPolicy, VpnScope,
-    harden_dynamic_library_search, load_operator_key, recv_packet, run_client_session_proxy,
-    run_operator_socks_proxy, run_operator_vpn, send_packet, websocket_config, websocket_to_io,
+    OfferedSession, OperatorKeyMaterial, OperatorSsh, OperatorVpn, PROTOCOL_VERSION,
+    ReconnectOffer, ReconnectOptions, ReconnectSecret, ReconnectSettings, ServerOffer, Shutdown,
+    SystemVpnPolicy, VpnScope, harden_dynamic_library_search, is_connection_loss,
+    load_operator_key, recv_packet, run_operator_socks_proxy, send_packet, websocket_config,
+    websocket_to_io,
 };
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sshportal-server",
     about = "Accept one consent-gated support client and expose SSH, SOCKS, or VPN access.",
-    long_about = "Run the server side of an sshportal support session. The server prints a one-time join token, accepts the first client that proves possession of it, and starts exactly one client-approved SSH, SOCKS, or VPN session.",
+    long_about = "Run the server side of an sshportal support session. The server prints a tokenized join URL and exposes one client-approved SSH, SOCKS, or VPN capability. With --reconnect on both endpoints, the same approved client can recover dropped transports within a bounded window.",
     after_help = "Examples:\n  sshportal-server --listen 0.0.0.0:8080 --ssh-listen 127.0.0.1:2222\n  sshportal-server --operator-key ./operator_ed25519 --persist-operator-key\n  sshportal-server --socks-only 127.0.0.1:1080\n  sudo sshportal-server --vpn\n  sudo sshportal-server --vpn --vpn-include-cidr 10.20.0.0/16 --vpn-include-domain anthem.com"
 )]
 struct ServerCli {
-    /// HTTP address for the one-time rendezvous endpoint.
+    /// HTTP address for the support rendezvous endpoint.
     #[arg(long, default_value = "0.0.0.0:8080", value_name = "ADDR")]
     listen: SocketAddr,
     /// Operator identity shown to the client user during consent.
@@ -108,6 +110,8 @@ struct ServerCli {
     /// suffixes; wildcard syntax is neither needed nor accepted.
     #[arg(long, value_name = "DOMAIN", requires = "vpn")]
     vpn_include_domain: Vec<String>,
+    #[command(flatten)]
+    reconnection: ReconnectOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -167,13 +171,32 @@ struct AppState {
     join_token: String,
     handshake_timeout: Duration,
     session_mode: ServerSessionMode,
+    reconnect: Option<ReconnectSettings>,
+    server_identity: ReconnectSecret,
+    approved_client: Mutex<Option<ClientHello>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RendezvousState {
     Accepting,
-    Negotiating,
+    Negotiating {
+        recovery_deadline: Option<tokio::time::Instant>,
+    },
+    Recovering {
+        deadline: tokio::time::Instant,
+    },
     Established,
+    Stopped,
+}
+
+impl RendezvousState {
+    fn recovery_deadline(self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Negotiating { recovery_deadline } => recovery_deadline,
+            Self::Recovering { deadline } => Some(deadline),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -201,13 +224,70 @@ struct NegotiationJob {
 }
 
 impl AppState {
+    async fn reopen(&self, settings: ReconnectSettings) -> oneshot::Receiver<EstablishedSession> {
+        let (sender, receiver) = oneshot::channel();
+        *self.session_sender.lock().await = Some(sender);
+        let mut status = self.status.write().await;
+        *status = SessionSummary {
+            phase: "reconnecting",
+            detail: "waiting for the approved client to reconnect",
+        };
+        self.rendezvous_state
+            .send_replace(RendezvousState::Recovering {
+                deadline: tokio::time::Instant::now()
+                    + Duration::from_secs(settings.timeout_seconds),
+            });
+        receiver
+    }
+
+    async fn reconnect_offer(&self, hello: &ClientHello) -> Result<Option<ReconnectOffer>> {
+        if let Some(approved) = self.approved_client.lock().await.as_ref() {
+            let requested = hello
+                .reconnect
+                .as_ref()
+                .context("this session requires resume credentials")?;
+            let previous = approved
+                .reconnect
+                .as_ref()
+                .expect("approved reconnect session has an identity");
+            if requested.client_identity != previous.client_identity
+                || requested.server_identity.as_ref() != Some(&self.server_identity)
+                || requested.settings != previous.settings
+                || hello.metadata != approved.metadata
+            {
+                bail!("resume credentials do not identify the approved client");
+            }
+        }
+        if hello
+            .reconnect
+            .as_ref()
+            .and_then(|hello| hello.server_identity.as_ref())
+            .is_some_and(|identity| *identity != self.server_identity)
+        {
+            bail!("server process identity changed; fresh approval is required");
+        }
+        match (self.reconnect, &hello.reconnect) {
+            (Some(local), Some(peer)) => Ok(Some(ReconnectOffer {
+                server_identity: self.server_identity.clone(),
+                settings: local.negotiate(peer.settings)?,
+            })),
+            _ => Ok(None),
+        }
+    }
+
     async fn try_begin_negotiation(&self) -> bool {
         let mut status = self.status.write().await;
         let claimed = self.rendezvous_state.send_if_modified(|rendezvous_state| {
-            if *rendezvous_state != RendezvousState::Accepting {
-                return false;
-            }
-            *rendezvous_state = RendezvousState::Negotiating;
+            let recovery_deadline = match *rendezvous_state {
+                RendezvousState::Accepting => None,
+                RendezvousState::Recovering { deadline }
+                    if deadline > tokio::time::Instant::now() =>
+                {
+                    Some(deadline)
+                }
+                _ => return false,
+            };
+            *rendezvous_state = RendezvousState::Negotiating { recovery_deadline };
             true
         });
         if claimed {
@@ -219,15 +299,44 @@ impl AppState {
     async fn release_negotiation(&self) {
         let mut status = self.status.write().await;
         let released = self.rendezvous_state.send_if_modified(|rendezvous_state| {
-            if *rendezvous_state != RendezvousState::Negotiating {
+            let RendezvousState::Negotiating { recovery_deadline } = *rendezvous_state else {
                 return false;
-            }
-            *rendezvous_state = RendezvousState::Accepting;
+            };
+            *rendezvous_state = match recovery_deadline {
+                Some(deadline) => RendezvousState::Recovering { deadline },
+                None => RendezvousState::Accepting,
+            };
             true
         });
         if released {
-            *status = SessionSummary::waiting();
+            *status = if self.rendezvous_state.borrow().recovery_deadline().is_some() {
+                SessionSummary {
+                    phase: "reconnecting",
+                    detail: "waiting for the approved client to reconnect",
+                }
+            } else {
+                SessionSummary::waiting()
+            };
         }
+    }
+
+    async fn retain_approval(&self, hello: &ClientHello, settings: ReconnectSettings) {
+        let mut approved = self.approved_client.lock().await;
+        if approved.is_none() {
+            *approved = Some(hello.clone());
+        }
+        // Approval owns a bounded lease even if its ready acknowledgement never reaches the peer.
+        self.rendezvous_state.send_if_modified(|state| {
+            let RendezvousState::Negotiating { recovery_deadline } = state else {
+                return false;
+            };
+            if recovery_deadline.is_some() {
+                return false;
+            }
+            *recovery_deadline =
+                Some(tokio::time::Instant::now() + Duration::from_secs(settings.timeout_seconds));
+            true
+        });
     }
 
     async fn mark_established(&self) {
@@ -267,6 +376,7 @@ impl ServerSessionMode {
         };
         ServerOffer {
             protocol_version: PROTOCOL_VERSION,
+            reconnect: None,
             operator_name,
             session,
         }
@@ -278,6 +388,7 @@ struct EstablishedSession {
     client_hello: ClientHello,
     transport_local: SocketAddr,
     transport_peer: SocketAddr,
+    reconnect: Option<ReconnectSettings>,
 }
 
 fn main() -> Result<()> {
@@ -291,7 +402,10 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = ServerCli::parse();
+    let shutdown = Shutdown::new()?;
+    let reconnect = cli.reconnection.settings()?;
     let session_mode = resolve_session_mode(&cli)?;
+    let mut frontend = SessionFrontend::bind(&session_mode).await?;
     let join_token = resolve_join_token(cli.join_token)?;
 
     let listener = TcpListener::bind(cli.listen)
@@ -310,6 +424,9 @@ async fn run() -> Result<()> {
         join_token: join_token.clone(),
         handshake_timeout: Duration::from_secs(cli.handshake_timeout_seconds),
         session_mode,
+        reconnect,
+        server_identity: ReconnectSecret::generate(),
+        approved_client: Mutex::new(None),
     });
 
     println!("sshportal server listening on http://{bound_address}");
@@ -364,70 +481,146 @@ async fn run() -> Result<()> {
         }
     }
 
-    let mut http_task = tokio::spawn(run_http_server(
+    let mut http_task = Some(tokio::spawn(run_http_server(
         listener,
         Arc::clone(&state),
         RendezvousLimits::default(),
-    ));
-    let established_session =
-        wait_for_established_session(session_receiver, &mut http_task).await?;
-    http_task
-        .await
-        .context("HTTP server task failed to join")??;
-    {
-        let mut status = state.status.write().await;
-        *status = SessionSummary::connected();
+    )));
+    let result = serve_sessions(
+        &state,
+        &mut frontend,
+        session_receiver,
+        &mut http_task,
+        &shutdown,
+    )
+    .await;
+    state
+        .rendezvous_state
+        .send_replace(RendezvousState::Stopped);
+    if let Some(task) = http_task.take() {
+        task.await.context("HTTP server task failed to join")??;
     }
-    let session_result = match &state.session_mode {
-        ServerSessionMode::Ssh {
-            operator_key,
-            ssh_listen,
-            dynamic_forward,
-        } => {
-            let transport = websocket_to_io(established_session.websocket);
-            run_client_session_proxy(
-                transport,
-                &established_session.client_hello.metadata.username,
-                Arc::clone(operator_key.private_key()),
-                *ssh_listen,
-                *dynamic_forward,
-            )
-            .await
-        }
-        ServerSessionMode::Socks { listen_addr } => {
-            run_operator_socks_proxy(established_session.websocket, *listen_addr).await
-        }
-        ServerSessionMode::VpnSystem { policy } => {
-            run_operator_vpn(
-                established_session.websocket,
-                established_session.transport_local,
-                established_session.transport_peer,
-                policy.clone(),
-            )
-            .await
-        }
-    };
-    {
-        let mut status = state.status.write().await;
-        match &session_result {
-            Ok(()) => *status = SessionSummary::finished(),
-            Err(_error) => *status = SessionSummary::failed(),
+    result
+}
+
+enum SessionFrontend {
+    Ssh(OperatorSsh),
+    Socks(Arc<TcpListener>),
+    Vpn(OperatorVpn),
+}
+
+impl SessionFrontend {
+    async fn bind(mode: &ServerSessionMode) -> Result<Self> {
+        match mode {
+            ServerSessionMode::Ssh {
+                ssh_listen,
+                dynamic_forward,
+                ..
+            } => Ok(Self::Ssh(
+                OperatorSsh::bind(*ssh_listen, *dynamic_forward).await?,
+            )),
+            ServerSessionMode::Socks { listen_addr } => Ok(Self::Socks(Arc::new(
+                TcpListener::bind(listen_addr)
+                    .await
+                    .with_context(|| format!("failed to bind SOCKS5 proxy to {listen_addr}"))?,
+            ))),
+            ServerSessionMode::VpnSystem { policy } => {
+                Ok(Self::Vpn(OperatorVpn::new(policy.clone())))
+            }
         }
     }
-    session_result?;
-    Ok(())
+
+    async fn run(
+        &mut self,
+        state: &AppState,
+        session: EstablishedSession,
+        shutdown: &Shutdown,
+    ) -> Result<()> {
+        if let Self::Vpn(vpn) = self {
+            return vpn
+                .run(
+                    session.websocket,
+                    session.transport_local,
+                    session.transport_peer,
+                    shutdown.token.clone(),
+                )
+                .await;
+        }
+        let run = async {
+            match (self, &state.session_mode) {
+                (Self::Ssh(proxy), ServerSessionMode::Ssh { operator_key, .. }) => {
+                    proxy
+                        .run(
+                            websocket_to_io(session.websocket),
+                            &session.client_hello.metadata.username,
+                            Arc::clone(operator_key.private_key()),
+                        )
+                        .await
+                }
+                (Self::Socks(listener), _) => {
+                    run_operator_socks_proxy(session.websocket, Arc::clone(listener)).await
+                }
+                _ => unreachable!("the frontend is bound from its immutable session mode"),
+            }
+        };
+        tokio::select! {
+            _ = shutdown.token.cancelled() => Ok(()),
+            result = run => result,
+        }
+    }
+}
+
+async fn serve_sessions(
+    state: &Arc<AppState>,
+    frontend: &mut SessionFrontend,
+    mut receiver: oneshot::Receiver<EstablishedSession>,
+    http_task: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    shutdown: &Shutdown,
+) -> Result<()> {
+    loop {
+        let established = tokio::select! {
+            _ = shutdown.token.cancelled() => return Ok(()),
+            result = wait_for_established_session(receiver, http_task) => result?,
+        };
+        *state.status.write().await = SessionSummary::connected();
+        let settings = established.reconnect;
+        let result = frontend.run(state, established, shutdown).await;
+        if shutdown.token.is_cancelled() {
+            return result;
+        }
+        *state.status.write().await = if result.is_ok() {
+            SessionSummary::finished()
+        } else {
+            SessionSummary::failed()
+        };
+        let Some(settings) = settings else {
+            return result;
+        };
+        if let Err(error) = &result {
+            if !is_connection_loss(error) {
+                return result;
+            }
+            eprintln!("support connection lost: {error:#}");
+        } else {
+            eprintln!("support connection closed");
+        }
+        receiver = state.reopen(settings).await;
+        println!(
+            "waiting up to {} seconds for the approved client to reconnect",
+            settings.timeout_seconds
+        );
+    }
 }
 
 async fn wait_for_established_session(
     session_receiver: oneshot::Receiver<EstablishedSession>,
-    http_task: &mut tokio::task::JoinHandle<Result<()>>,
+    http_task: &mut Option<tokio::task::JoinHandle<Result<()>>>,
 ) -> Result<EstablishedSession> {
     tokio::select! {
         biased;
-        result = session_receiver => {
-            result.context("server shut down before any client session started")
-        }
-        result = http_task => {
+        result = session_receiver => result.context("server shut down before any client session started"),
+        result = http_task.as_mut().expect("HTTP server task remains owned") => {
+            http_task.take();
             result.context("HTTP server task failed to join")??;
             bail!("HTTP server stopped before any client session started");
         }
@@ -460,15 +653,28 @@ async fn run_http_server(
     let mut rendezvous_state = *state_updates.borrow_and_update();
 
     let server_result = loop {
-        if rendezvous_state == RendezvousState::Established {
+        if rendezvous_state == RendezvousState::Stopped
+            || (rendezvous_state == RendezvousState::Established
+                && state.approved_client.lock().await.is_none())
+        {
             break Ok(());
         }
         tokio::select! {
+            biased;
             changed = state_updates.changed() => {
                 if changed.is_err() {
                     break Err(anyhow!("HTTP rendezvous state channel closed unexpectedly"));
                 }
                 rendezvous_state = *state_updates.borrow_and_update();
+            }
+            _ = async {
+                match rendezvous_state.recovery_deadline() {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                state.rendezvous_state.send_replace(RendezvousState::Stopped);
+                break Err(anyhow!("approved client did not reconnect before the recovery window expired"));
             }
             accepted = async {
                 let permit = Arc::clone(&admission)
@@ -477,14 +683,14 @@ async fn run_http_server(
                     .expect("HTTP admission semaphore remains open");
                 let (stream, peer_addr) = listener.accept().await?;
                 Ok::<_, std::io::Error>((stream, peer_addr, permit))
-            }, if rendezvous_state == RendezvousState::Accepting => {
+            }, if matches!(rendezvous_state, RendezvousState::Accepting | RendezvousState::Recovering { .. } | RendezvousState::Established) => {
                 let (stream, peer_addr, permit) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
                         break Err(error).context("failed to accept HTTP connection");
                     }
                 };
-                if *state_updates.borrow() != RendezvousState::Accepting {
+                if matches!(*state_updates.borrow(), RendezvousState::Negotiating { .. } | RendezvousState::Stopped) {
                     drop(stream);
                     continue;
                 }
@@ -712,11 +918,10 @@ async fn run_negotiation(job: NegotiationJob, state: Arc<AppState>) -> Result<()
             bail!("support session receiver is unavailable");
         }
     };
+    state.mark_established().await;
     if sender.send(established_session).is_err() {
-        state.mark_established().await;
         bail!("support session receiver closed before accepting the established session");
     }
-    state.mark_established().await;
     Ok(())
 }
 
@@ -726,11 +931,41 @@ async fn handle_support_session(
     transport_local: SocketAddr,
     transport_peer: SocketAddr,
 ) -> Result<EstablishedSession> {
-    let client_hello = match recv_packet(&mut websocket).await? {
+    let packet = match recv_packet(&mut websocket).await {
+        Ok(packet) => packet,
+        Err(error) => {
+            if !is_connection_loss(&error) {
+                let _ = send_packet(
+                    &mut websocket,
+                    &ControlPacket::SessionRejected {
+                        reason: "invalid client handshake or unsupported protocol version"
+                            .to_string(),
+                    },
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+    let client_hello = match packet {
         ControlPacket::ClientHello(hello) => hello,
         unexpected => bail!("expected client_hello packet, received {unexpected:?}"),
     };
-    let offer = state.session_mode.offer(state.operator_name.clone());
+    let reconnect = match state.reconnect_offer(&client_hello).await {
+        Ok(reconnect) => reconnect,
+        Err(error) => {
+            send_packet(
+                &mut websocket,
+                &ControlPacket::SessionRejected {
+                    reason: error.to_string(),
+                },
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let mut offer = state.session_mode.offer(state.operator_name.clone());
+    offer.reconnect = reconnect.clone();
     send_packet(&mut websocket, &ControlPacket::ServerOffer(offer)).await?;
 
     let decision = match recv_packet(&mut websocket).await? {
@@ -742,11 +977,17 @@ async fn handle_support_session(
         eprintln!("client note: {note}");
     }
 
+    if let Some(offer) = &reconnect {
+        state.retain_approval(&client_hello, offer.settings).await;
+    }
+    send_packet(&mut websocket, &ControlPacket::SessionReady {}).await?;
+
     Ok(EstablishedSession {
         websocket,
         client_hello,
         transport_local,
         transport_peer,
+        reconnect: reconnect.map(|offer| offer.settings),
     })
 }
 
@@ -874,8 +1115,132 @@ mod tests {
     };
     use sshportal::{
         ClientDecision, ClientHello, ClientMetadata, ControlPacket, DEFAULT_CONNECT_PATH,
-        OperatorKeyMaterial, PROTOCOL_VERSION, Platform, recv_packet, send_packet,
+        OperatorKeyMaterial, PROTOCOL_VERSION, Platform, ReconnectHello, ReconnectSecret,
+        ReconnectSettings, recv_packet, send_packet,
     };
+
+    #[test]
+    fn reconnect_parameters_require_explicit_enablement() {
+        for arguments in [
+            vec!["sshportal-server", "--reconnect-timeout-seconds", "20"],
+            vec![
+                "sshportal-server",
+                "--reconnect",
+                "--reconnect-interval-seconds",
+                "0",
+            ],
+        ] {
+            assert!(ServerCli::try_parse_from(arguments).is_err());
+        }
+        let cli = ServerCli::try_parse_from(["sshportal-server", "--reconnect"]).unwrap();
+        assert_eq!(
+            cli.reconnection.settings().unwrap(),
+            Some(ReconnectSettings {
+                interval_seconds: 5,
+                timeout_seconds: 300
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_admission_pins_credentials_and_client_environment() {
+        let (mut state, _) = test_state(Duration::from_secs(1));
+        Arc::get_mut(&mut state).unwrap().reconnect = Some(ReconnectSettings {
+            interval_seconds: 5,
+            timeout_seconds: 300,
+        });
+        let initial = ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            metadata: ClientMetadata {
+                hostname: "client".to_string(),
+                username: "user".to_string(),
+                working_directory: "/work".to_string(),
+                platform: Platform::current().unwrap(),
+            },
+            reconnect: Some(ReconnectHello {
+                client_identity: ReconnectSecret::generate(),
+                server_identity: None,
+                settings: ReconnectSettings {
+                    interval_seconds: 2,
+                    timeout_seconds: 60,
+                },
+            }),
+        };
+        let offer = state.reconnect_offer(&initial).await.unwrap().unwrap();
+        assert_eq!(
+            offer.settings,
+            ReconnectSettings {
+                interval_seconds: 5,
+                timeout_seconds: 60
+            }
+        );
+        *state.approved_client.lock().await = Some(initial.clone());
+        assert!(state.reconnect_offer(&initial).await.is_err());
+        let mut resumed = initial;
+        resumed.reconnect.as_mut().unwrap().server_identity = Some(offer.server_identity);
+        state.reconnect_offer(&resumed).await.unwrap();
+        let mut changed = resumed.clone();
+        changed.reconnect.as_mut().unwrap().client_identity = ReconnectSecret::generate();
+        assert!(state.reconnect_offer(&changed).await.is_err());
+        let mut changed = resumed.clone();
+        changed.metadata.username = "another-user".to_string();
+        assert!(state.reconnect_offer(&changed).await.is_err());
+        resumed.reconnect.as_mut().unwrap().server_identity = Some(ReconnectSecret::generate());
+        assert!(state.reconnect_offer(&resumed).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_and_failed_negotiations_share_one_bounded_lease() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (state, _receiver) = test_state(Duration::from_secs(30));
+        let settings = ReconnectSettings {
+            interval_seconds: 1,
+            timeout_seconds: 2,
+        };
+        let hello = ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            metadata: ClientMetadata {
+                hostname: "client".to_string(),
+                username: "user".to_string(),
+                working_directory: "/work".to_string(),
+                platform: Platform::current().unwrap(),
+            },
+            reconnect: Some(ReconnectHello {
+                client_identity: ReconnectSecret::generate(),
+                server_identity: None,
+                settings,
+            }),
+        };
+        assert!(state.try_begin_negotiation().await);
+        state.retain_approval(&hello, settings).await;
+        let deadline = state.rendezvous_state.borrow().recovery_deadline().unwrap();
+        state.release_negotiation().await;
+        assert_eq!(
+            state.rendezvous_state.borrow().recovery_deadline(),
+            Some(deadline)
+        );
+        assert!(state.try_begin_negotiation().await);
+        state.retain_approval(&hello, settings).await;
+        assert_eq!(
+            state.rendezvous_state.borrow().recovery_deadline(),
+            Some(deadline)
+        );
+
+        // An unfinished handshake cannot outlive the approval lease's absolute deadline.
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_http_server(
+                listener,
+                Arc::clone(&state),
+                test_limits(8, Duration::from_secs(2)),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("recovery window expired"));
+        assert!(!state.try_begin_negotiation().await);
+    }
 
     #[test]
     fn explicit_join_token_is_preserved() {
@@ -1295,6 +1660,7 @@ mod tests {
             &mut client,
             &ControlPacket::ClientHello(ClientHello {
                 protocol_version: PROTOCOL_VERSION,
+                reconnect: None,
                 metadata: ClientMetadata {
                     hostname: "test-client".to_string(),
                     username: "test-user".to_string(),
@@ -1346,12 +1712,13 @@ mod tests {
     async fn established_session_wait_fails_when_the_http_task_stops_first() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (state, session_receiver) = test_state(Duration::from_secs(1));
-        let mut server_task = tokio::spawn(run_http_server(
+        let server_task = tokio::spawn(run_http_server(
             listener,
             Arc::clone(&state),
             test_limits(0, Duration::from_secs(1)),
         ));
 
+        let mut server_task = Some(server_task);
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             wait_for_established_session(session_receiver, &mut server_task),
@@ -1380,6 +1747,9 @@ mod tests {
             operator_name: "support".to_string(),
             join_token: "join-token".to_string(),
             handshake_timeout,
+            reconnect: None,
+            server_identity: ReconnectSecret::generate(),
+            approved_client: Mutex::new(None),
             session_mode: ServerSessionMode::Ssh {
                 operator_key: test_operator_key_material(),
                 ssh_listen: "127.0.0.1:0".parse().unwrap(),
@@ -1402,7 +1772,7 @@ mod tests {
     ) {
         state
             .rendezvous_state
-            .send_replace(RendezvousState::Established);
+            .send_replace(RendezvousState::Stopped);
         tokio::time::timeout(Duration::from_secs(1), server_task)
             .await
             .expect("HTTP rendezvous did not stop")

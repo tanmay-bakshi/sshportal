@@ -10,10 +10,13 @@
 
 The project ships two binaries:
 
-- `sshportal-server` hosts the one-time rendezvous endpoint and exposes the selected capability on the operator's machine.
+- `sshportal-server` hosts the consent-gated rendezvous endpoint and exposes the selected capability on the operator's machine.
 - `sshportal-client` connects back, presents the requested capability for consent, and provides network or shell access from the client environment.
 
-The server accepts one client at a time. Once the consent handshake succeeds, it closes the HTTP listener and keeps only that session's WebSocket alive. There is no persistent client daemon, background control plane, or multi-session broker.
+The server accepts one client at a time. With reconnection disabled, it closes the HTTP listener
+after consent and keeps only that session's WebSocket alive. Automatic reconnection keeps the
+rendezvous available for the approved client while the endpoint processes remain running. There
+is no persistent client daemon or multi-session broker.
 
 The server generates a fresh random join token on each launch. To supply a token in any session
 mode, use `--join-token`:
@@ -25,6 +28,48 @@ sshportal-server --join-token 'my-shared-token'
 The token must be nonempty and is used exactly as supplied, including whitespace and special
 characters. The printed WebSocket URL encodes the complete token for the client; when using a public
 HTTPS origin, preserve that URL's encoded `token` query parameter. Client consent is still required.
+
+## Automatic Reconnection
+
+Enable `--reconnect` on both endpoints to recover dropped connections in SSH, SOCKS, or VPN mode:
+
+```bash
+sshportal-server --socks-only 127.0.0.1:1080 --reconnect
+sshportal-client --server 'https://support.example?token=<printed-token>' --reconnect
+```
+
+The default retry interval is **5 seconds**, and each recovery window lasts **300 seconds**.
+Override either value with `--reconnect-interval-seconds` and `--reconnect-timeout-seconds` on
+either endpoint. Both require `--reconnect`, accept whole seconds from 1 to 86400, and require an
+interval shorter than the timeout. The peers negotiate the slower interval and shorter timeout;
+settings with no shared recovery window are rejected. The client also retries initial connection
+failures within its own configured window. The server's initial wait for its first client has no
+deadline. When only one endpoint enables the mode, an approved session remains a single connection.
+
+Recovery starts after transport loss is detected and session teardown finishes. Connection attempts,
+handshakes, and delays share an absolute deadline, so failed attempts cannot extend a recovery
+window. A successful approved handshake starts a new transport epoch. Network keepalives detect
+silent transport failures; detection time is separate from the recovery timeout.
+
+The initial consent prompt explicitly includes reconnection. The running client retains that
+approval only for the same server process, operator identity, SSH key or network policy, and
+reconnection settings. A private, randomly generated client credential binds resumption to the
+approved client; knowing the original join token does not permit another client to take over.
+Resume credentials stay in memory, are absent from URLs and debug output, and are checked using
+constant-time comparison. Restarting either process requires a new initial session and consent.
+Consent denial, invalid TLS certificates, changed capabilities, and local configuration or cleanup
+failures stop recovery. Ctrl-C, SIGTERM/SIGHUP on POSIX, or Ctrl-Break on Windows stops the process.
+
+The local SSH/SOCKS ports and SSH proxy host key stay stable across transports. Each VPN transport
+installs its own host-network transaction and restores routes and DNS before recovery begins.
+During an outage, the host's ordinary routing applies; this mode does not provide a kill switch.
+VPN address ranges and synthetic DNS mappings retain their identity so cached addresses continue
+to identify the same hostnames. A newly conflicting host route stops recovery rather than changing
+those address identities.
+
+Recovery restores access for **new connections**. Existing TCP/UDP flows and interactive SSH shells
+end with the dropped transport; they are not replayed or resumed. Both binaries must implement
+control protocol version 8.
 
 ## SSH Mode
 

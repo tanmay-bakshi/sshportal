@@ -362,14 +362,19 @@ impl<E: CommandExecutor> PreparedHostNetwork<E> {
     }
 }
 
+pub(super) enum AddressSelection {
+    Fresh([u8; 16]),
+    Retained(VpnNetworkConfiguration),
+}
+
 pub(super) fn prepare(
     policy: &SystemVpnPolicy,
-    entropy: [u8; 16],
+    selection: AddressSelection,
     transport_peer: IpAddr,
 ) -> Result<PreparedHostNetwork> {
     prepare_with(
         policy,
-        entropy,
+        selection,
         transport_peer,
         Platform::current()?,
         SystemCommandExecutor,
@@ -379,7 +384,7 @@ pub(super) fn prepare(
 
 fn prepare_with<E: CommandExecutor>(
     policy: &SystemVpnPolicy,
-    entropy: [u8; 16],
+    selection: AddressSelection,
     transport_peer: IpAddr,
     platform: Platform,
     executor: E,
@@ -400,8 +405,15 @@ fn prepare_with<E: CommandExecutor>(
             if transport_peer.is_ipv4() { 32 } else { 128 },
         )?],
     );
-    let network =
-        VpnNetworkConfiguration::select(&address_conflicts, entropy, policy.uses_virtual_dns())?;
+    let network = match selection {
+        AddressSelection::Fresh(entropy) => {
+            VpnNetworkConfiguration::select(&address_conflicts, entropy, policy.uses_virtual_dns())?
+        }
+        AddressSelection::Retained(network) => {
+            network.validate_available(&address_conflicts)?;
+            network
+        }
+    };
     Ok(PreparedHostNetwork {
         executor,
         platform,
@@ -4060,6 +4072,36 @@ mod tests {
     }
 
     #[test]
+    fn resume_retains_vpn_address_ranges_and_refuses_new_collisions() {
+        let policy = SystemVpnPolicy::full_tunnel();
+        let network = selected_network(true);
+        let temp = TempDir::new().unwrap();
+        let prepared = prepare_with(
+            &policy,
+            AddressSelection::Retained(network),
+            "203.0.113.8".parse().unwrap(),
+            Platform::Linux,
+            MockExecutor::with_outputs([
+                Ok(CommandOutput::success("")),
+                Ok(CommandOutput::success("")),
+            ]),
+            journal_store(&temp),
+        )
+        .unwrap();
+        assert_eq!(prepared.network_configuration(), network);
+        assert!(
+            network
+                .validate_available(&[IpNet::V4(network.synthetic.unwrap().ipv4)])
+                .is_err()
+        );
+        assert!(
+            network
+                .validate_available(&[IpNet::V6(network.point_to_point_ipv6)])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn policy_cidrs_are_reserved_from_internal_and_synthetic_address_selection() {
         let entropy = [29; 16];
         let baseline = VpnNetworkConfiguration::select(&[], entropy, true).unwrap();
@@ -4075,7 +4117,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let prepared = prepare_with(
             &policy,
-            entropy,
+            AddressSelection::Fresh(entropy),
             "203.0.113.7".parse().unwrap(),
             Platform::Linux,
             MockExecutor::with_outputs([
@@ -4100,7 +4142,7 @@ mod tests {
         let ipv4_temp = TempDir::new().unwrap();
         let ipv4 = prepare_with(
             &policy,
-            entropy,
+            AddressSelection::Fresh(entropy),
             IpAddr::V4(baseline.gateway_ipv4),
             Platform::Linux,
             MockExecutor::with_outputs([
@@ -4117,7 +4159,7 @@ mod tests {
         let ipv6_temp = TempDir::new().unwrap();
         let ipv6 = prepare_with(
             &policy,
-            entropy,
+            AddressSelection::Fresh(entropy),
             IpAddr::V6(ipv6_peer),
             Platform::Linux,
             MockExecutor::with_outputs([

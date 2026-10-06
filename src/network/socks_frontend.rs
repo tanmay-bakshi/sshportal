@@ -74,14 +74,11 @@ struct SocksUdpWorkerCompletion {
 
 pub async fn run_operator_socks_proxy<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
-    listen_addr: SocketAddr,
+    listener: Arc<TcpListener>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("failed to bind SOCKS5 proxy to {listen_addr}"))?;
     let bound_addr = listener
         .local_addr()
         .context("failed to read SOCKS5 proxy listener address")?;
@@ -91,7 +88,7 @@ where
 
 async fn run_operator_network_proxy_with_listener<S>(
     websocket: tokio_tungstenite::WebSocketStream<S>,
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -103,7 +100,7 @@ where
 async fn run_socks_listener(
     session: OperatorNetworkSession,
     runtime: NetworkSessionRuntime,
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
 ) -> Result<()> {
     let mut flows = JoinSet::new();
     let session_result = {
@@ -594,6 +591,7 @@ fn socks_reply_for_error(error: &NetworkError) -> u8 {
 mod tests {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -654,7 +652,7 @@ mod tests {
             run_client_network_session(client_websocket, OfferedSession::Socks {}).await
         });
         let operator_task = tokio::spawn(async move {
-            run_operator_network_proxy_with_listener(operator_websocket, listener).await
+            run_operator_network_proxy_with_listener(operator_websocket, Arc::new(listener)).await
         });
         NetworkProxyHarness {
             socks_address,

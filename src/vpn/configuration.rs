@@ -45,6 +45,24 @@ pub(super) struct SyntheticNetworkConfiguration {
 }
 
 impl VpnNetworkConfiguration {
+    pub(super) fn validate_available(self, existing_routes: &[IpNet]) -> Result<()> {
+        let mut networks = vec![
+            IpNet::V4(self.point_to_point_ipv4),
+            IpNet::V6(self.point_to_point_ipv6),
+        ];
+        if let Some(synthetic) = self.synthetic {
+            networks.extend(synthetic.routes());
+        }
+        for network in networks {
+            if !route_is_available(network, existing_routes) {
+                bail!(
+                    "retained VPN address range {network} conflicts with the current network; restart the session to select new ranges"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn select(
         existing_routes: &[IpNet],
         entropy: [u8; 16],

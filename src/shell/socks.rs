@@ -32,6 +32,11 @@ impl DynamicForwardListener {
     pub(super) fn local_addr(&self) -> SocketAddr {
         self.listen_addr
     }
+
+    pub(super) async fn shutdown(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for DynamicForwardListener {
@@ -42,11 +47,8 @@ impl Drop for DynamicForwardListener {
 
 pub(super) async fn start_dynamic_forward_listener(
     session: Arc<AsyncMutex<client::Handle<NoopClientHandler>>>,
-    listen_addr: SocketAddr,
+    listener: Arc<TcpListener>,
 ) -> Result<DynamicForwardListener> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("failed to bind dynamic forward listener to {listen_addr}"))?;
     let bound_addr = listener
         .local_addr()
         .context("failed to read dynamic forward listener address")?;

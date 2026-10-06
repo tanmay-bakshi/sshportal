@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -53,12 +53,13 @@ impl VpnRuntime {
         session: OperatorNetworkSession,
         network: VpnNetworkConfiguration,
         policy: SystemVpnPolicy,
-    ) -> Result<Self>
+        mappings: Arc<Mutex<SyntheticAddressMap>>,
+    ) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let transport = SessionPacketTransport::new(session, network, policy)?;
+        let transport = SessionPacketTransport::new(session, network, policy, mappings);
         let limits = PacketEngineLimits {
             mtu: super::VPN_MTU as usize,
             ..PacketEngineLimits::default()
@@ -74,7 +75,7 @@ impl VpnRuntime {
         let task = AbortOnDropHandle::new(tokio::spawn(run_packet_loop(
             reader, writer, engine, transport,
         )));
-        Ok(Self { task: Some(task) })
+        Self { task: Some(task) }
     }
 
     pub(super) async fn wait(&mut self) -> Result<()> {
@@ -405,7 +406,7 @@ struct SessionPacketTransport {
     udp_credits: HashMap<FlowId, CreditEntry<UdpReceiveCredit>>,
     output_bytes: Arc<Semaphore>,
     output_ready: Arc<Notify>,
-    mappings: SyntheticAddressMap,
+    mappings: Arc<Mutex<SyntheticAddressMap>>,
     synthetic: Option<SyntheticNetworkConfiguration>,
     health_servers: [SocketAddr; 2],
 }
@@ -415,9 +416,9 @@ impl SessionPacketTransport {
         session: OperatorNetworkSession,
         network: VpnNetworkConfiguration,
         policy: SystemVpnPolicy,
-    ) -> Result<Self> {
+        mappings: Arc<Mutex<SyntheticAddressMap>>,
+    ) -> Self {
         let synthetic = network.synthetic;
-        let mappings = synthetic_address_map(synthetic)?;
         let (open_sender, open_receiver) = mpsc::channel(OPEN_REQUESTS);
         let (lifecycle_sender, lifecycle_events) = mpsc::channel(RUNTIME_EVENTS);
         let (data_sender, data_events) = mpsc::channel(RUNTIME_EVENTS);
@@ -432,7 +433,7 @@ impl SessionPacketTransport {
             open_receiver,
             event_senders,
         )));
-        Ok(Self {
+        Self {
             open_sender,
             lifecycle_events,
             data_events,
@@ -449,11 +450,17 @@ impl SessionPacketTransport {
                 SocketAddr::from((network.gateway_ipv4, super::DATA_PLANE_HEALTH_PORT)),
                 SocketAddr::from((network.gateway_ipv6, super::DATA_PLANE_HEALTH_PORT)),
             ],
-        })
+        }
     }
 
     fn target_for(&self, address: SocketAddr) -> Result<NetworkTarget, NetworkError> {
-        network_target_for(&self.mappings, self.synthetic, address)
+        let mappings = self.mappings.lock().map_err(|_| {
+            NetworkError::new(
+                NetworkErrorKind::General,
+                "VPN DNS mapping lock is poisoned",
+            )
+        })?;
+        network_target_for(&mappings, self.synthetic, address)
     }
 
     fn is_dns_server(&self, address: SocketAddr) -> bool {
@@ -570,7 +577,11 @@ impl SessionPacketTransport {
         outcome: ResolveOutcome,
         transport: DnsTransport,
     ) -> Result<PacketCommand> {
-        synthesize_dns_command(flow_id, query, outcome, transport, &mut self.mappings)
+        let mut mappings = self
+            .mappings
+            .lock()
+            .map_err(|_| anyhow!("VPN DNS mapping lock is poisoned"))?;
+        synthesize_dns_command(flow_id, query, outcome, transport, &mut mappings)
     }
 
     fn discard_command(&mut self, command: &PacketCommand) -> Result<()> {
@@ -673,7 +684,7 @@ fn synthesize_dns_command(
     })
 }
 
-fn synthetic_address_map(
+pub(super) fn synthetic_address_map(
     synthetic: Option<SyntheticNetworkConfiguration>,
 ) -> Result<SyntheticAddressMap> {
     let Some(synthetic) = synthetic else {
@@ -2010,8 +2021,8 @@ fn dns_resolution(outcome: ResolveOutcome) -> Result<Resolution> {
 mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use bytes::BytesMut;
@@ -2024,13 +2035,15 @@ mod tests {
         BufferedBytes, CreditEntry, DataRuntimeEvent, DnsQuery, DnsTransport, FLOW_OUTPUT_MESSAGES,
         FlowOutputEvent, FlowOutputHandle, LifecycleRuntimeEvent, NetworkError, NetworkErrorKind,
         PacketCommand, ReceiveCredit, Resolution, ResolutionFamily, ResolveOutcome,
-        RuntimeEventSenders, SyntheticAddressMap, SyntheticNetworkConfiguration, SystemVpnPolicy,
-        TcpFlowOutput, TcpOutput, TransportSendError, UdpOutput, VpnRuntime, dns_query_allowed,
-        emit_dns_refused, flow_output, network_target_for, run_dns_tcp_flow, run_health_udp_flow,
-        synthesize_dns_command, take_dns_tcp_frame,
+        RuntimeEventSenders, SessionPacketTransport, SyntheticAddressMap,
+        SyntheticNetworkConfiguration, SystemVpnPolicy, TcpFlowOutput, TcpOutput,
+        TransportSendError, UdpOutput, VpnRuntime, dns_query_allowed, emit_dns_refused,
+        flow_output, network_target_for, run_dns_tcp_flow, run_health_udp_flow,
+        synthesize_dns_command, synthetic_address_map, take_dns_tcp_frame,
     };
     use crate::control::{OfferedSession, VpnScope};
     use crate::network::{run_client_network_proxy, start_operator_network_session};
+    use crate::vpn::configuration::VpnNetworkConfiguration;
     use crate::vpn::dns::{DnsName, Ipv4Pool, Ipv6Pool};
     use crate::vpn::packet::{FlowId, TcpOpenRequest, UdpOpenRequest};
 
@@ -2098,6 +2111,65 @@ mod tests {
                 Ipv6Pool::new(configuration.ipv6_first, configuration.ipv6_last, 128, []).unwrap(),
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn cached_dns_targets_survive_replacement_of_packet_transports() {
+        let network = VpnNetworkConfiguration::select(&[], [41; 16], true).unwrap();
+        let mappings = Arc::new(Mutex::new(
+            synthetic_address_map(network.synthetic).unwrap(),
+        ));
+        let name = DnsName::from_ascii("jira.elevancehealth.com").unwrap();
+        let ipv4 = mappings
+            .lock()
+            .unwrap()
+            .get_or_allocate_ipv4(&name)
+            .unwrap();
+        let ipv6 = mappings
+            .lock()
+            .unwrap()
+            .get_or_allocate_ipv6(&name)
+            .unwrap();
+
+        for _ in 0..2 {
+            let (operator_io, client_io) = tokio::io::duplex(64 * 1024);
+            let operator = WebSocketStream::from_raw_socket(operator_io, Role::Server, None).await;
+            let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let policy = SystemVpnPolicy::full_tunnel();
+            let client = AbortOnDropHandle::new(tokio::spawn(run_client_network_proxy(
+                client,
+                OfferedSession::Vpn {
+                    scope: VpnScope::System {
+                        policy: policy.clone(),
+                    },
+                },
+            )));
+            let (session, runtime) = start_operator_network_session(operator).await.unwrap();
+            let transport =
+                SessionPacketTransport::new(session, network, policy, Arc::clone(&mappings));
+            for address in [IpAddr::V4(ipv4), IpAddr::V6(ipv6)] {
+                assert_eq!(
+                    transport
+                        .target_for(SocketAddr::new(address, 443))
+                        .unwrap()
+                        .host,
+                    "jira.elevancehealth.com"
+                );
+            }
+            let other = DnsName::from_ascii("other.elevancehealth.com").unwrap();
+            assert_ne!(
+                mappings
+                    .lock()
+                    .unwrap()
+                    .get_or_allocate_ipv4(&other)
+                    .unwrap(),
+                ipv4
+            );
+            drop(transport);
+            drop(runtime);
+            client.abort();
+            let _ = client.await;
+        }
     }
 
     #[test]

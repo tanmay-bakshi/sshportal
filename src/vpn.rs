@@ -10,10 +10,12 @@ mod runtime;
 pub use policy::SystemVpnPolicy;
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::network::start_operator_network_session;
@@ -22,166 +24,141 @@ pub(super) const VPN_MTU: u16 = 1_500;
 pub(super) const DATA_PLANE_HEALTH_PORT: u16 = 49_152;
 const NETWORK_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[cfg(unix)]
-struct ShutdownSignals {
-    interrupt: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
-    hangup: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-impl ShutdownSignals {
-    fn new() -> Result<Self> {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        Ok(Self {
-            interrupt: signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?,
-            terminate: signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?,
-            hangup: signal(SignalKind::hangup()).context("failed to listen for SIGHUP")?,
-        })
-    }
-
-    async fn recv(&mut self) {
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-            _ = self.hangup.recv() => {}
-        }
-    }
-}
-
-#[cfg(windows)]
-struct ShutdownSignals {
-    ctrl_c: tokio::signal::windows::CtrlC,
-    ctrl_break: tokio::signal::windows::CtrlBreak,
-}
-
-#[cfg(windows)]
-impl ShutdownSignals {
-    fn new() -> Result<Self> {
-        use tokio::signal::windows::{ctrl_break, ctrl_c};
-
-        Ok(Self {
-            ctrl_c: ctrl_c().context("failed to listen for Ctrl-C")?,
-            ctrl_break: ctrl_break().context("failed to listen for Ctrl-Break")?,
-        })
-    }
-
-    async fn recv(&mut self) {
-        tokio::select! {
-            _ = self.ctrl_c.recv() => {}
-            _ = self.ctrl_break.recv() => {}
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ShutdownSignals;
-
-#[cfg(not(any(unix, windows)))]
-impl ShutdownSignals {
-    fn new() -> Result<Self> {
-        Ok(Self)
-    }
-
-    async fn recv(&mut self) {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-pub async fn run_operator_vpn<S>(
-    websocket: WebSocketStream<S>,
-    transport_local: SocketAddr,
-    transport_peer: SocketAddr,
+/// Retains address identity and DNS mappings while individual VPN transports are replaced.
+pub struct OperatorVpn {
     policy: SystemVpnPolicy,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let transport_peer_ip = normalize_ip(transport_peer.ip());
-    validate_transport_peer(&policy, transport_peer_ip)?;
-    let mut shutdown_signals = ShutdownSignals::new()?;
-    let mut entropy = [0_u8; 16];
-    rand::fill(&mut entropy);
-    let prepared_network = routes::prepare(&policy, entropy, transport_peer_ip)
-        .context("failed to prepare collision-free VPN network settings")?;
-    let network = prepared_network.network_configuration();
-    let (session, session_runtime) = tokio::select! {
-        result = start_operator_network_session(websocket) => result?,
-        _ = shutdown_signals.recv() => return Ok(()),
-    };
-    let mut tun = device::SystemTun::create(network).context(
+    addresses: Option<VpnAddresses>,
+}
+
+struct VpnAddresses {
+    network: configuration::VpnNetworkConfiguration,
+    mappings: Arc<Mutex<dns::SyntheticAddressMap>>,
+}
+
+impl OperatorVpn {
+    pub fn new(policy: SystemVpnPolicy) -> Self {
+        Self {
+            policy,
+            addresses: None,
+        }
+    }
+
+    pub async fn run<S>(
+        &mut self,
+        websocket: WebSocketStream<S>,
+        transport_local: SocketAddr,
+        transport_peer: SocketAddr,
+        shutdown: CancellationToken,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let policy = &self.policy;
+        let transport_peer_ip = normalize_ip(transport_peer.ip());
+        validate_transport_peer(policy, transport_peer_ip)?;
+        let selection = match &self.addresses {
+            Some(addresses) => routes::AddressSelection::Retained(addresses.network),
+            None => routes::AddressSelection::Fresh(rand::random()),
+        };
+        let prepared_network = routes::prepare(policy, selection, transport_peer_ip)
+            .context("failed to prepare collision-free VPN network settings")?;
+        let network = prepared_network.network_configuration();
+        if self.addresses.is_none() {
+            self.addresses = Some(VpnAddresses {
+                network,
+                mappings: Arc::new(Mutex::new(runtime::synthetic_address_map(
+                    network.synthetic,
+                )?)),
+            });
+        }
+        let mappings = Arc::clone(
+            &self
+                .addresses
+                .as_ref()
+                .expect("VPN address state has been selected")
+                .mappings,
+        );
+        let (session, session_runtime) = tokio::select! {
+            result = start_operator_network_session(websocket) => result?,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
+        let mut tun = device::SystemTun::create(network).context(
         "failed to create the VPN interface; run sshportal-server with administrator/root privileges",
     )?;
-    let mut network_guard = prepared_network
-        .install(&tun.name, tun.index, transport_local, transport_peer)
-        .with_context(|| {
-            format!(
-                "failed to configure VPN host-network state on interface {}",
-                tun.name
-            )
-        })?;
-    let (tun_reader, tun_writer) = tun.split()?;
-    let mut packet_runtime =
-        runtime::VpnRuntime::start(tun_reader, tun_writer, session, network, policy.clone())?;
-    let mut session_runtime = AbortOnDropHandle::new(tokio::spawn(session_runtime.wait()));
-    let mut network_reconcile = tokio::time::interval(NETWORK_RECONCILE_INTERVAL);
-    network_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    network_reconcile.tick().await;
+        let mut network_guard = prepared_network
+            .install(&tun.name, tun.index, transport_local, transport_peer)
+            .with_context(|| {
+                format!(
+                    "failed to configure VPN host-network state on interface {}",
+                    tun.name
+                )
+            })?;
+        let (tun_reader, tun_writer) = tun.split()?;
+        let mut packet_runtime = runtime::VpnRuntime::start(
+            tun_reader,
+            tun_writer,
+            session,
+            network,
+            policy.clone(),
+            mappings,
+        );
+        let mut session_runtime = AbortOnDropHandle::new(tokio::spawn(session_runtime.wait()));
+        let mut network_reconcile = tokio::time::interval(NETWORK_RECONCILE_INTERVAL);
+        network_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        network_reconcile.tick().await;
 
-    let mut session_runtime_finished = false;
-    let mut readiness = Box::pin(probe::verify_data_plane(network, &policy));
-    let mut ready = false;
-    let operation_result = loop {
-        tokio::select! {
-            result = &mut readiness, if !ready => {
-                match result {
-                    Ok(()) => {
-                        ready = true;
-                        if policy.is_full_tunnel() {
-                            println!("full-tunnel VPN active on interface {}", tun.name);
-                        } else {
-                            println!("selective VPN active on interface {}", tun.name);
+        let mut session_runtime_finished = false;
+        let mut readiness = Box::pin(probe::verify_data_plane(network, policy));
+        let mut ready = false;
+        let operation_result = loop {
+            tokio::select! {
+                result = &mut readiness, if !ready => {
+                    match result {
+                        Ok(()) => {
+                            ready = true;
+                            if policy.is_full_tunnel() {
+                                println!("full-tunnel VPN active on interface {}", tun.name);
+                            } else {
+                                println!("selective VPN active on interface {}", tun.name);
+                            }
+                            println!("press Ctrl-C to disconnect and restore the original routes");
                         }
-                        println!("press Ctrl-C to disconnect and restore the original routes");
+                        Err(error) => break Err(anyhow::Error::new(crate::reconnect::FatalSessionFailure(error))).context(
+                            "VPN data plane did not become ready after host-network installation",
+                        ),
                     }
-                    Err(error) => break Err(error).context(
-                        "VPN data plane did not become ready after host-network installation",
-                    ),
                 }
-            }
-            result = packet_runtime.wait() => break result,
-            result = &mut session_runtime => {
-                session_runtime_finished = true;
-                break result
-                    .context("VPN network session task failed to join")
-                    .and_then(|result| result);
-            }
-            _ = network_reconcile.tick() => {
-                if let Err(error) = network_guard.reconcile() {
-                    break Err(error).context(
-                        "failed to reconcile VPN network settings after a host network change",
-                    );
+                result = packet_runtime.wait() => break result,
+                result = &mut session_runtime => {
+                    session_runtime_finished = true;
+                    break result
+                        .context("VPN network session task failed to join")
+                        .and_then(|result| result);
                 }
+                _ = network_reconcile.tick() => {
+                    if let Err(error) = network_guard.reconcile() {
+                        break Err(error).context(
+                            "failed to reconcile VPN network settings after a host network change",
+                        );
+                    }
+                }
+                _ = shutdown.cancelled() => break Ok(()),
             }
-            _ = shutdown_signals.recv() => break Ok(()),
-        }
-    };
-    let packet_shutdown_result = packet_runtime.shutdown().await;
-    let session_shutdown_result = if session_runtime_finished {
-        Ok(())
-    } else {
-        session_runtime.abort();
-        match session_runtime.await {
-            Ok(result) => result,
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(error).context("VPN network session task failed to join"),
-        }
-    };
-    let restore_result = network_guard.restore();
+        };
+        let packet_shutdown_result = packet_runtime.shutdown().await;
+        let session_shutdown_result = if session_runtime_finished {
+            Ok(())
+        } else {
+            session_runtime.abort();
+            match session_runtime.await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(error) => Err(error).context("VPN network session task failed to join"),
+            }
+        };
+        let restore_result = network_guard.restore();
 
-    combine_results(
-        combine_results(
+        let operation_result = combine_results(
             combine_results(
                 operation_result,
                 packet_shutdown_result,
@@ -189,10 +166,20 @@ where
             ),
             session_shutdown_result,
             "VPN network session shutdown also failed",
-        ),
-        restore_result,
-        "VPN host-network restoration also failed",
-    )
+        );
+        match restore_result {
+            Ok(()) => operation_result,
+            Err(error) => {
+                let failure = combine_results(
+                    operation_result,
+                    Err(error),
+                    "VPN host-network restoration also failed",
+                )
+                .expect_err("host-network restoration failed");
+                Err(crate::reconnect::FatalSessionFailure(failure).into())
+            }
+        }
+    }
 }
 
 fn combine_results(primary: Result<()>, secondary: Result<()>, context: &str) -> Result<()> {

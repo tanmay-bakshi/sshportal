@@ -5,7 +5,9 @@ mod debug;
 mod keys;
 mod network;
 mod platform;
+mod reconnect;
 mod shell;
+mod shutdown;
 mod socks;
 mod vpn;
 mod websocket;
@@ -20,8 +22,13 @@ pub use keys::{
 };
 pub use network::{run_client_network_proxy, run_operator_socks_proxy};
 pub use platform::{OperatingSystem, Platform, ShellLaunch};
-pub use shell::{run_client_session_proxy, run_remote_shell_server};
-pub use vpn::{SystemVpnPolicy, run_operator_vpn};
+pub use reconnect::{
+    ReconnectHello, ReconnectOffer, ReconnectOptions, ReconnectSecret, ReconnectSettings,
+    ReconnectWindow, is_connection_loss,
+};
+pub use shell::{OperatorSsh, run_remote_shell_server};
+pub use shutdown::Shutdown;
+pub use vpn::{OperatorVpn, SystemVpnPolicy};
 pub use websocket::{
     AsyncStream, ClientWebSocketStream, WebSocketClientTransport, connect_async_with_env_proxy,
     connect_async_with_env_proxy_and_extra_roots, normalize_websocket_url, websocket_config,
@@ -38,7 +45,7 @@ pub fn install_default_rustls_crypto_provider() {
 
 pub const DEFAULT_CONNECT_PATH: &str = "/connect";
 pub const DEFAULT_HEALTH_PATH: &str = "/healthz";
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub(crate) const NETWORK_SESSION_FLOW_LIMIT: usize = 256;
 pub(crate) const MAX_NETWORK_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize - 20 - 8;
 

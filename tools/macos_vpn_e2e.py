@@ -96,11 +96,14 @@ class SpawnedProcess:
         self.transcript += output
         return output
 
-    def wait_for_text(self, expected: str, timeout_seconds: float) -> str:
-        """Wait until the transcript contains expected text.
+    def wait_for_text(
+        self, expected: str, timeout_seconds: float, minimum_occurrences: int = 1
+    ) -> str:
+        """Wait until the transcript contains enough occurrences of expected text.
 
         :param expected: Text required in the process transcript.
         :param timeout_seconds: Maximum time to wait.
+        :param minimum_occurrences: Required number of occurrences.
         :returns: Complete process transcript.
         :raises RuntimeError: If the process exits or the deadline expires.
         """
@@ -108,7 +111,7 @@ class SpawnedProcess:
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             self.read_available(0.2)
-            if expected in self.transcript:
+            if self.transcript.count(expected) >= minimum_occurrences:
                 return self.transcript
             if self.process.poll() is not None:
                 raise RuntimeError(
@@ -183,6 +186,7 @@ class TlsForwarder:
     _ready: threading.Event
     _stop_future: asyncio.Future[None] | None
     _thread: threading.Thread
+    _connections: set[asyncio.StreamWriter]
 
     def __init__(self, certificate: Path, private_key: Path, backend_port: int) -> None:
         """Initialize a local TLS forwarder.
@@ -200,6 +204,7 @@ class TlsForwarder:
         self._loop = None
         self._ready = threading.Event()
         self._stop_future = None
+        self._connections = set()
         self._thread = threading.Thread(
             target=self._run,
             name="sshportal-macos-vpn-tls",
@@ -231,6 +236,28 @@ class TlsForwarder:
             self._thread.join(timeout=10.0)
         if self._thread.is_alive():
             raise RuntimeError("TLS forwarder did not stop")
+
+    def disconnect(self) -> None:
+        """Break active transports without replacing the TLS listener.
+
+        :raises RuntimeError: If the forwarder cannot inject the disconnect.
+        """
+
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError("TLS forwarder is not running")
+        disconnected = threading.Event()
+
+        def close_connections() -> None:
+            """Close the streams owned by the forwarding loop."""
+
+            for writer in tuple(self._connections):
+                writer.transport.abort()
+            disconnected.set()
+
+        loop.call_soon_threadsafe(close_connections)
+        if not disconnected.wait(timeout=10.0):
+            raise RuntimeError("TLS forwarder did not disconnect its transports")
 
     def _run(self) -> None:
         """Own the asyncio event loop used by the forwarder thread."""
@@ -308,6 +335,7 @@ class TlsForwarder:
             asyncio.create_task(relay(reader, upstream_writer)),
             asyncio.create_task(relay(upstream_reader, writer)),
         }
+        self._connections.update([writer, upstream_writer])
         try:
             _done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED
@@ -316,6 +344,7 @@ class TlsForwarder:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            self._connections.difference_update([writer, upstream_writer])
             upstream_writer.close()
             writer.close()
             await asyncio.gather(
@@ -1103,6 +1132,7 @@ def start_session(
     server_certificate: Path,
     server_key: Path,
     policy_arguments: list[str],
+    connection_arguments: list[str],
 ) -> tuple[SpawnedProcess, SpawnedProcess, TlsForwarder]:
     """Start one root server, local WSS proxy, and unprivileged client.
 
@@ -1112,6 +1142,7 @@ def start_session(
     :param server_certificate: PEM certificate for the local WSS listener.
     :param server_key: PEM private key for the local WSS listener.
     :param policy_arguments: VPN include-selector arguments.
+    :param connection_arguments: Reconnection settings applied to both endpoints.
     :returns: Server, client, and TLS forwarder.
     """
 
@@ -1130,6 +1161,7 @@ def start_session(
             JOIN_TOKEN,
             "--vpn",
             *policy_arguments,
+            *connection_arguments,
         ],
     )
     client: SpawnedProcess | None = None
@@ -1150,6 +1182,7 @@ def start_session(
                 "--tls-ca-certificate",
                 str(root_certificate),
                 "--approve-session",
+                *connection_arguments,
             ],
             env=client_environment(),
         )
@@ -1182,10 +1215,10 @@ def active_interface(server: SpawnedProcess) -> str:
     :raises RuntimeError: If the transcript has no valid name.
     """
 
-    match = re.search(r"VPN active on interface (utun[0-9]+)", server.transcript)
-    if match is None:
+    interfaces = re.findall(r"VPN active on interface (utun[0-9]+)", server.transcript)
+    if len(interfaces) == 0:
         raise RuntimeError(f"server did not report its VPN interface:\n{server.transcript}")
-    return match.group(1)
+    return interfaces[-1]
 
 
 def verify_interface_configuration(interface: str) -> None:
@@ -1421,6 +1454,7 @@ def run_domain_session(
         server_certificate,
         server_key,
         ["--vpn-include-domain", TEST_DOMAIN],
+        [],
     )
     routed_addresses: list[str] = []
     try:
@@ -1463,6 +1497,96 @@ def run_domain_session(
         cleanup_processes(server, client, forwarder)
 
 
+def run_reconnect_domain_session(
+    server_binary: Path,
+    client_binary: Path,
+    root_certificate: Path,
+    server_certificate: Path,
+    server_key: Path,
+    echoes: EchoServices,
+    baseline_route: tuple[str, str],
+) -> None:
+    """Recover a native VPN epoch and reuse cached synthetic DNS addresses.
+
+    :param server_binary: Built server executable.
+    :param client_binary: Built client executable.
+    :param root_certificate: PEM root trusted only by the fixture client.
+    :param server_certificate: PEM certificate for the local WSS listener.
+    :param server_key: PEM private key for the local WSS listener.
+    :param echoes: Client-side loopback echo services.
+    :param baseline_route: Normal route for unmatched internet traffic.
+    """
+
+    baseline_dns = vpn_dns_keys()
+    server, client, forwarder = start_session(
+        server_binary,
+        client_binary,
+        root_certificate,
+        server_certificate,
+        server_key,
+        ["--vpn-include-domain", TEST_DOMAIN],
+        [
+            "--reconnect",
+            "--reconnect-interval-seconds",
+            "1",
+            "--reconnect-timeout-seconds",
+            "15",
+        ],
+    )
+    try:
+        original_interface = active_interface(server)
+        _key, original_dns = verify_supplemental_dns(baseline_dns, original_interface)
+        answers = verify_dns_matrix(original_dns)
+        ipv4 = answers[DNS_TYPE_A]
+        ipv6 = answers[DNS_TYPE_AAAA]
+        if not isinstance(ipv4, ipaddress.IPv4Address) or not isinstance(
+            ipv6, ipaddress.IPv6Address
+        ):
+            raise RuntimeError("synthetic DNS returned the wrong address families")
+        verify_tcp_tunnel(ipv4, echoes.tcp_ports[socket.AF_INET])
+        verify_tcp_tunnel(ipv6, echoes.tcp_ports[socket.AF_INET6])
+        forwarder.disconnect()
+        server.wait_for_text("for the approved client to reconnect", PROCESS_TIMEOUT_SECONDS)
+        server.wait_for_text("VPN active on interface", PROCESS_TIMEOUT_SECONDS, 2)
+        client.wait_for_text("VPN egress session approved", PROCESS_TIMEOUT_SECONDS, 2)
+        interface = active_interface(server)
+        verify_interface_configuration(interface)
+        if route_path("1.1.1.1") != baseline_route:
+            raise RuntimeError("reconnected VPN changed unmatched IPv4 routing")
+        # Use the cached addresses before issuing DNS queries into the replacement epoch.
+        verify_tcp_tunnel(ipv4, echoes.tcp_ports[socket.AF_INET])
+        verify_tcp_tunnel(ipv6, echoes.tcp_ports[socket.AF_INET6])
+        verify_udp_tunnel(ipv4, echoes.udp_ports[socket.AF_INET])
+        verify_udp_tunnel(ipv6, echoes.udp_ports[socket.AF_INET6])
+        _key, restored_dns = verify_supplemental_dns(baseline_dns, interface)
+        if restored_dns != original_dns or verify_dns_matrix(restored_dns) != answers:
+            raise RuntimeError("VPN reconnection changed cached DNS addresses")
+        echoes.assert_healthy()
+        # Both endpoints opt into recovery, so stopping one does not stop the other.
+        owner_pid = journal_owner_pid()
+        run_checked(["sudo", "-n", "kill", "-INT", str(owner_pid)])
+        client.signal_group(signal.SIGINT)
+        server_exit = server.wait(PROCESS_TIMEOUT_SECONDS)
+        client_exit = client.wait(PROCESS_TIMEOUT_SECONDS)
+        if server_exit != 0 or client_exit != 0:
+            raise RuntimeError(
+                f"reconnecting shutdown returned server={server_exit}, client={client_exit}"
+            )
+        addresses = [str(address) for address in original_dns] + [str(ipv4), str(ipv6)]
+        wait_for_cleanup(baseline_dns, original_interface, addresses)
+        wait_for_cleanup(baseline_dns, interface, addresses)
+    except (OSError, RuntimeError) as error:
+        server.read_available(0.2)
+        client.read_available(0.2)
+        raise RuntimeError(
+            f"reconnecting macOS VPN session failed: {error}\n\n"
+            f"--- server transcript ---\n{server.transcript}\n\n"
+            f"--- client transcript ---\n{client.transcript}"
+        ) from error
+    finally:
+        cleanup_processes(server, client, forwarder)
+
+
 def run_cidr_failure_session(
     server_binary: Path,
     client_binary: Path,
@@ -1490,6 +1614,7 @@ def run_cidr_failure_session(
         server_certificate,
         server_key,
         ["--vpn-include-cidr", TEST_CIDR],
+        [],
     )
     try:
         interface = active_interface(server)
@@ -1619,6 +1744,15 @@ def main() -> int:
                 root_certificate,
                 server_certificate,
                 server_key,
+                baseline_route,
+            )
+            run_reconnect_domain_session(
+                server_binary,
+                client_binary,
+                root_certificate,
+                server_certificate,
+                server_key,
+                echoes,
                 baseline_route,
             )
         finally:

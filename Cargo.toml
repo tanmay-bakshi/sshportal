@@ -17,7 +17,7 @@ resolver = "2"
 anyhow = "1.0.103"
 bytes = "1.10.1"
 clap = { version = "4.5.39", features = ["derive"] }
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures-util = "0.3.31"
 h2 = "0.4.19"
 dns-lookup = "3.0.1"
@@ -37,6 +37,7 @@ rustls-platform-verifier = "0.7.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-pause-synack", "socket-tcp-reno"] }
+subtle = "2.6.1"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = { version = "0.26.4", default-features = false }
 tokio-tungstenite = { version = "0.28.0", features = ["__rustls-tls"] }
