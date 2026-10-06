@@ -11,5 +11,6 @@ ole32.dll
 oleaut32.dll
 rpcrt4.dll
 shell32.dll
+user32.dll
 wintrust.dll
 ws2_32.dll
